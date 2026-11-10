@@ -703,7 +703,7 @@ class ConversationStore:
                 ).fetchone()
                 ctx_start = ctx_row[0] if ctx_row else 0
 
-                columns = "seq, role, content" + (", extras" if with_authors else "")
+                columns = "seq, role, content, extras"
                 cursor = conn.execute(
                     f"""
                     SELECT {columns}
@@ -732,6 +732,13 @@ class ConversationStore:
             if role == "assistant" and isinstance(content, list):
                 content = [b for b in content if b.get("type") != "thinking"]
             message = {"role": role, "content": content}
+            try:
+                extras = json.loads(_[0]) if _ and _[0] else {}
+            except (ValueError, TypeError):
+                extras = {}
+            if extras.get("personal_task_id"):
+                message["personal_task_id"] = extras["personal_task_id"]
+                message["extras"] = extras
             if authors.get(seq):
                 message["agent_id"] = authors[seq]
             result.append(message)
@@ -1163,6 +1170,9 @@ class ConversationStore:
         Returns:
             Number of message rows deleted.
         """
+        from common.personal_tasks import personal_enabled
+        if personal_enabled():
+            return 0
         if keep_last_n < 0:
             keep_last_n = 0
         if markers is None:
@@ -1242,6 +1252,9 @@ class ConversationStore:
         Returns:
             Number of sessions deleted.
         """
+        from common.personal_tasks import personal_enabled
+        if personal_enabled():
+            return 0
         try:
             from config import conf
             max_age = max_age_days or conf().get(

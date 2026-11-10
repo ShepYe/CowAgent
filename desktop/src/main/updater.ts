@@ -194,7 +194,7 @@ export function initUpdater(windowGetter: () => BrowserWindow | null): void {
 
   // In dev (not packaged) there's no update feed; skip wiring entirely so
   // electron-updater doesn't throw on the missing app-update.yml.
-  if (!app.isPackaged) {
+  if (!app.isPackaged || loadAppConfig()?.automaticUpdates === false) {
     log('not packaged — updater wiring skipped')
     return
   }
@@ -266,8 +266,12 @@ let userInitiatedCheck = false
 //   panel re-opens even if the version was previously dismissed. The startup +
 //   interval polls pass false, so a dismissed version only lights the dot.
 export function checkForUpdates(userInitiated = false): void {
+  if (loadAppConfig()?.automaticUpdates === false) {
+    send({ state: 'not-available' })
+    return
+  }
   userInitiatedCheck = userInitiated
-  if (!app.isPackaged) {
+  if (!app.isPackaged || loadAppConfig()?.automaticUpdates === false) {
     // Dev-only UI harness: set COW_MOCK_UPDATE=1 to simulate an available
     // update so the update panel/menu interactions can be exercised in
     // `npm run dev` (where there's no real feed). Never runs in a packaged app.
@@ -290,7 +294,7 @@ export function checkForUpdates(userInitiated = false): void {
 }
 
 export function startDownload(): void {
-  if (!app.isPackaged) return
+  if (!app.isPackaged || loadAppConfig()?.automaticUpdates === false) return
   downloadFellBack = false
   log(`startDownload: user requested download (preferChina=${preferChina})`)
   attemptDownload()
@@ -327,7 +331,7 @@ function attemptDownload(): void {
 }
 
 export function quitAndInstall(): void {
-  if (!app.isPackaged) return
+  if (!app.isPackaged || loadAppConfig()?.automaticUpdates === false) return
   log('quitAndInstall: relaunching to install update')
   // Drop window-all-closed handlers first: a lingering handler can keep the
   // process alive and stop the installer from replacing files / relaunching

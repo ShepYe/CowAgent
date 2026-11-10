@@ -292,7 +292,8 @@ class MemoryFlushManager:
             # receiver session; promoting them into long-term daily memory
             # produces low-value flat logs (e.g. "11:28 price=1013, normal /
             # 11:58 price=1013, normal / ...") and wastes summarisation tokens.
-            messages = self._strip_scheduler_pairs(messages)
+            from agent.knowledge.purpose import durable_messages
+            messages = durable_messages(self._strip_scheduler_pairs(messages))
             if not messages:
                 return False
 
@@ -416,6 +417,9 @@ class MemoryFlushManager:
         :return: True on success.
         """
         summary = (summary or "").strip()
+        from agent.knowledge.purpose import source_task_context
+        if source_task_context() or "[personal-task:" in summary:
+            return False
         if not summary:
             return False
         try:
@@ -746,6 +750,8 @@ class MemoryFlushManager:
 
     def _format_conversation_for_summary(self, messages: List[Dict], max_messages: int = 0) -> str:
         """Format messages into readable conversation text for LLM summarization."""
+        from agent.knowledge.purpose import durable_messages
+        messages = durable_messages(messages)
         msgs = messages if max_messages == 0 else messages[-max_messages * 2:]
         lines = []
         for msg in msgs:
@@ -845,6 +851,8 @@ class MemoryFlushManager:
         Rule-based summary of discarded messages.
         Format: "用户问了X; 助手回答了Y" per event, compact and readable.
         """
+        from agent.knowledge.purpose import durable_messages
+        messages = durable_messages(messages)
         msgs = messages if max_messages == 0 else messages[-max_messages * 2:]
 
         events: List[str] = []

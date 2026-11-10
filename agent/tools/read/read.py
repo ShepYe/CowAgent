@@ -192,10 +192,20 @@ class Read(BaseTool):
             if shared_page:
                 absolute_path = shared_page
 
+        from agent.knowledge.personal_assistant import guard_path
+        try:
+            guard_path(absolute_path)
+        except ValueError as exc:
+            return ToolResult.fail(str(exc))
+
         # Security check: block credential files and their aliases.
         # See issue #2913 (/proc/self/environ bypass) and #2863 (scope).
         if self._is_credential_path(absolute_path):
             return ToolResult.fail(DENIED_MESSAGE)
+
+        attachment_result = self._read_task_attachment(absolute_path, offset, limit)
+        if attachment_result is not None:
+            return attachment_result
         
         # Check if file exists. Both misses below name the tool that answers
         # the question instead - otherwise the model tends to guess at nearby
@@ -258,6 +268,63 @@ class Read(BaseTool):
         # Read text file (with truncation for large files)
         return self._read_text(absolute_path, path, offset, limit)
     
+    def _read_task_attachment(self, absolute_path, offset, limit):
+        """Read authorized hash blobs using their registered original filename.
+
+        Extraction remains complete; only the returned source units are paged.
+        This never decides long-term purpose or publishes a knowledge page.
+        """
+        from common.personal_tasks import current_task_id, TaskStore
+        task_id = current_task_id()
+        if not task_id:
+            return None
+        try:
+            from common.runtime_identity import current_identity
+            from agent.knowledge.personal_assistant import SourceService
+            import json
+            store = self.config.get("task_store") or TaskStore()
+            owner = current_identity().user_id
+            task = store.get(owner, task_id)
+            resolved = Path(absolute_path).resolve()
+            entry = next((a for a in task["attachments"] if Path(a["path"]).resolve() == resolved), None)
+            if entry is None:
+                if resolved.is_relative_to((store.root / "originals").resolve()):
+                    return ToolResult.fail({"code": "forbidden", "message": "附件不属于当前接收任务"})
+                return None
+            attachment = store.attachment(owner, task_id, entry["attachment_id"])
+            workspace = self.config.get("workspace_root") or self.cwd
+            service = SourceService(workspace, owner)
+            receipt = service.receive(attachment["path"], filename=attachment["filename"],
+                request_id=f"{task_id}:{attachment['attachment_id']}", origin=task["origin"])
+            parsed = service.parse(receipt["revision_id"])
+            # Preserve full locations while splitting very large physical pages
+            # into display fragments; text offsets make every fragment resumable.
+            units = []
+            for ordinal, unit in enumerate(parsed["units"]):
+                for begin in range(0, len(unit["text"]), 2000):
+                    units.append(dict(unit, text=unit["text"][begin:begin+2000], ordinal=ordinal,
+                                      text_start=begin, text_end=min(begin+2000, len(unit["text"]))))
+            offset = 1 if offset is None else offset
+            limit = 20 if limit is None else limit
+            if type(offset) is not int or type(limit) is not int or limit <= 0:
+                return ToolResult.fail({"code": "invalid_request", "message": "offset/limit 须为整数且 limit 大于零"})
+            start = max(0, len(units) + offset) if offset < 0 else max(0, offset-1)
+            selected, used = [], 0
+            for unit in units[start:start+min(limit, 200)]:
+                size = len(json.dumps(unit, ensure_ascii=False, default=str).encode("utf-8"))
+                if selected and used + size > DEFAULT_MAX_BYTES:
+                    break
+                selected.append(unit)
+                used += size
+            next_index = start + len(selected)
+            return ToolResult.success(dict(document_id=receipt["document_id"], revision_id=receipt["revision_id"],
+                parse_id=parsed["parse_id"], attachment_id=attachment["attachment_id"], filename=attachment["filename"],
+                units=selected, total_units=len(units), offset=start+1, has_more=next_index < len(units),
+                next_offset=next_index+1 if next_index < len(units) else None,
+                published=False, searchable=False, display_fragments=True))
+        except Exception as exc:
+            return ToolResult.fail({"code": getattr(exc, "code", "invalid_request"), "message": str(exc)})
+
     def _shared_knowledge_path(self, path: str) -> Optional[str]:
         """An existing knowledge page under the shared root, or None.
 

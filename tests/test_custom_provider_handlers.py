@@ -20,8 +20,11 @@ from unittest.mock import patch
 # Add project root to path.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-# Stub the web.py framework so web_channel imports without the dependency.
-if "web" not in sys.modules:
+# Prefer the real framework so collection does not replace an installed web.py
+# with an incomplete stub used by subsequently collected integration tests.
+try:
+    import web  # noqa: F401
+except ImportError:
     _web_stub = types.ModuleType("web")
     _web_stub.header = lambda *a, **k: None
     _web_stub.data = lambda: b"{}"
@@ -183,19 +186,17 @@ class TestDeleteCustomProvider(unittest.TestCase):
         # bot_type unchanged (still pointing to a)
         self.assertEqual(config_module.conf().get("bot_type"), f"custom:{self.res_a['id']}")
 
-    def test_delete_active_falls_back_to_first_remaining(self):
-        # 'a' is active (created first); deleting it should re-point to 'b'.
-        self.assertEqual(config_module.conf().get("bot_type"), f"custom:{self.res_a['id']}")
+    def test_delete_active_is_rejected_with_reference(self):
         res = self.h.call(action="delete_custom_provider", id=self.res_a["id"])
-        self.assertEqual(res["status"], "success")
-        self.assertEqual(config_module.conf().get("bot_type"), f"custom:{self.res_b['id']}")
+        self.assertEqual(res["code"], "provider_in_use")
+        self.assertIn("bot_type", res["references"])
+        self.assertEqual(config_module.conf()["bot_type"], f"custom:{self.res_a['id']}")
 
-    def test_delete_last_reverts_to_legacy(self):
+    def test_delete_all_after_explicit_unbind(self):
+        config_module.conf()["bot_type"] = "custom"
         self.h.call(action="delete_custom_provider", id=self.res_a["id"])
         self.h.call(action="delete_custom_provider", id=self.res_b["id"])
-        self.assertEqual(config_module.conf().get("custom_providers"), [])
-        # When all providers deleted, reverts to legacy "custom"
-        self.assertEqual(config_module.conf().get("bot_type"), "custom")
+        self.assertEqual(config_module.conf()["custom_providers"], [])
 
 
 class TestSetActiveCustomProvider(unittest.TestCase):
@@ -367,48 +368,12 @@ class TestCustomImageProvider(unittest.TestCase):
             "https://new.example.com/v1",
         )
 
-    def test_deleting_selected_provider_clears_image_route(self):
+    def test_deleting_selected_provider_rejects_without_mutation(self):
         handler = ModelsHandler.__new__(ModelsHandler)
-        file_config = {
-            "custom_providers": [self.provider],
-            "skills": {
-                "image-generation": {
-                    "provider": "custom:image_vendor",
-                    "model": "vendor-image-model",
-                },
-            },
-        }
-        handler._read_file_config = lambda: file_config
-        handler._write_file_config = lambda data: None
-        handler._reset_bridge = lambda: None
-        env = {
-            "SKILL_IMAGE_GENERATION_PROVIDER": "custom:image_vendor",
-            "SKILL_IMAGE_GENERATION_MODEL": "vendor-image-model",
-            "SKILL_IMAGE_GENERATION_CUSTOM_PROVIDER": json.dumps(
-                self.provider
-            ),
-        }
-
-        with patch.dict(os.environ, env, clear=False):
+        with self.assertRaisesRegex(ValueError, "skills.image-generation.provider"):
             handler._persist_custom_providers([])
-
-            image_config = config_module.conf()["skills"][
-                "image-generation"
-            ]
-            self.assertEqual(image_config["provider"], "")
-            self.assertEqual(image_config["model"], "")
-            self.assertNotIn(
-                "SKILL_IMAGE_GENERATION_CUSTOM_PROVIDER",
-                os.environ,
-            )
-            self.assertNotIn(
-                "SKILL_IMAGE_GENERATION_PROVIDER",
-                os.environ,
-            )
-            self.assertNotIn(
-                "SKILL_IMAGE_GENERATION_MODEL",
-                os.environ,
-            )
+        self.assertEqual(config_module.conf()["skills"]["image-generation"]["provider"],
+                         "custom:image_vendor")
 
 
 if __name__ == "__main__":

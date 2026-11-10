@@ -1,3 +1,4 @@
+import { instanceDataDir, personalInstance } from './instance-paths'
 import { app, ipcMain, dialog, BrowserWindow } from 'electron'
 import path from 'path'
 import fs from 'fs'
@@ -43,7 +44,7 @@ let getDataDir: () => string = () => ''
 // The Agent workspace, resolved like the backend does: config.json's
 // agent_workspace, else ~/cow.
 function workspaceDir(): string {
-  let workspace = '~/cow'
+  let workspace = personalInstance ? path.join(instanceDataDir, 'workspace') : '~/cow'
   try {
     const dataDir = getDataDir() || path.join(os.homedir(), '.cow')
     const cfg = JSON.parse(fs.readFileSync(path.join(dataDir, 'config.json'), 'utf8'))
@@ -78,6 +79,8 @@ function bundledThemesDir(): string | null {
 
 // Optional app config bundled with the app. Absent in the standard build.
 export interface AppConfig {
+  personalInstance?: boolean
+  automaticUpdates?: boolean
   defaultTheme?: string
   // Built-in theme ids to leave out of the theme list.
   hiddenThemes?: string[]

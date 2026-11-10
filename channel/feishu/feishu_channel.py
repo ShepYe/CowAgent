@@ -336,6 +336,16 @@ class FeiShuChanel(ChatChannel):
         self.feishu_token = self.cfg('feishu_token')
         self.feishu_event_mode = self.cfg('feishu_event_mode', 'websocket')
 
+        from common.personal_tasks import personal_enabled
+        if personal_enabled():
+            from channel.feishu.personal import binding_for, register
+            try:
+                binding_for(self)
+            except ValueError:
+                self.report_startup_error("请在桌面绑定本人飞书身份")
+                return
+            register(self)
+
         # 命令行启动场景：缺少凭据时尝试通过 lark.register_app 在终端弹二维码
         # 引导用户扫码创建应用。Web 控制台启动同样会走到这里，但控制台用户通常
         # 已经通过 /api/feishu/register 完成了创建并写回 config.json。
@@ -443,6 +453,11 @@ class FeiShuChanel(ChatChannel):
             try:
                 event_dict = json.loads(lark.JSON.marshal(data))
                 event = event_dict.get("event", {})
+                header = event_dict.get("header") or {}
+                if header.get("app_id"):
+                    event["app_id"] = header["app_id"]
+                if header.get("tenant_key"):
+                    event["tenant_key"] = header["tenant_key"]
                 msg = event.get("message", {})
 
                 # Skip group messages that don't @-mention the bot (reduce log noise)
@@ -677,7 +692,10 @@ class FeiShuChanel(ChatChannel):
         return False
 
     def _handle_card_action_event(self, event: dict) -> dict:
-        """Apply a scheduler card action within its chat/operator ownership scope."""
+        """Apply scheduler actions only in the generic channel ownership scope."""
+        from common.personal_tasks import personal_enabled
+        if personal_enabled():
+            return {"toast": {"type": "error", "content": "请使用本人私聊或桌面任务入口"}}
         action = event.get("action") or {}
         value = action.get("value") or {}
         if value.get("cowagent") != "scheduler":
@@ -735,6 +753,17 @@ class FeiShuChanel(ChatChannel):
         处理消息事件的核心逻辑
         webhook和websocket模式共用此方法
         """
+        from common.personal_tasks import personal_enabled
+        if personal_enabled():
+            from channel.feishu.personal import receive
+            from common.personal_tasks import TaskError
+            try:
+                return receive(self, event)
+            except TaskError as exc:
+                if exc.code in {"forbidden", "config_unavailable"}:
+                    logger.info("[FeiShu] personal message rejected: %s", exc.code)
+                    return
+                raise
         if not event.get("message") or not event.get("sender"):
             logger.warning(f"[FeiShu] invalid message, event={event}")
             return
@@ -2397,6 +2426,10 @@ class FeishuController:
 
             # 3. Handle message events.
             if event_type == self.MESSAGE_RECEIVE_TYPE and event:
+                if header.get("app_id"):
+                    event["app_id"] = header["app_id"]
+                if header.get("tenant_key"):
+                    event["tenant_key"] = header["tenant_key"]
                 channel._handle_message_event(event)
             elif event_type == self.MESSAGE_RECALLED_TYPE and event:
                 channel._handle_message_recalled_event(event)

@@ -1,0 +1,8 @@
+{
+  "appName": "CowAgent Personal",
+  "appUserModelId": "com.cowagent.personal",
+  "runtimeIconTitle": false,
+  "automaticUpdates": false,
+  "personalInstance": true,
+  "clientSource": "cowagent-personal"
+}

@@ -1656,6 +1656,14 @@ class AgentBridge:
             # runtime built for this turn has only just restored it.
             if cached:
                 self._sync_shared_transcript(agent, session_id, resolved_agent_id)
+
+            from common.personal_tasks import current_task_id, personal_enabled
+            from agent.knowledge.purpose import mark_messages
+            personal_task_id = current_task_id()
+            if personal_enabled() and hasattr(agent, "messages"):
+                from agent.knowledge.purpose import refresh_evidence_context
+                refresh_evidence_context(agent)
+            personal_message_ids = {id(message) for message in getattr(agent, "messages", [])}
             
             # Create event handler for logging and channel communication
             event_handler = AgentEventHandler(context=context, original_callback=on_event)
@@ -1818,6 +1826,10 @@ class AgentBridge:
 
             # Persist what this run added beyond the steps already stored
             if writer is not None:
+                if personal_task_id:
+                    with agent.messages_lock:
+                        agent.messages[:] = [message if id(message) in personal_message_ids
+                            else mark_messages([message], personal_task_id)[0] for message in agent.messages]
                 new_messages = list(getattr(agent, '_last_run_new_messages', []))
                 # The leading user turn was already persisted eagerly above;
                 # drop it here so it isn't stored twice.
@@ -1825,6 +1837,9 @@ class AgentBridge:
                     new_messages = new_messages[1:]
                 writer.finish(new_messages)
 
+            if personal_enabled() and hasattr(agent, "messages"):
+                from agent.knowledge.purpose import refresh_evidence_context
+                refresh_evidence_context(agent)
             self.remember_context_usage(agent, session_id, resolved_agent_id)
             
             # Record this user turn for the self-evolution idle trigger. Skip
@@ -2160,6 +2175,9 @@ class AgentBridge:
         messages_to_store = new_messages
         if not thinking_enabled:
             messages_to_store = self._strip_thinking_blocks(new_messages)
+        from common.personal_tasks import current_task_id
+        from agent.knowledge.purpose import mark_messages
+        messages_to_store = mark_messages(messages_to_store, current_task_id())
 
         stored = False
         try:

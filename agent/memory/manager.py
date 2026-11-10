@@ -5,6 +5,7 @@ Provides high-level interface for memory operations
 """
 
 import os
+import json
 from typing import List, Optional, Dict, Any, Sequence, Tuple
 from pathlib import Path
 import hashlib
@@ -122,6 +123,15 @@ class MemoryManager:
         
         # Ensure workspace directories exist
         self._init_workspace()
+
+        # Resolve the publication bridge once for this workspace. Memory-only
+        # searches must not consult the ambient Agent registry on every query.
+        from common import state_dir
+        from config import conf
+        self._publication_root = (
+            Path(state_dir.knowledge_dir(base=workspace_dir)).parent
+            if conf().get("knowledge", True) else None
+        )
         
         self._dirty = False
     
@@ -209,6 +219,19 @@ class MemoryManager:
         )
         logger.info(f"[MemoryManager] Keyword search found {len(keyword_results)} results for query: {query}")
 
+        # SourceService owns the publication index. Bridge it before ranking so
+        # a committed source is queryable without a later filesystem reindex.
+        source_root = getattr(self, "_publication_root", None)
+        if (include_shared and user_id in (None, "local-owner") and source_root is not None
+                and (source_root / ".personal_sources" / "sources.sqlite3").exists()):
+            from agent.knowledge.personal_assistant import SourceService
+            for ref in SourceService(source_root).search(query, limit=max_results):
+                keyword_results.append(SearchResult(
+                    path=ref["path"], start_line=1, end_line=1, score=1.0,
+                    snippet=ref["text"] + "\n[source_reference] " + json.dumps({
+                        k: ref[k] for k in ("document_id", "revision_id", "parse_id", "publish_id", "ordinal", "location")
+                    }, ensure_ascii=False), source="knowledge"))
+
         # Merge results
         merged = self._merge_results(
             vector_results,
@@ -219,7 +242,20 @@ class MemoryManager:
 
         # min_score is a cutoff on the fused score, so it is applied before
         # rerank; the reranker only reorders the candidates that pass it.
-        filtered = [r for r in merged if r.score >= min_score]
+        filtered = []
+        knowledge_root = None
+        for result in merged:
+            if result.score < min_score:
+                continue
+            path = result.path.replace("\\", "/")
+            if path.startswith("knowledge/"):
+                from agent.knowledge.personal_assistant import readable
+                if knowledge_root is None:
+                    from common import state_dir
+                    knowledge_root = Path(state_dir.knowledge_dir(base=self.config.get_workspace()))
+                if not readable(knowledge_root / path[len("knowledge/"):]):
+                    continue
+            filtered.append(result)
         filtered = self._rerank(query, filtered)
         # The hit boost runs last, as a pure reordering multiplier over the
         # final candidates: it rewards chunks that proved useful before but
@@ -434,6 +470,11 @@ class MemoryManager:
                 continue
             # Recorded before the read, so a file that is present but unreadable
             # still counts as scanned and keeps the rows it already has.
+            if source == "knowledge":
+                from agent.knowledge.personal_assistant import readable
+                if not readable(file_path):
+                    self.storage.delete_by_path(rel_path)
+                    continue
             scanned.setdefault(source, set()).add(rel_path)
             try:
                 content = file_path.read_text(encoding='utf-8')

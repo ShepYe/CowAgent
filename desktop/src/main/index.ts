@@ -1,3 +1,4 @@
+import { instanceDataDir, personalInstance } from './instance-paths'
 import { app, BrowserWindow, screen, session, shell, ipcMain, dialog, nativeImage, Notification, systemPreferences, crashReporter, Menu, clipboard, net } from 'electron'
 import path from 'path'
 import fs from 'fs'
@@ -21,7 +22,8 @@ import {
 // Kept in sync with COW_DATA_DIR in python-manager.ts so the desktop shell
 // writes its own diagnostics into the SAME run.log the "open log folder" button
 // reveals and the in-app Logs page tails — one place to look for both layers.
-const COW_DATA_DIR = path.join(os.homedir(), '.cow')
+const COW_DATA_DIR = instanceDataDir
+if (personalInstance) process.env.COW_HOME = instanceDataDir
 
 // Mirror the main process's console output and any uncaught crash to run.log.
 // Packaged builds have no terminal, so every console.log/error and every
@@ -142,6 +144,7 @@ initDesktopLogging()
 // where the default Electron binary would otherwise report "Electron". The name
 // can be overridden by the bundled app-config (appName); defaults to CowAgent.
 app.setName(loadAppConfig()?.appName || 'CowAgent')
+if (personalInstance) app.setPath('userData', path.join(instanceDataDir, 'electron'))
   // The web layer may have overridden the name at runtime. Re-apply it here,
   // before app.getPath('userData') is read anywhere, since setName moves it.
 applyCachedAppName()

@@ -14,7 +14,10 @@ Maintain a persistent, structured knowledge base in the `knowledge/` directory.
 
 ### 1. Ingest — User shares an article, document, or resource
 
-1. Read and understand the source material
+1. 若上下文包含 personal task_id，先通过 `knowledge_ingest` 处理接收任务附件。主 Agent 自主判断 long_term/transient/waiting，不逐份询问。缺少替代关系等必要信息才 waiting。工具返回 published/searchable 才能说可检索；失败与 pending_index 如实说明。
+2. 托管页 `knowledge/managed/` 禁止用 write/edit 修改或复制为未托管页。更正/撤回/用途改变调用 `knowledge_source_action`，携带 document_id、expected_state、reason；使用来源服务状态修订；引用需包含 document_id/revision_id/parse_id/publish_id 及真实原文位置，并回读有效原文。PDF 使用物理页，DOCX 使用段落/表格位置，XLSX 使用工作表和单元格，公式缓存缺失不得猜值。
+3. 临时附件和派生结论仅保留原始留档，不写知识、日记、摘要或 Deep Dream。长期附件由来源工具发布，不另存无版本摘要。
+4. Read and understand the source material
 2. Extract key facts, insights, and structured knowledge
 3. Determine the appropriate subdirectory:
    - Read `knowledge/index.md` to see existing categories

@@ -201,3 +201,37 @@ def test_model_discovery_does_not_hold_the_save_lock(console, monkeypatch):
 
     assert json.loads(resp.data)["status"] == "success"
     assert seen == [False], "a read-only network probe held the config save lock"
+
+
+def test_settings_masked_key_roundtrip_does_not_leak(console):
+    post_models, save_settings, path = console
+    post_models({"action": "set_provider", "provider_id": "deepseek", "api_key": "fake-secret"})
+    response = save_settings({"deepseek_api_key": "fa***et", "deepseek_api_base": "https://changed.invalid/v1"})
+    payload = json.loads(response.data)
+    assert payload["status"] == "success"
+    assert "fake-secret" not in response.data.decode()
+    assert json.loads(path.read_text(encoding="utf-8"))["deepseek_api_key"] == "fake-secret"
+
+
+def test_failed_settings_save_leaves_runtime_and_revision(console, monkeypatch):
+    from channel.web.api import config as config_api
+    from models.config_revision import capture_config_revision
+    _, save_settings, path = console
+    revision = capture_config_revision()
+    before = path.read_bytes()
+    def fail(*args):
+        raise OSError("disk full")
+    monkeypatch.setattr(config_api, "_write_config_file_for_write", fail)
+    assert json.loads(save_settings({"model": "changed"}).data)["status"] == "error"
+    assert capture_config_revision() == revision
+    assert path.read_bytes() == before
+
+
+def test_settings_explicit_embedding_flag_and_invalid_binding(console):
+    _, save_settings, path = console
+    assert json.loads(save_settings({"embedding_enabled": False}).data)["status"] == "success"
+    assert config.conf()["embedding_enabled"] is False
+    assert json.loads(save_settings({"embedding_enabled": "false"}).data)["status"] == "error"
+    before = path.read_bytes()
+    assert json.loads(save_settings({"bot_type": "custom:missing"}).data)["status"] == "error"
+    assert path.read_bytes() == before

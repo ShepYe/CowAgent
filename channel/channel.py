@@ -2,7 +2,7 @@
 Message sending channel abstract class
 """
 
-from bridge.bridge import Bridge
+from bridge.bridge import current_bridge
 from bridge.context import Context
 from bridge.reply import *
 from common.log import logger
@@ -167,7 +167,7 @@ class Channel(object):
                 on_event = context.get("on_event") if context else None
 
                 # Use agent bridge to handle the query
-                return Bridge().fetch_agent_reply(
+                return current_bridge().fetch_agent_reply(
                     query=query,
                     context=context,
                     on_event=on_event,
@@ -176,13 +176,13 @@ class Channel(object):
             except Exception as e:
                 logger.error(f"[Channel] Agent mode failed, fallback to normal mode: {e}")
                 # Fallback to normal mode if agent fails
-                return Bridge().fetch_reply_content(query, context)
+                return current_bridge().fetch_reply_content(query, context)
         else:
             # Normal mode
-            return Bridge().fetch_reply_content(query, context)
+            return current_bridge().fetch_reply_content(query, context)
 
     def build_voice_to_text(self, voice_file) -> Reply:
-        return Bridge().fetch_voice_to_text(voice_file)
+        return current_bridge().fetch_voice_to_text(voice_file)
 
     def build_text_to_voice(self, text) -> Reply:
-        return Bridge().fetch_text_to_voice(text)
+        return current_bridge().fetch_text_to_voice(text)

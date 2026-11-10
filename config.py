@@ -7,6 +7,9 @@ import os
 import pickle
 import sys
 import time
+import threading
+from contextvars import ContextVar
+from contextlib import contextmanager
 
 from common.log import logger
 from common import i18n
@@ -16,6 +19,8 @@ from cli.config_json import deep_merge_dicts as _deep_merge_dicts, merge_duplica
 # The values here are placeholders only; the program does NOT read them.
 # They merely document the expected format — put real values in config.json.
 available_setting = {
+    "personal_assistant_enabled": False,
+    "personal_feishu_binding": {},
     # global UI language for CLI, startup logs, error messages, agent prompts
     # and channel replies. Options: "auto" (detect from system locale, default),
     # "zh" (Chinese) or "en" (English). An explicit value locks the language.
@@ -137,6 +142,7 @@ available_setting = {
     # Google Gemini Api Key
     "gemini_api_key": "",
     # Embedding model config
+    "embedding_enabled": True,  # absent: legacy auto selection; false: keyword only
     "embedding_provider": "",  # explicitly set the provider: openai / linkai / dashscope / doubao / zhipu (aligned with bot_type naming)
     "embedding_model": "",     # leave empty to use the provider's default model
     "embedding_dimensions": 0, # leave empty/0 to use the provider's default dimension (1024 recommended for consistency)
@@ -448,6 +454,7 @@ class Config(dict):
 
 
 config = Config()
+config_lock = threading.Lock()
 
 
 _SENSITIVE_KEY_PARTS = ("key", "secret", "token", "password", "passwd", "cookie", "authorization")
@@ -965,8 +972,22 @@ def read_file(path):
         return f.read()
 
 
+_config_scope = ContextVar("cow_config_scope", default=None)
+
+
 def conf():
-    return config
+    scoped = _config_scope.get()
+    return scoped if scoped is not None else config
+
+
+@contextmanager
+def config_scope(snapshot):
+    """Use a private configuration for this synchronous execution context."""
+    token = _config_scope.set(snapshot)
+    try:
+        yield snapshot
+    finally:
+        _config_scope.reset(token)
 
 
 def get_appdata_dir():

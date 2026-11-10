@@ -28,6 +28,8 @@ def create_default_embedding_provider():
     """
     from config import conf
 
+    if conf().get("embedding_enabled", True) is False:
+        return None
     raw_provider = conf().get("embedding_provider")
     explicit_provider = raw_provider.strip().lower() if isinstance(raw_provider, str) else ""
     if not explicit_provider:

@@ -18,7 +18,7 @@ from .event import *
 def _plugins_resource_dir():
     """Read-only plugins source dir. In a frozen bundle it lives under the
     resource root (sys._MEIPASS); from source it's the CWD-relative ./plugins."""
-    if getattr(sys, "frozen", False):
+    if getattr(sys, "frozen", False) or os.environ.get("COW_DATA_DIR"):
         return os.path.join(get_resource_root(), "plugins")
     return "./plugins"
 
@@ -27,7 +27,7 @@ def _plugins_data_dir():
     """Writable dir for plugin runtime config (plugins.json). In a frozen
     bundle the resource dir is read-only, so redirect writes to the data root
     (~/.cow); from source it stays the CWD-relative ./plugins."""
-    if getattr(sys, "frozen", False):
+    if getattr(sys, "frozen", False) or os.environ.get("COW_DATA_DIR"):
         d = os.path.join(get_data_root(), "plugins")
         os.makedirs(d, exist_ok=True)
         return d

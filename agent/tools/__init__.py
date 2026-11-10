@@ -1,3 +1,5 @@
+from agent.tools.knowledge_ingest import KnowledgeIngest
+from agent.tools.knowledge_source_action import KnowledgeSourceAction
 # Import base tool
 from agent.tools.base_tool import BaseTool
 from agent.tools.tool_manager import ToolManager
@@ -145,6 +147,8 @@ McpClientRegistry = _mcp_tools.get('McpClientRegistry')
 
 # Export all tools (including optional ones that might be None)
 __all__ = [
+    'KnowledgeIngest',
+    'KnowledgeSourceAction',
     'BaseTool',
     'ToolManager',
     'Read',

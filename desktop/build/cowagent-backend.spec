@@ -27,11 +27,7 @@ def rp(*parts):
 # --- Hidden imports -------------------------------------------------------
 # Channels are imported dynamically by channel_factory via string names, so
 # PyInstaller's static analysis can't see them. List every channel we ship.
-# Feishu (channel.feishu.feishu_channel) is bundled so the channel code is
-# present; its heavy lark_oapi SDK is deliberately NOT bundled — see the
-# `excludes` note below and channel/feishu/lark_install.py, which downloads a
-# trimmed bundle the first time the user enables Feishu (fixes
-# zhayujie/CowAgent#2987: "客户端没有飞书通道").
+# Personal builds bundle Feishu SDK for offline channel startup.
 hiddenimports = [
     # channels (dynamic import in channel/channel_factory.py)
     'channel.web.web_channel',
@@ -66,6 +62,9 @@ hiddenimports += collect_submodules('agent.tools')
 hiddenimports += collect_submodules('models')
 hiddenimports += collect_submodules('voice')
 hiddenimports += collect_submodules('bridge')
+hiddenimports += collect_submodules('common')
+# Personal installation includes Feishu SDK for offline first startup.
+hiddenimports += collect_submodules('lark_oapi')
 
 # Plugin framework + plugins. WebChannel -> ChatChannel imports
 # `from plugins import *`, and desktop mode loads plugins (in a background
@@ -174,17 +173,12 @@ datas += collect_data_files('playwright', include_py_files=True)
 # --- Excludes -------------------------------------------------------------
 # Keep the bundle lean: drop tests/docs and dev-only packages.
 #
-# Feishu's lark_oapi (~122MB unpacked) is intentionally EXCLUDED here. The first
-# time a user enables the Feishu channel, channel/feishu/lark_install.py
-# downloads a trimmed, pure-Python bundle (~1MB, built by
-# desktop/build/build-feishu-vendor.py) into ~/.cow/feishu_vendor and adds it to
-# sys.path. This keeps the base download small while Feishu still works out of
-# the box after a one-time fetch (fixes zhayujie/CowAgent#2987).
+# Personal builds include lark_oapi; first-download is unnecessary.
 excludes = [
-    'lark_oapi',          # Feishu SDK — fetched on demand, NOT bundled (see above)
     'tests',
     'pip',
-    'wheel',
+    # setuptools vendors wheel; excluding it conflicts with PyInstaller's
+    # pre-safe-import alias hook (ExcludedModule vs vendored wheel).
     'pytest',
     # NOTE: playwright is now BUNDLED (pure-Python package + Node driver, ~10-15MB)
     # so the browser tool works out of the box on desktop. The heavy Chromium

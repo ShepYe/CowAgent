@@ -676,6 +676,9 @@ def _warn_if_legacy_workspace_data_exists():
     directory's contents over. The new workspace would otherwise look
     empty even though old data still exists, with no indication why.
     """
+    from common.personal_tasks import personal_enabled
+    if personal_enabled():
+        return
     try:
         from common.state_dir import state_root_str
         from common.utils import expand_path
@@ -851,6 +854,11 @@ def run():
         set_channel_manager(channel_mgr)
         channel_mgr.start(channel_names, first_start=True)
 
+        from common.personal_tasks import personal_enabled
+        if personal_enabled():
+            from common.personal_worker import recover
+            recover()
+
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
@@ -867,4 +875,10 @@ def run():
 
 
 if __name__ == "__main__":
-    run()
+    if "--personal-self-test" in sys.argv:
+        import json
+        from common.personal_selftest import run as self_test
+        index = sys.argv.index("--personal-self-test")
+        print(json.dumps(self_test(sys.argv[index + 1]), ensure_ascii=False))
+    else:
+        run()

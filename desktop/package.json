@@ -18,7 +18,10 @@
     "dist:win": "npm run build && electron-builder --win",
     "flavor:apply": "node scripts/apply-flavor.mjs",
     "flavor:clear": "node scripts/apply-flavor.mjs --clear",
-    "dist:flavor": "node scripts/apply-flavor.mjs $FLAVOR && npm run build && electron-builder && node scripts/apply-flavor.mjs --clear"
+    "dist:flavor": "node scripts/apply-flavor.mjs $FLAVOR && npm run build && electron-builder && node scripts/apply-flavor.mjs --clear",
+    "dist:win:personal": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-personal.ps1",
+    "predev": "node scripts/apply-flavor.mjs personal",
+    "predev:main": "node scripts/apply-flavor.mjs personal"
   },
   "dependencies": {
     "electron-updater": "^6.8.9",
@@ -46,8 +49,8 @@
     "vite": "^6.0.3"
   },
   "build": {
-    "appId": "com.cowagent.desktop",
-    "productName": "CowAgent",
+    "appId": "com.cowagent.personal",
+    "productName": "CowAgent Personal",
     "directories": {
       "output": "release"
     },
@@ -107,12 +110,10 @@
       "perMachine": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
-      "createStartMenuShortcut": true
+      "createStartMenuShortcut": true,
+      "deleteAppDataOnUninstall": false
     },
-    "publish": {
-      "provider": "generic",
-      "url": "https://cowagent.ai/update/"
-    }
+    "publish": null
   },
   "overrides": {
     "js-yaml": "4.3.1",

@@ -778,7 +778,10 @@ class WebChannel(ChatChannel):
 
     @staticmethod
     def _cleanup_stale_voice_recordings(max_age_seconds: int = 3600) -> None:
-        """Drop voice_input_* uploads older than max_age_seconds (run at startup)."""
+        """Drop old mic uploads only for installations with automatic retention."""
+        from common.personal_tasks import personal_enabled
+        if personal_enabled():
+            return
         try:
             upload_dir = _get_upload_dir()
             if not os.path.isdir(upload_dir):
@@ -1132,6 +1135,16 @@ class WebChannel(ChatChannel):
                     logger.info(f"[WebChannel] Attached {len(file_refs)} file(s) to message")
 
             request_id = self._generate_request_id()
+            personal_task = None
+            from common.personal_tasks import personal_enabled
+            if personal_enabled() and attachments:
+                from common.personal_intake import receive_desktop, task_prompt
+                personal_task = receive_desktop(
+                    request_id, session_id, typed_prompt, attachments,
+                    _get_upload_dir(resolved_agent_id), _get_workspace_root(session_id, resolved_agent_id),
+                )
+                if personal_task:
+                    prompt += task_prompt(personal_task)
             self.request_to_session[request_id] = session_id
             self.request_to_agent[request_id] = resolved_agent_id
 
@@ -1165,6 +1178,9 @@ class WebChannel(ChatChannel):
             context["receiver"] = session_id
             context["request_id"] = request_id
             context["agent_id"] = resolved_agent_id
+            if personal_task:
+                context["personal_task_id"] = personal_task["task_id"]
+                context["config_revision"] = personal_task["config_revision"]
             # Addressing a teammate hands them the turn. The conversation still
             # belongs to `resolved_agent_id`, so this only changes who answers.
             # The composer already knows who it wrote; parsing the text is the

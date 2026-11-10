@@ -4,6 +4,7 @@ import { t } from '../../i18n'
 import apiClient, { type IntegrationsState } from '../../api/client'
 import ChatApiCard, { CopyButton } from './ChatApiCard'
 import GuestSharesCard from './shares/GuestSharesCard'
+import PersonalBindingCard from './PersonalBindingCard'
 import { askConfirm } from '../../store/confirmStore'
 import { Btn, Card, Dropdown, Field, TextInput } from './primitives'
 
@@ -253,6 +254,7 @@ const IntegrationsTab: React.FC<{
         </div>
       </Card>
 
+      <PersonalBindingCard />
       <ChatApiCard baseUrl={linkBase} />
 
       <GuestSharesCard base={linkBase} onNotice={notice} onGoToPassword={onGoToPassword} />

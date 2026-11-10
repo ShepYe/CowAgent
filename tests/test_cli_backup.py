@@ -225,6 +225,7 @@ def test_fresh_restore_ignores_archive_controlled_destinations(tmp_path, monkeyp
 
     fake_home = tmp_path / "home"
     monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
     target_data = tmp_path / "target-data"
     result = restore_backup_archive(archive, target_data)
 

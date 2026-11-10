@@ -1,3 +1,4 @@
+import { instanceDataDir, personalInstance, initializePersonalInstance } from './instance-paths'
 import { app } from 'electron'
 import { ChildProcess, spawn, execFileSync } from 'child_process'
 import { EventEmitter } from 'events'
@@ -11,7 +12,7 @@ import crypto from 'crypto'
 // Writable data dir for the packaged app (config.json, run.log, user data).
 // Lives in the user's home so it survives app updates and avoids writing into
 // the read-only app bundle. Source/dev runs keep using the repo CWD instead.
-const COW_DATA_DIR = path.join(os.homedir(), '.cow')
+const COW_DATA_DIR = instanceDataDir
 
 // Preferred port for the desktop backend. Deliberately not 9899 (the web
 // console's default) so a source-run `python app.py` never collides with the
@@ -169,7 +170,7 @@ export class PythonBackend extends EventEmitter {
    * that had no run.log in it at all.
    */
   getDataDir(): string {
-    return this.packaged ? COW_DATA_DIR : this.backendPath
+    return this.packaged || personalInstance ? COW_DATA_DIR : this.backendPath
   }
 
   getDesktopToken(): string {
@@ -474,6 +475,10 @@ export class PythonBackend extends EventEmitter {
       if (await this.isPortFree(port)) {
         return port
       }
+      if (personalInstance) {
+        this.emit('log', `Port ${port} is busy — leaving its owner running`)
+        continue
+      }
       await this.freePort(port)
       if (await this.isPortFree(port)) {
         return port
@@ -529,6 +534,7 @@ export class PythonBackend extends EventEmitter {
    * can't free it we still try to bind and let the backend surface EADDRINUSE.
    */
   private async freePort(port: number): Promise<void> {
+    if (personalInstance) return
     if (await this.isPortFree(port)) {
       return
     }
@@ -708,6 +714,7 @@ export class PythonBackend extends EventEmitter {
     this.lastError = null
 
     // Packaged app stores writable data in ~/.cow; dev keeps it in the repo.
+    initializePersonalInstance()
     const dataDir = this.getDataDir()
 
     // Start mirroring backend output to run.log before we spawn, so even an
@@ -779,7 +786,7 @@ export class PythonBackend extends EventEmitter {
       }
       command = pythonPath
       args = [appPath]
-      cwd = this.backendPath
+      cwd = personalInstance ? dataDir : this.backendPath
       this.emit('log', `Starting Python backend: ${pythonPath} ${appPath}`)
     }
 
@@ -800,12 +807,18 @@ export class PythonBackend extends EventEmitter {
         // two sides can never disagree (and we avoid the 9899 web-console clash).
         COW_WEB_PORT: String(this.port),
         COW_DESKTOP_TOKEN: this.desktopToken,
-        ...(bundled ? { COW_DATA_DIR } : {}),
+        ...(bundled || personalInstance ? { COW_DATA_DIR: dataDir } : {}),
+        ...(personalInstance ? { COW_PERSONAL: '1', COW_HOME: dataDir } : {}),
         ...this.appConfigEnv(),
         COW_CLIENT_VERSION: app.getVersion(),
       },
       stdio: ['pipe', 'pipe', 'pipe'],
     })
+
+    if (personalInstance && this.process.pid) {
+      // Backup is offline-only; never infer another instance from its image name.
+      fs.writeFileSync(path.join(dataDir, '.personal-backend.pid'), String(this.process.pid), 'utf8')
+    }
 
     const onOutput = (data: Buffer) => {
       const text = data.toString()
@@ -996,7 +1009,7 @@ export class PythonBackend extends EventEmitter {
       // the tree walk missed a re-parented child. Scoped to our exe name so it
       // can't touch unrelated processes.
       try {
-        execFileSync('taskkill', ['/im', 'cowagent-backend.exe', '/T', '/F'], {
+        if (!personalInstance) execFileSync('taskkill', ['/im', 'cowagent-backend.exe', '/T', '/F'], {
           stdio: 'ignore',
           timeout: 5000,
         })

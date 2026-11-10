@@ -1,15 +1,19 @@
 """Portable local backup and restore commands for CowAgent user data."""
 
 import errno
+import hashlib
+import sqlite3
 import json
+import logging
 import os
 import re
 import shutil
 import stat
 import tempfile
 import zipfile
+from contextlib import closing
 from datetime import datetime, timezone
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Iterable, Optional, Set
 
 import click
@@ -37,10 +41,10 @@ BACKUP_FORMAT = "cowagent-backup"
 # stays restorable by older CowAgent versions.
 BACKUP_VERSION = 2
 _SINGLE_WORKSPACE_VERSION = 1
-_SUPPORTED_BACKUP_VERSIONS = {_SINGLE_WORKSPACE_VERSION, BACKUP_VERSION}
+_SUPPORTED_BACKUP_VERSIONS = {_SINGLE_WORKSPACE_VERSION, BACKUP_VERSION, 3}
 _AGENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _SKIP_DIRS = {".git", "__pycache__", "tmp"}
-_SKIP_FILES = {".DS_Store"}
+_SKIP_FILES = {".DS_Store", ".personal-backend.pid", ".cow.pid"}
 
 
 def _data_root() -> Path:
@@ -61,7 +65,7 @@ def _read_config(data_root: Path) -> dict:
 
 
 def _workspace_from_config(config: dict) -> Path:
-    return Path(config.get("agent_workspace") or "~/cow").expanduser().resolve()
+    return Path(config.get("agent_workspace") or (_data_root() / "workspace" if os.environ.get("COW_PERSONAL") == "1" else "~/cow")).expanduser().resolve()
 
 
 def _configured_workspaces(config: dict, fallback: Path):
@@ -94,6 +98,7 @@ def _iter_workspace_files(
     workspace: Path,
     excluded: Set[Path],
     pruned_dirs: Optional[Set[Path]] = None,
+    complete: bool = False,
 ):
     pruned = {Path(path).resolve() for path in (pruned_dirs or ())}
     if not workspace.is_dir():
@@ -102,7 +107,7 @@ def _iter_workspace_files(
         current_path = Path(current)
         dirnames[:] = [
             name for name in dirnames
-            if name not in _SKIP_DIRS
+            if (name not in _SKIP_DIRS or (complete and name == "tmp"))
             and not (current_path / name).is_symlink()
             and (current_path / name).resolve() not in pruned
         ]
@@ -116,11 +121,28 @@ def _iter_workspace_files(
                 yield path
 
 
+def _require_personal_stopped(data_root: Path) -> None:
+    """完整实例备份仅允许离线运行；逐库 backup API 不是跨库事务。"""
+    from cli.commands.process import _is_pid_alive
+
+    for name in (".personal-backend.pid", ".cow.pid"):
+        path = data_root / name
+        if not path.exists():
+            continue
+        try:
+            pid = int(path.read_text(encoding="utf-8").strip())
+        except (ValueError, OSError) as exc:
+            raise ValueError("个人实例 PID 记录不可核验，请先退出后端再备份/恢复") from exc
+        if pid > 0 and _is_pid_alive(pid):
+            raise ValueError(f"个人实例后端仍在运行（PID {pid}），请先退出桌面后端再执行完整备份/恢复；不支持跨数据库在线快照")
+
+
 def create_backup_archive(
     output: Path,
     data_root: Path,
     workspace: Path,
     excluded_paths: Optional[Iterable[Path]] = None,
+    complete: Optional[bool] = None,
 ) -> dict:
     """Create a portable archive containing config and every agent workspace."""
     output = Path(output).expanduser().resolve()
@@ -136,6 +158,10 @@ def create_backup_archive(
         # The roster lives beside the workspaces, so read it from the tree
         # being archived rather than from wherever config.json happens to point.
         config = _team().resolve({**config, "agent_workspace": str(workspace)})
+    if complete is None:
+        complete = config.get("personal_instance") is True or config.get("personal_assistant_enabled") is True
+    if complete:
+        _require_personal_stopped(data_root)
     legacy_path = _legacy_user_data_path(data_root, config)
     profiles, explicit_registry, default_agent_id = _configured_workspaces(config, workspace)
     sources = {
@@ -157,7 +183,7 @@ def create_backup_archive(
             for other_id, other in sources.items()
             if other_id != profile.id and other != source and _is_within(other, source)
         }
-        files = list(_iter_workspace_files(source, excluded, nested))
+        files = list(_iter_workspace_files(source, excluded, nested, complete=complete))
         size = sum(path.stat().st_size for path in files)
         archive_root = (
             f"agents/{profile.id}/workspace"
@@ -170,9 +196,10 @@ def create_backup_archive(
 
     manifest = {
         "format": BACKUP_FORMAT,
-        "version": BACKUP_VERSION if explicit_registry else _SINGLE_WORKSPACE_VERSION,
+        "version": 3 if complete else (BACKUP_VERSION if explicit_registry else _SINGLE_WORKSPACE_VERSION),
         "created_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "layout": "agents" if explicit_registry else "workspace",
+        "data_root_source": str(data_root),
         "workspace_source": str(
             next(
                 source
@@ -215,10 +242,22 @@ def create_backup_archive(
         with zipfile.ZipFile(
             str(temp_archive), "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True
         ) as archive:
-            archive.writestr(
-                "manifest.json",
-                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-            )
+            def write_file(path, name):
+                # Backup API includes committed WAL pages and produces one standalone DB.
+                with path.open("rb") as source:
+                    is_sqlite = source.read(16) == b"SQLite format 3\0"
+                if is_sqlite:
+                    snapshot = temp_dir / "sqlite-snapshot"
+                    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as src:
+                        with closing(sqlite3.connect(snapshot)) as dst:
+                            src.backup(dst)
+                    try:
+                        archive.write(snapshot, name)
+                    finally:
+                        snapshot.unlink()
+                else:
+                    archive.write(path, name)
+
             if config_path.is_file():
                 # The archive keeps the roster inside config.json even though a
                 # live install stores it separately. An archive is a snapshot,
@@ -234,11 +273,34 @@ def create_backup_archive(
                     # rewrite it without losing whatever it does hold.
                     archive.write(str(config_path), "data/config.json")
             if legacy_path.is_file():
-                archive.write(str(legacy_path), "data/user_datas.pkl")
+                write_file(legacy_path, "data/user_datas.pkl")
             for _, source, archive_root, files, _ in workspace_entries:
                 for path in files:
                     relative = path.relative_to(source).as_posix()
-                    archive.write(str(path), f"{archive_root}/{relative}")
+                    if complete and path.name.endswith(("-wal", "-shm")):
+                        continue
+                    write_file(path, f"{archive_root}/{relative}")
+            if complete:
+                # Data-root files include session caches, attachment associations,
+                # credentials and processing state outside the workspace.
+                for path in _iter_workspace_files(data_root, excluded, set(sources.values()) | {temp_dir}, complete=True):
+                    if path == config_path or path.name.endswith(("-wal", "-shm")):
+                        continue
+                    write_file(path, "data/instance/" + path.relative_to(data_root).as_posix())
+                manifest["schema_version"] = 1
+            if not complete:
+                archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+        if complete:
+            manifest["files"] = {}
+            with zipfile.ZipFile(temp_archive) as staged:
+                for info in staged.infolist():
+                    digest = hashlib.sha256()
+                    with staged.open(info) as source:
+                        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                    manifest["files"][info.filename] = {"size": info.file_size, "sha256": digest.hexdigest()}
+            with zipfile.ZipFile(temp_archive, "a", compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
         try:
             os.replace(str(temp_archive), str(output))
         except OSError as exc:
@@ -260,6 +322,8 @@ def create_backup_archive(
 
 def _validate_archive(archive: zipfile.ZipFile) -> dict:
     names = {info.filename for info in archive.infolist()}
+    if len(names) != len(archive.infolist()):
+        raise ValueError("duplicate archive entries")
     if "manifest.json" not in names:
         raise ValueError("archive is missing manifest.json")
     try:
@@ -272,6 +336,24 @@ def _validate_archive(archive: zipfile.ZipFile) -> dict:
         or version not in _SUPPORTED_BACKUP_VERSIONS
     ):
         raise ValueError("unsupported CowAgent backup format or version")
+
+    if version == 3:
+        if manifest.get("schema_version") != 1:
+            raise ValueError("unsupported backup schema_version")
+        files = manifest.get("files")
+        if not isinstance(files, dict) or set(files) != names - {"manifest.json"}:
+            raise ValueError("backup file manifest does not match archive")
+        for name, metadata in files.items():
+            digest = hashlib.sha256()
+            size = 0
+            with archive.open(name) as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(chunk)
+                    size += len(chunk)
+            if not isinstance(metadata, dict) or metadata.get("size") != size or metadata.get("sha256") != digest.hexdigest():
+                raise ValueError(f"backup integrity mismatch: {name}")
+    elif archive.testzip() is not None:
+        raise ValueError("backup CRC mismatch")
 
     # The user dimension is declared but not yet produced. Checked at any
     # version, because the slot travels on single-workspace archives too.
@@ -308,7 +390,7 @@ def _validate_archive(archive: zipfile.ZipFile) -> dict:
     for info in archive.infolist():
         name = info.filename
         path = PurePosixPath(name)
-        if not name or path.is_absolute() or ".." in path.parts or "\\" in name:
+        if not name or path.is_absolute() or ".." in path.parts or "\\" in name or ":" in name or any(part.endswith((".", " ")) for part in path.parts):
             raise ValueError(f"unsafe archive path: {name!r}")
         mode = (info.external_attr >> 16) & 0o170000
         if mode == stat.S_IFLNK:
@@ -424,6 +506,123 @@ def _multi_agent_destinations(
     return archived_registry, destinations
 
 
+def _validate_schemas(root: Path) -> None:
+    for path in _iter_workspace_files(root, set(), complete=True):
+        if path.suffix == ".json":
+            try:
+                record = json.loads(path.read_text(encoding="utf-8-sig"))
+            except (ValueError, UnicodeError):
+                continue
+            if isinstance(record, dict) and "schema_version" in record and record["schema_version"] != 1:
+                raise ValueError(f"unsupported schema_version: {path.name}")
+        with path.open("rb") as handle:
+            is_sqlite = handle.read(16) == b"SQLite format 3\0"
+        if is_sqlite:
+            with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
+                if db.execute("PRAGMA user_version").fetchone()[0] > 1:
+                    raise ValueError(f"unsupported SQLite schema: {path.name}")
+                if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                    raise ValueError(f"invalid SQLite snapshot: {path.name}")
+                for (table,) in db.execute("SELECT name FROM sqlite_master WHERE type='table'"):
+                    quoted = '"' + table.replace('"', '""') + '"'
+                    columns = [row[1] for row in db.execute(f"PRAGMA table_info({quoted})")]
+                    if "record" in columns:
+                        for (body,) in db.execute(f"SELECT record FROM {quoted}"):
+                            try:
+                                record = json.loads(body)
+                            except (ValueError, TypeError):
+                                continue
+                            if isinstance(record, dict) and "schema_version" in record and record["schema_version"] != 1:
+                                raise ValueError(f"unsupported record schema: {path.name}")
+                    if "schema_version" in columns and db.execute(f"SELECT 1 FROM {quoted} WHERE schema_version != 1 LIMIT 1").fetchone():
+                        raise ValueError(f"unsupported record schema: {path.name}")
+
+
+def _relocate_personal_databases(staging: Path, manifest: dict, data_root: Path,
+                                 target_workspace: Path, destinations: dict) -> None:
+    """只改已校验 staging 的 v1 路径槽位；正文、摘要、定位和指纹原样保留。"""
+    mappings = []
+    if manifest.get("data_root_source"):
+        mappings.append((manifest["data_root_source"], data_root))
+    for item in manifest.get("agents", []):
+        mappings.append((item["workspace_source"], destinations.get(item["id"], target_workspace)))
+    if manifest.get("workspace_source"):
+        mappings.append((manifest["workspace_source"], target_workspace))
+
+    def pure(value):
+        return PureWindowsPath(value) if PureWindowsPath(value).drive or "\\" in value else PurePosixPath(value)
+
+    mappings.sort(key=lambda pair: len(pure(pair[0]).parts), reverse=True)
+
+    def relocate(value):
+        if not isinstance(value, str) or not pure(value).is_absolute():
+            return value  # Publication result paths are deliberately relative.
+        path = pure(value)
+        for old, new in mappings:
+            try:
+                relative = path.relative_to(pure(old))
+            except ValueError:
+                continue
+            if ".." in relative.parts:
+                raise ValueError("unsafe persisted source path")
+            result = new.joinpath(*relative.parts)
+            if not _is_within(result, new):
+                raise ValueError("unsafe relocated source path")
+            return str(result)
+        raise ValueError("persisted source path has no archived root mapping")
+
+    def source_ref(record):
+        if isinstance(record, dict):
+            for key in ("original", "path"):
+                if key in record:
+                    record[key] = relocate(record[key])
+
+    def task_record(record):
+        for item in record.get("attachments", []):
+            if "path" in item:
+                item["path"] = relocate(item["path"])
+        for item in record.get("source_candidates", []):
+            if "workspace" in item:
+                item["workspace"] = relocate(item["workspace"])
+        for key in ("result_refs", "source_existing_refs"):
+            for item in record.get(key, []):
+                source_ref(item)
+        for decision in record.get("attachment_decisions", {}).values():
+            if "workspace" in decision:
+                decision["workspace"] = relocate(decision["workspace"])
+            source_ref(decision.get("source"))
+            source_ref(decision.get("result_ref"))
+
+    databases = [(staging / "data/instance/personal/tasks.sqlite3", True)]
+    for item in manifest.get("agents", []):
+        databases.append((staging / item["archive_root"] / ".personal_sources/sources.sqlite3", False))
+    if not manifest.get("agents"):
+        databases.append((staging / "workspace/.personal_sources/sources.sqlite3", False))
+    for path, is_tasks in databases:
+        if not path.is_file():
+            continue
+        with closing(sqlite3.connect(path)) as db:
+            tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            with db:
+                for table in (("tasks", "events") if is_tasks else ("revisions", "receipts")):
+                    if table not in tables:
+                        continue
+                    for rowid, body in db.execute(f"SELECT rowid, record FROM {table}").fetchall():
+                        record = json.loads(body)
+                        if is_tasks:
+                            task_record(record)
+                        elif "original" in record:
+                            record["original"] = relocate(record["original"])
+                        db.execute(f"UPDATE {table} SET record=? WHERE rowid=?",
+                                   (json.dumps(record, ensure_ascii=False), rowid))
+                if not is_tasks and "publications" in tables:
+                    for rowid, value in db.execute("SELECT rowid, path FROM publications").fetchall():
+                        db.execute("UPDATE publications SET path=? WHERE rowid=?", (relocate(value), rowid))
+            # Close with no sidecars: publishing copies only the standalone DB.
+            db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            db.execute("PRAGMA journal_mode=DELETE")
+
+
 def restore_backup_archive(
     archive_path: Path,
     data_root: Path,
@@ -441,6 +640,40 @@ def restore_backup_archive(
         current_config = _team().resolve(current_config)
 
     temp_dir = Path(tempfile.mkdtemp(prefix="cowagent-restore-"))
+    undo = []
+    paused_loggers = []
+    def preserve(destination):
+        saved = temp_dir / "undo" / str(len(undo))
+        if destination.exists():
+            saved.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(destination, saved)
+        undo.append((destination, saved if saved.exists() else None))
+
+    def publish(source, destination, **kwargs):
+        destination = Path(destination)
+        # CLI imports can open the destination run.log before restore begins.
+        # Windows cannot replace that file; POSIX would leave the logger writing
+        # to its unlinked old inode. Pause only our matching file handlers until
+        # publication or rollback has finished, then continue the restored log.
+        loggers = [logging.getLogger(), *list(logging.Logger.manager.loggerDict.values())]
+        for log in loggers:
+            if not isinstance(log, logging.Logger):
+                continue
+            for handler in list(log.handlers):
+                if isinstance(handler, logging.FileHandler) and Path(handler.baseFilename).resolve() == destination.resolve():
+                    log.removeHandler(handler)
+                    paused_loggers.append((log, handler))
+                    handler.close()
+        # Reject pre-existing symlinks/junction escapes before touching files.
+        preserve(destination)
+        with Path(source).open("rb") as handle:
+            if handle.read(16) == b"SQLite format 3\0":
+                for suffix in ("-wal", "-shm"):
+                    sidecar = Path(str(destination) + suffix)
+                    if sidecar.exists():
+                        preserve(sidecar)
+                        sidecar.unlink()
+        _atomic_copy(source, destination, **kwargs)
     try:
         with zipfile.ZipFile(str(archive_path), "r") as archive:
             manifest = _validate_archive(archive)
@@ -455,6 +688,9 @@ def restore_backup_archive(
                 raise ValueError("archived config.json must contain an object")
             archived_config = value
 
+        if manifest.get("version") == 3:
+            _require_personal_stopped(data_root)
+            _validate_schemas(temp_dir)
         restored_config = dict(archived_config)
         multi_agent = (
             manifest.get("version", 1) >= 2
@@ -491,7 +727,7 @@ def restore_backup_archive(
                 # Do not trust an archive-controlled absolute destination on a
                 # fresh machine. Portable restores default to ~/cow unless the
                 # operator supplies --workspace.
-                target_workspace = Path("~/cow").expanduser().resolve()
+                target_workspace = data_root / "workspace" if manifest.get("version") == 3 else Path("~/cow").expanduser().resolve()
             if restored_config:
                 restored_config["agent_workspace"] = str(target_workspace)
 
@@ -503,6 +739,33 @@ def restore_backup_archive(
                     # Keep legacy user data under the selected data root
                     # instead of writing to an archive-controlled path.
                     restored_config["appdata_dir"] = ""
+        if manifest.get("version") == 3:
+            _validate_schemas(data_root)
+            for target in (list(destinations.values()) if multi_agent else [target_workspace]):
+                _validate_schemas(target)
+            # Resolve every destination before publication, including symlink ancestors.
+            roots = {"data/instance/": data_root}
+            if multi_agent:
+                for item in manifest["agents"]:
+                    roots[item["archive_root"] + "/"] = destinations[item["id"]]
+            else:
+                roots["workspace/"] = target_workspace
+            for name in manifest["files"]:
+                for prefix, target in roots.items():
+                    if name.startswith(prefix) and not _is_within(target / name[len(prefix):], target):
+                        raise ValueError("unsafe restore destination")
+
+        if manifest.get("version") == 3:
+            _relocate_personal_databases(temp_dir, manifest, data_root, target_workspace, destinations)
+            _validate_schemas(temp_dir)
+
+        recovery_point = None
+        if manifest.get("version") == 3:
+            # Stop the backend before calling restore. Preserve every current byte
+            # before a downgrade/restore, including data a compatible old point lacks.
+            if data_root.exists() or target_workspace.exists():
+                recovery_path = archive_path.parent / ("cow-recovery-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + ".zip")
+                recovery_point = create_backup_archive(recovery_path, data_root, target_workspace, excluded_paths={archive_path}, complete=True)
         restored_files = 0
         restored_agents = []
         if multi_agent:
@@ -512,14 +775,14 @@ def restore_backup_archive(
                 source_root = temp_dir.joinpath(*PurePosixPath(archive_root).parts)
                 agent_files = 0
                 if source_root.is_dir():
-                    for source in _iter_workspace_files(source_root, set()):
+                    for source in _iter_workspace_files(source_root, set(), complete=manifest.get("version") == 3):
                         relative = source.relative_to(source_root)
                         destination = target / relative
                         if not _is_within(destination, target):
                             raise ValueError(
                                 f"unsafe Agent workspace destination: {agent_id}/{relative}"
                             )
-                        _atomic_copy(source, destination, mode=file_modes.get(source))
+                        publish(source, destination, mode=file_modes.get(source))
                         restored_files += 1
                         agent_files += 1
                 restored_agents.append(
@@ -528,13 +791,21 @@ def restore_backup_archive(
         else:
             source_root = temp_dir / "workspace"
             if source_root.is_dir():
-                for source in _iter_workspace_files(source_root, set()):
+                for source in _iter_workspace_files(source_root, set(), complete=manifest.get("version") == 3):
                     relative = source.relative_to(source_root)
                     destination = target_workspace / relative
                     if not _is_within(destination, target_workspace):
                         raise ValueError(f"unsafe workspace destination: {relative}")
-                    _atomic_copy(source, destination, mode=file_modes.get(source))
+                    publish(source, destination, mode=file_modes.get(source))
                     restored_files += 1
+
+        instance_source = temp_dir / "data" / "instance"
+        if manifest.get("version") == 3 and instance_source.is_dir():
+            for source in _iter_workspace_files(instance_source, set(), complete=True):
+                destination = data_root / source.relative_to(instance_source)
+                if not _is_within(destination, data_root):
+                    raise ValueError("unsafe instance destination")
+                publish(source, destination, private=True)
 
         # Publish config only after every workspace file has been validated
         # and copied. A copy failure cannot leave config pointing at a partial
@@ -550,6 +821,7 @@ def restore_backup_archive(
                 if key not in team.TEAM_KEYS
             }
             if multi_agent:
+                preserve(team.team_file(published))
                 team.write(
                     published,
                     {
@@ -564,24 +836,39 @@ def restore_backup_archive(
             with config_temp.open("w", encoding="utf-8") as handle:
                 json.dump(published, handle, ensure_ascii=False, indent=2)
                 handle.write("\n")
-            _atomic_copy(config_temp, data_root / "config.json", private=True)
+            publish(config_temp, data_root / "config.json", private=True)
 
         legacy_source = temp_dir / "data" / "user_datas.pkl"
         if legacy_source.is_file():
             effective_config = restored_config or current_config
             legacy_destination = _legacy_user_data_path(data_root, effective_config)
-            _atomic_copy(legacy_source, legacy_destination, private=True)
+            publish(legacy_source, legacy_destination, private=True)
 
+        if recovery_point:
+            point = temp_dir / "recovery-point.json"
+            point.write_text(json.dumps({"schema_version": 1, "created_at": recovery_point["created_at"], "archive": recovery_point["archive"], "restored_from": str(archive_path)}, ensure_ascii=False, indent=2), encoding="utf-8")
+            publish(point, data_root / "recovery-point.json", private=True)
         return {
             "manifest": manifest,
+            "recovery_point": recovery_point,
             "workspace": str(target_workspace),
             "workspace_files": restored_files,
             "agents": restored_agents,
             "config_restored": bool(restored_config),
             "legacy_user_data_restored": legacy_source.is_file(),
         }
+    except Exception:
+        for destination, saved in reversed(undo):
+            if saved is None:
+                destination.unlink(missing_ok=True)
+            else:
+                shutil.copy2(saved, destination)
+        raise
     finally:
         shutil.rmtree(str(temp_dir), ignore_errors=True)
+        for log, handler in paused_loggers:
+            handler.mode = "a"
+            log.addHandler(handler)
 
 
 @click.command("backup")
@@ -596,10 +883,22 @@ def backup_command(output: Optional[Path]):
     data_root = _data_root()
     config = _read_config(data_root)
     workspace = _workspace_from_config(config)
+    if config.get("personal_assistant_enabled") or config.get("personal_instance"):
+        try:
+            from cli.commands.process import _read_pid
+            pid = _read_pid()
+            if pid:
+                raise ValueError(f"后端仍在运行（PID {pid}），请先停止后端再执行完整备份")
+            _require_personal_stopped(data_root)
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
     if output is None:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         output = Path.cwd() / f"cow-backup-{stamp}.zip"
-    result = create_backup_archive(output, data_root, workspace)
+    try:
+        result = create_backup_archive(output, data_root, workspace)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
     click.echo(click.style("✓ Backup created", fg="green"))
     click.echo(f"  Archive: {result['archive']}")
     click.echo(f"  Agent workspaces: {result['contents']['agent_workspaces']}")

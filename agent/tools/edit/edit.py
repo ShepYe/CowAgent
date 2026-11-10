@@ -94,6 +94,14 @@ class Edit(BaseTool):
         # Resolve path
         absolute_path = self._resolve_path(path)
 
+        from agent.knowledge.personal_assistant import guard_path
+        try:
+            guard_path(absolute_path, write=True)
+            from agent.knowledge.purpose import guard_memory_write
+            guard_memory_write(absolute_path, self.config.get("workspace_root") or self.cwd)
+        except ValueError as exc:
+            return ToolResult.fail(str(exc))
+
         # Same guard the read tool applies. Editing is also a read: the success
         # result carries a diff whose context lines would expose the secrets.
         if is_credential_path(absolute_path):

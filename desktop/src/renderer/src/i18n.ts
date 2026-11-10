@@ -1,5 +1,7 @@
 const translations: Record<string, Record<string, string>> = {
   zh: {
+    personal_withdraw: '撤回资料',
+    personal_withdraw_confirm: '撤回后不再用于后续回答，原件与历史记录继续保留。',
     chat_scroll_to_bottom: '滚动到底部',
     console: '控制台',
     nav_chat: '对话',
@@ -1215,6 +1217,8 @@ const translations: Record<string, Record<string, string>> = {
     slash_version: '查看版本',
   },
   en: {
+    personal_withdraw: 'Withdraw source',
+    personal_withdraw_confirm: 'Exclude this source from future answers and retain its original and history.',
     chat_scroll_to_bottom: 'Scroll to bottom',
     console: 'Console',
     nav_chat: 'Chat',

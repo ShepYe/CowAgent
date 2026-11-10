@@ -7,7 +7,6 @@ page also renders is served by api/models.py.
 
 import json
 import os
-import threading
 
 import web
 
@@ -29,11 +28,12 @@ from channel.web.core.providers import (
 )
 from common import i18n
 from common.log import logger
-from config import conf, get_data_root
+from config import conf, get_data_root, config_lock, drag_sensitive, sync_image_generation_custom_provider_env, CONFIG_TO_ENV
+from models.config_revision import preserve_masked_secrets, validate_provider_bindings
 from models.reasoning_capabilities import provider_reasoning_metadata
 
 
-_settings_save_lock = threading.Lock()
+_settings_save_lock = config_lock
 
 
 class ConfigHandler:
@@ -47,6 +47,8 @@ class ConfigHandler:
         "zhipu_ai_api_key", "dashscope_api_key", "moonshot_api_key",
         "ark_api_key", "minimax_api_key", "linkai_api_key", "custom_api_key", "mimo_api_key",
         "custom_providers",
+        "embedding_enabled",
+        "personal_assistant_enabled", "personal_feishu_binding",
         "agent_max_context_tokens", "agent_max_context_turns", "agent_max_steps",
         "enable_thinking", "reasoning_effort", "reasoning_effort_by_model", "self_evolution_enabled", "web_password",
         "agent_permission_mode",
@@ -138,6 +140,9 @@ class ConfigHandler:
                 "use_agent": use_agent,
                 "title": title,
                 "model": local_config.get("model", ""),
+                "embedding_enabled": local_config.get("embedding_enabled", True),
+                "personal_assistant_enabled": local_config.get("personal_assistant_enabled", False),
+                "personal_feishu_binding": local_config.get("personal_feishu_binding", {}),
                 "bot_type": "openai" if local_config.get("bot_type") == "chatGPT" else local_config.get("bot_type", ""),
                 "use_linkai": bool(local_config.get("use_linkai", False)),
                 "channel_type": local_config.get("channel_type", ""),
@@ -184,7 +189,7 @@ class ConfigHandler:
         web.header('Content-Type', 'application/json; charset=utf-8')
         try:
             data = json.loads(web.data())
-            updates = data.get("updates", {})
+            updates = preserve_masked_secrets(data.get("updates", {}), conf())
             if not updates:
                 return json.dumps({"status": "error", "message": "no updates provided"})
 
@@ -200,6 +205,12 @@ class ConfigHandler:
                     continue
                 if key in ("agent_max_context_tokens", "agent_max_context_turns", "agent_max_steps"):
                     value = int(value)
+                if key == "embedding_enabled" and not isinstance(value, bool):
+                    raise ValueError("embedding_enabled must be boolean")
+                if key == "personal_assistant_enabled" and not isinstance(value, bool):
+                    raise ValueError("personal_assistant_enabled must be boolean")
+                if key == "personal_feishu_binding" and not isinstance(value, dict):
+                    raise ValueError("personal_feishu_binding must be an object")
                 if key in ("use_linkai", "enable_thinking", "self_evolution_enabled"):
                     value = bool(value)
                 # Never persist an unknown mode: every later read would silently
@@ -239,11 +250,20 @@ class ConfigHandler:
                 merged.update(values)
                 file_cfg[section] = merged
                 applied[section] = merged
+            validate_provider_bindings(file_cfg)
             _write_config_file_for_write(config_path, file_cfg)
 
             # Publish only after the file is saved, so a failed save changes nothing.
             for key, value in applied.items():
                 local_config[key] = value
+                env_key = CONFIG_TO_ENV.get(key)
+                if env_key:
+                    if value:
+                        os.environ[env_key] = str(value)
+                    else:
+                        os.environ.pop(env_key, None)
+            if "custom_providers" in applied:
+                sync_image_generation_custom_provider_env(local_config, overwrite=True)
 
             logger.info(f"[WebChannel] Config updated: {list(applied.keys())}")
 
@@ -272,7 +292,7 @@ class ConfigHandler:
             # Reset Bridge so that bot routing reflects the new config.
             # Without this, Bridge keeps its cached bot instance (e.g. LinkAIBot)
             # even after the user switches bot_type / use_linkai / model in UI.
-            bridge_routing_keys = {"bot_type", "use_linkai", "model"}
+            bridge_routing_keys = set(applied)
             if any(k in applied for k in bridge_routing_keys):
                 try:
                     from bridge.bridge import Bridge
@@ -293,7 +313,7 @@ class ConfigHandler:
                 except Exception as limits_err:
                     logger.warning(f"[WebChannel] Failed to apply runtime limits: {limits_err}")
 
-            result = {"status": "success", "applied": applied, "warning": password_warning}
+            result = {"status": "success", "applied": drag_sensitive(applied), "warning": password_warning}
             # A new password voids every token signed with the old one, the
             # caller's included; hand it one for the new password so the
             # client that made the change stays signed in.

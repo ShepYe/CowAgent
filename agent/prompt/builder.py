@@ -610,13 +610,23 @@ def _build_knowledge_section(
     knowledge_root = str(state_dir.knowledge_dir(base=workspace_dir))
     index_path = os.path.join(knowledge_root, "index.md")
     if not os.path.exists(index_path):
-        return []
+        return ["个人接收任务使用 knowledge_ingest 自主处理资料；long_term 发布、transient 仅留档、waiting 仅用于必要澄清。托管资料禁止用 write/edit 绕过版本登记。"]
 
     try:
         with open(index_path, 'r', encoding='utf-8') as f:
             index_content = f.read().strip()
     except Exception:
         return []
+
+    # Managed index entries must not inject stale facts into later turns.
+    from agent.knowledge.personal_assistant import readable
+    import re as _source_re
+    from urllib.parse import unquote as _source_unquote
+    index_content = "\n".join(line for line in index_content.splitlines()
+        if all(readable(os.path.join(knowledge_root, _source_unquote(target)))
+               for target in _source_re.findall(r"\]\((?:\./)?(managed/[^)]+)\)", line)))
+
+    index_content = "个人接收任务使用 knowledge_ingest 自主处理，无需逐份询问。临时资料及派生结论不得写入日记或 Deep Dream。托管页引用必须回读有效原文位置；仅 published/searchable 回执表示可检索。\n" + index_content
 
     # Anchor knowledge paths to ~/cow when a project cwd is active, and to the
     # shared root when this Agent reads the shared copy.

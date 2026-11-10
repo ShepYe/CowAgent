@@ -8,6 +8,33 @@ from contextlib import contextmanager
 from copy import deepcopy
 
 
+def iter_docx_source_units(document):
+    """Body positions follow XML order, including content controls and nested tables."""
+    from docx.oxml.ns import qn
+    from docx.table import Table
+
+    def walk(container, parent, prefix):
+        paragraph, table = 0, 0
+        for element in container.iterchildren():
+            if element.tag == qn("w:p"):
+                paragraph += 1
+                yield {"text": _docx_paragraph_text(element, parent),
+                       "location": {"kind": "docx", "path": f"{prefix}/paragraph[{paragraph}]"}}
+            elif element.tag == qn("w:sdt"):
+                content = element.find(qn("w:sdtContent"))
+                if content is not None:
+                    yield from walk(content, parent, f"{prefix}/control[{list(container).index(element) + 1}]")
+            elif element.tag == qn("w:tbl"):
+                table += 1
+                seen = set()
+                for r, row in enumerate(Table(element, parent).rows, 1):
+                    for c, cell in enumerate(row.cells, 1):
+                        if cell._tc not in seen:
+                            seen.add(cell._tc)
+                            yield from walk(cell._tc, cell, f"{prefix}/table[{table}]/row[{r}]/cell[{c}]")
+    yield from walk(document.element.body, document, "body")
+
+
 def iter_docx_body_text(document):
     """Yield paragraphs and table rows in body order, including content controls.
 

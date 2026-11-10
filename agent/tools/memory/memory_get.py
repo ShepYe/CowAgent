@@ -128,6 +128,8 @@ class MemoryGetTool(BaseTool):
             if not file_path.is_file():
                 return ToolResult.fail(f"Error: {path} is not a regular file")
             
+            from agent.knowledge.personal_assistant import guard_path
+            guard_path(file_path)
             content = file_path.read_text(encoding='utf-8')
             lines = content.split('\n')
             

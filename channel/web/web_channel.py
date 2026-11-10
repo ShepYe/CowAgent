@@ -46,6 +46,9 @@ from channel.web.api.knowledge import (  # noqa: F401
     KnowledgeActionHandler, KnowledgeGraphHandler, KnowledgeImportHandler,
     KnowledgeListHandler, KnowledgeReadHandler,
 )
+from channel.web.api.personal import (  # noqa: F401
+    PersonalTasksHandler, PersonalTaskHandler, PersonalOriginalHandler, PersonalBindingHandler, PersonalReferenceHandler,
+)
 from channel.web.api.logs import LogsDownloadHandler, LogsHandler  # noqa: F401
 from channel.web.api.memory import (  # noqa: F401
     MemoryContentHandler, MemoryHandler,
@@ -157,6 +160,11 @@ URLS = (
     '/api/skills/upload', 'SkillUploadHandler',
     '/api/memory', 'MemoryHandler',
     '/api/memory/content', 'MemoryContentHandler',
+    '/api/personal/tasks', 'PersonalTasksHandler',
+    '/api/personal/tasks/([^/]+)/original/([^/]+)', 'PersonalOriginalHandler',
+    '/api/personal/tasks/([^/]+)/reference/([^/]+)', 'PersonalReferenceHandler',
+    '/api/personal/tasks/([^/]+)', 'PersonalTaskHandler',
+    '/api/personal/binding', 'PersonalBindingHandler',
     '/api/knowledge/list', 'KnowledgeListHandler',
     '/api/knowledge/read', 'KnowledgeReadHandler',
     '/api/knowledge/graph', 'KnowledgeGraphHandler',

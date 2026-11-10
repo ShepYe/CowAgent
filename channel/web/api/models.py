@@ -11,6 +11,7 @@ class because the frontend asks for the whole page state in one request.
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 import json
+import copy
 import os
 
 import requests
@@ -36,6 +37,7 @@ from config import (
     get_data_root,
     sync_image_generation_custom_provider_env,
 )
+from models.config_revision import provider_references, validate_provider_bindings
 from models import model_catalog
 
 
@@ -811,7 +813,7 @@ class ModelsHandler:
         ``_custom_provider_cards``). Otherwise the legacy single ``custom``
         card is shown unchanged.
         """
-        local_config = conf()
+        local_config = copy.deepcopy(conf())
         custom_cards = cls._custom_provider_cards(local_config)
         # Keep the legacy single "custom" card visible alongside the expanded
         # ones when the flat custom_api_key/base config is still active or
@@ -1318,6 +1320,8 @@ class ModelsHandler:
             "current_provider": explicit,
             "suggested_provider": suggested,
             "current_model": local_config.get("embedding_model", "") or "",
+            "enabled": local_config.get("embedding_enabled", True),
+            "mode": "keyword" if local_config.get("embedding_enabled", True) is False else "embedding",
             "current_dim": int(local_config.get("embedding_dimensions") or 0) or None,
             "providers": providers,
             "provider_models": cls._apply_catalog(cls._EMBEDDING_PROVIDER_MODELS, "embedding", custom_cards),
@@ -1796,7 +1800,7 @@ class ModelsHandler:
         _require_auth()
         web.header("Content-Type", "application/json; charset=utf-8")
         try:
-            local_config = conf()
+            local_config = copy.deepcopy(conf())
             return json.dumps({
                 "status": "success",
                 "providers": self._provider_overview(),
@@ -1864,7 +1868,7 @@ class ModelsHandler:
         requested_key = (data.get("api_key") or "").strip()
         requested_base = (data.get("api_base") or "").strip()
 
-        local_config = conf()
+        local_config = copy.deepcopy(conf())
         stored_key = ""
         stored_base = ""
         effective_id = provider_id or "custom"
@@ -1946,11 +1950,11 @@ class ModelsHandler:
         api_base = (data.get("api_base") or "").strip() if api_base_present else None
 
         applied = {}
-        local_config = conf()
+        local_config = copy.deepcopy(conf())
         file_cfg = self._read_file_config()
 
         key_field = meta.get("api_key_field")
-        if key_field and api_key:
+        if key_field and api_key and "*" not in api_key:
             local_config[key_field] = api_key
             file_cfg[key_field] = api_key
             applied[key_field] = True
@@ -1966,8 +1970,17 @@ class ModelsHandler:
             # frontend can show "Saved" instead of surfacing an error.
             return json.dumps({"status": "success", "provider": provider_id, "noop": True})
 
+        validate_provider_bindings(local_config)
         self._write_file_config(file_cfg)
+        conf().update(local_config)
         logger.info(f"[ModelsHandler] provider {provider_id} updated: {sorted(applied.keys())}")
+        for field in applied:
+            env_key = CONFIG_TO_ENV.get(field)
+            if env_key:
+                if local_config[field]:
+                    os.environ[env_key] = str(local_config[field])
+                else:
+                    os.environ.pop(env_key, None)
 
         # Vendor credentials affect bot routing for any capability that uses
         # them; safest to reset Bridge so the next request rebuilds bots.
@@ -1980,28 +1993,30 @@ class ModelsHandler:
         if not meta:
             return json.dumps({"status": "error", "message": f"unknown provider: {provider_id}"})
 
-        local_config = conf()
+        refs = provider_references(conf(), provider_id)
+        if self._chat_capability(conf()).get("current_provider") == provider_id:
+            refs.append("chat.current_provider")
+        if refs:
+            return json.dumps({"status": "error", "code": "provider_in_use",
+                               "message": "provider is referenced", "references": refs})
+        local_config = copy.deepcopy(conf())
         file_cfg = self._read_file_config()
 
         cleared = []
+        old_values = {}
         for field_name in (meta.get("api_key_field"), meta.get("api_base_key")):
-            if not field_name:
-                continue
-            # Always write the key — even if it was absent before — so the
-            # in-memory conf() reflects the cleared state without needing a
-            # restart. (`in local_config` was too strict: provider keys that
-            # were ever set then deleted manually wouldn't get reset.)
-            previous = local_config.get(field_name)
-            local_config[field_name] = ""
-            file_cfg[field_name] = ""
-            cleared.append(field_name)
-            # Startup mirrors these keys into os.environ, and readers fall
-            # back to env when config is empty, so drop the mirrored copy too.
+            if field_name:
+                old_values[field_name] = local_config.get(field_name)
+                local_config[field_name] = ""
+                file_cfg[field_name] = ""
+                cleared.append(field_name)
+        validate_provider_bindings(local_config)
+        self._write_file_config(file_cfg)
+        conf().update(local_config)
+        for field_name, previous in old_values.items():
             env_key = CONFIG_TO_ENV.get(field_name)
             if env_key and previous and os.environ.get(env_key) == previous:
                 os.environ.pop(env_key, None)
-
-        self._write_file_config(file_cfg)
         logger.info(f"[ModelsHandler] provider {provider_id} cleared: {cleared}")
         self._reset_bridge()
         return json.dumps({"status": "success", "provider": provider_id, "cleared": cleared})
@@ -2034,7 +2049,7 @@ class ModelsHandler:
         agent, vision) automatically use the correct model."""
         from models.custom_provider import parse_custom_bot_type
 
-        local_config = conf()
+        local_config = copy.deepcopy(conf())
         file_cfg = self._read_file_config()
         local_config["custom_providers"] = providers
         file_cfg["custom_providers"] = providers
@@ -2049,51 +2064,10 @@ class ModelsHandler:
                     local_config["model"] = provider["model"]
                     file_cfg["model"] = provider["model"]
 
-        skills = local_config.get("skills") or {}
-        image_config = (
-            skills.get("image-generation")
-            if isinstance(skills, dict)
-            else {}
-        )
-        image_provider = (
-            image_config.get("provider", "")
-            if isinstance(image_config, dict)
-            else ""
-        )
-        if image_provider.startswith("custom:"):
-            image_provider_id = image_provider[len("custom:"):]
-            if not any(
-                provider.get("id") == image_provider_id
-                for provider in providers
-            ):
-                for target in (local_config, file_cfg):
-                    self._set_nested_namespace_value(
-                        target,
-                        "skills",
-                        "image-generation",
-                        "provider",
-                        "",
-                    )
-                    self._set_nested_namespace_value(
-                        target,
-                        "skills",
-                        "image-generation",
-                        "model",
-                        "",
-                    )
-                os.environ.pop(
-                    "SKILL_IMAGE_GENERATION_PROVIDER",
-                    None,
-                )
-                os.environ.pop(
-                    "SKILL_IMAGE_GENERATION_MODEL",
-                    None,
-                )
-        sync_image_generation_custom_provider_env(
-            local_config,
-            overwrite=True,
-        )
+        validate_provider_bindings(local_config)
         self._write_file_config(file_cfg)
+        conf().update(local_config)
+        sync_image_generation_custom_provider_env(conf(), overwrite=True)
         self._reset_bridge()
 
     def _handle_set_custom_provider(self, data: dict) -> str:
@@ -2125,7 +2099,7 @@ class ModelsHandler:
         model = (data.get("model") or "").strip()
         make_active = bool(data.get("make_active"))
 
-        local_config = conf()
+        local_config = copy.deepcopy(conf())
         providers = self._normalize_custom_providers(local_config.get("custom_providers"))
 
         existing = next((p for p in providers if p.get("id") == provider_id), None) if provider_id else None
@@ -2147,7 +2121,7 @@ class ModelsHandler:
             # omitted => keep existing" from "explicit empty => clear it" by
             # presence of the key, mirroring the model handling below. A masked,
             # untouched value is omitted by the UI, so it never reaches here.
-            if "api_key" in data:
+            if "api_key" in data and "*" not in api_key:
                 if api_key:
                     existing["api_key"] = api_key
                 else:
@@ -2181,28 +2155,21 @@ class ModelsHandler:
 
     def _handle_delete_custom_provider(self, data: dict) -> str:
         """Remove a custom provider by id."""
-        from models.custom_provider import parse_custom_bot_type
-
         provider_id = (data.get("id") or "").strip()
         if not provider_id:
             return json.dumps({"status": "error", "message": "id is required"})
 
-        local_config = conf()
+        local_config = copy.deepcopy(conf())
         providers = self._normalize_custom_providers(local_config.get("custom_providers"))
         remaining = [p for p in providers if p.get("id") != provider_id]
         if len(remaining) == len(providers):
             return json.dumps({"status": "error", "message": f"unknown custom provider id: {provider_id}"})
 
-        # If the deleted provider was active, fall back to the first remaining.
-        _, current_active_id = parse_custom_bot_type(local_config.get("bot_type") or "")
-        new_bot_type = None
-        if current_active_id == provider_id:
-            if remaining:
-                new_bot_type = f"custom:{remaining[0]['id']}"
-            else:
-                new_bot_type = "custom"  # revert to legacy
-
-        self._persist_custom_providers(remaining, new_bot_type)
+        refs = provider_references(local_config, f"custom:{provider_id}")
+        if refs:
+            return json.dumps({"status": "error", "code": "provider_in_use",
+                               "message": "provider is referenced", "references": refs})
+        self._persist_custom_providers(remaining)
         model_catalog.remove_catalog(f"custom:{provider_id}")
         logger.info(f"[ModelsHandler] custom provider id={provider_id} deleted")
         return json.dumps({"status": "success", "id": provider_id})
@@ -2213,7 +2180,7 @@ class ModelsHandler:
         if not provider_id:
             return json.dumps({"status": "error", "message": "id is required"})
 
-        local_config = conf()
+        local_config = copy.deepcopy(conf())
         providers = self._normalize_custom_providers(local_config.get("custom_providers"))
         if not any(p.get("id") == provider_id for p in providers):
             return json.dumps({"status": "error", "message": f"unknown custom provider id: {provider_id}"})
@@ -2261,7 +2228,7 @@ class ModelsHandler:
         if capability == "tts":
             return self._set_tts(provider_id, model, (data.get("voice") or "").strip())
         if capability == "embedding":
-            return self._set_embedding(provider_id, model)
+            return self._set_embedding(provider_id, model, data.get("enabled"))
         if capability == "image":
             return self._set_image(provider_id, model)
         if capability == "search":
@@ -2276,7 +2243,7 @@ class ModelsHandler:
         # provider field is persisted so users picking a custom model under
         # a specific vendor still get routed there — runtime falls back to
         # model-name prefix inference only when provider is empty.
-        local_config = conf()
+        local_config = copy.deepcopy(conf())
         if provider_id.startswith("custom:"):
             custom_id = provider_id[len("custom:"):]
             providers = self._normalize_custom_providers(
@@ -2325,7 +2292,9 @@ class ModelsHandler:
         self._drop_legacy_namespace(local_config, "skill", "skills", child="image-generation")
         self._drop_legacy_namespace(file_cfg, "skill", "skills", child="image-generation")
 
+        validate_provider_bindings(local_config)
         self._write_file_config(file_cfg)
+        conf().update(local_config)
 
         # The skill subprocess reads SKILL_IMAGE_GENERATION_{MODEL,PROVIDER}
         # from env at startup; mirror the change so live edits apply without
@@ -2368,7 +2337,7 @@ class ModelsHandler:
             return json.dumps({"status": "error", "message": f"unknown provider: {provider_id}"})
 
         applied = {}
-        local_config = conf()
+        local_config = copy.deepcopy(conf())
         file_cfg = self._read_file_config()
 
         # The runtime prefers the custom provider's model over the global one.
@@ -2406,7 +2375,9 @@ class ModelsHandler:
         if not applied:
             return json.dumps({"status": "success", "applied": {}, "noop": True})
 
+        validate_provider_bindings(local_config)
         self._write_file_config(file_cfg)
+        conf().update(local_config)
         logger.info(f"[ModelsHandler] chat updated: {applied}")
         self._reset_bridge()
         return json.dumps({"status": "success", "applied": applied})
@@ -2487,7 +2458,7 @@ class ModelsHandler:
                 "message": "at least one provider/model pair is required to enable the fallback",
             })
 
-        local_config = conf()
+        local_config = copy.deepcopy(conf())
         file_cfg = self._read_file_config()
         payload = {
             "enabled": bool(enabled),
@@ -2496,7 +2467,9 @@ class ModelsHandler:
         # Written as a whole so a stale key from an older shape can't survive.
         local_config["chat_fallback"] = dict(payload)
         file_cfg["chat_fallback"] = dict(payload)
+        validate_provider_bindings(local_config)
         self._write_file_config(file_cfg)
+        conf().update(local_config)
 
         # Turning the fallback off must take effect now, not on the next run
         # boundary. A model that had already switched to the backup keeps its
@@ -2539,7 +2512,7 @@ class ModelsHandler:
                 "message": "vision model is required when a provider is selected",
             })
 
-        local_config = conf()
+        local_config = copy.deepcopy(conf())
         file_cfg = self._read_file_config()
         self._set_nested_namespace_value(file_cfg, "tools", "vision", "model", model)
         self._set_nested_namespace_value(local_config, "tools", "vision", "model", model)
@@ -2548,7 +2521,9 @@ class ModelsHandler:
         self._drop_legacy_namespace(file_cfg, "tool", "tools", child="vision")
         self._drop_legacy_namespace(local_config, "tool", "tools", child="vision")
 
+        validate_provider_bindings(local_config)
         self._write_file_config(file_cfg)
+        conf().update(local_config)
         logger.info(f"[ModelsHandler] vision updated: provider={provider_id!r} model={model!r}")
         return json.dumps({"status": "success", "provider": provider_id, "model": model})
 
@@ -2586,13 +2561,15 @@ class ModelsHandler:
             return json.dumps({"status": "error", "message": f"invalid mode: {mode!r}"})
         always = (mode == "always")
         if_voice = (mode == "voice_if_voice")
-        local_config = conf()
+        local_config = copy.deepcopy(conf())
         file_cfg = self._read_file_config()
         local_config["always_reply_voice"] = always
         local_config["voice_reply_voice"] = if_voice
         file_cfg["always_reply_voice"] = always
         file_cfg["voice_reply_voice"] = if_voice
+        validate_provider_bindings(local_config)
         self._write_file_config(file_cfg)
+        conf().update(local_config)
         logger.info(
             f"[ModelsHandler] voice reply mode set: {mode!r} "
             f"(always_reply_voice={always}, voice_reply_voice={if_voice})"
@@ -2600,11 +2577,13 @@ class ModelsHandler:
         return json.dumps({"status": "success", "mode": mode})
 
     def _set_simple(self, key: str, value: str) -> str:
-        local_config = conf()
+        local_config = copy.deepcopy(conf())
         file_cfg = self._read_file_config()
         local_config[key] = value
         file_cfg[key] = value
+        validate_provider_bindings(local_config)
         self._write_file_config(file_cfg)
+        conf().update(local_config)
         logger.info(f"[ModelsHandler] {key} set: {value!r}")
         # Hot-swap the cached voice bot so the change takes effect immediately.
         if key in ("voice_to_text", "text_to_voice"):
@@ -2612,7 +2591,7 @@ class ModelsHandler:
         return json.dumps({"status": "success", key: value})
 
     def _set_asr(self, provider_id: str, model: str) -> str:
-        local_config = conf()
+        local_config = copy.deepcopy(conf())
         file_cfg = self._read_file_config()
         local_config["voice_to_text"] = provider_id
         file_cfg["voice_to_text"] = provider_id
@@ -2633,7 +2612,9 @@ class ModelsHandler:
         elif offers_default:
             local_config["voice_to_text_model"] = ""
             file_cfg["voice_to_text_model"] = ""
+        validate_provider_bindings(local_config)
         self._write_file_config(file_cfg)
+        conf().update(local_config)
         logger.info(
             f"[ModelsHandler] asr updated: provider={provider_id!r} "
             f"model={model!r}"
@@ -2646,7 +2627,7 @@ class ModelsHandler:
         })
 
     def _set_tts(self, provider_id: str, model: str, voice: str = "") -> str:
-        local_config = conf()
+        local_config = copy.deepcopy(conf())
         file_cfg = self._read_file_config()
         local_config["text_to_voice"] = provider_id
         file_cfg["text_to_voice"] = provider_id
@@ -2654,7 +2635,9 @@ class ModelsHandler:
         file_cfg["text_to_voice_model"] = model
         local_config["tts_voice_id"] = voice
         file_cfg["tts_voice_id"] = voice
+        validate_provider_bindings(local_config)
         self._write_file_config(file_cfg)
+        conf().update(local_config)
         logger.info(
             f"[ModelsHandler] tts updated: provider={provider_id!r} "
             f"model={model!r} voice={voice!r}"
@@ -2673,7 +2656,7 @@ class ModelsHandler:
         except Exception as e:
             logger.warning(f"[ModelsHandler] Bridge voice refresh failed: {e}")
 
-    def _set_embedding(self, provider_id: str, model: str) -> str:
+    def _set_embedding(self, provider_id: str, model: str, enabled=None) -> str:
         # Validate provider_id — mirrors _set_chat's validation pattern.
         if provider_id.startswith("custom:"):
             from models.custom_provider import parse_custom_bot_type
@@ -2695,13 +2678,21 @@ class ModelsHandler:
                 "status": "error",
                 "message": "embedding model is required when a provider is selected",
             })
-        local_config = conf()
+        if enabled is not None and not isinstance(enabled, bool):
+            raise ValueError("embedding enabled must be boolean")
+        local_config = copy.deepcopy(conf())
         file_cfg = self._read_file_config()
+        if enabled is not None:
+            local_config["embedding_enabled"] = enabled
+            file_cfg["embedding_enabled"] = enabled
         local_config["embedding_provider"] = provider_id
         file_cfg["embedding_provider"] = provider_id
         local_config["embedding_model"] = model
         file_cfg["embedding_model"] = model
+        validate_provider_bindings(local_config)
         self._write_file_config(file_cfg)
+        conf().update(local_config)
+        self._reset_bridge()
         logger.info(f"[ModelsHandler] embedding updated: provider={provider_id!r} model={model!r}")
         # The next /memory rebuild-index command hot-swaps the provider onto
         # the running MemoryManager (see plugins/cow_cli). The dim may have
@@ -2723,13 +2714,15 @@ class ModelsHandler:
         else:
             provider = ""
 
-        local_config = conf()
+        local_config = copy.deepcopy(conf())
         file_cfg = self._read_file_config()
         self._set_nested_namespace_value(local_config, "tools", "web_search", "strategy", strategy)
         self._set_nested_namespace_value(file_cfg,     "tools", "web_search", "strategy", strategy)
         self._set_nested_namespace_value(local_config, "tools", "web_search", "provider", provider)
         self._set_nested_namespace_value(file_cfg,     "tools", "web_search", "provider", provider)
+        validate_provider_bindings(local_config)
         self._write_file_config(file_cfg)
+        conf().update(local_config)
         logger.info(f"[ModelsHandler] search updated: strategy={strategy!r} provider={provider!r}")
         return json.dumps({"status": "success", "strategy": strategy, "provider": provider})
 
@@ -2754,7 +2747,7 @@ class ModelsHandler:
             anonymous_field = f"{provider}_anonymous"
             anonymous_on = bool(anonymous and not api_key)
 
-            local_config = conf()
+            local_config = copy.deepcopy(conf())
             file_cfg = self._read_file_config()
 
             self._set_nested_namespace_value(local_config, "tools", "web_search", key_field, api_key)
@@ -2765,32 +2758,38 @@ class ModelsHandler:
             if api_key or anonymous_on:
                 self._set_search_provider_disabled(local_config, file_cfg, provider, False)
 
+            validate_provider_bindings(local_config)
             self._write_file_config(file_cfg)
+            conf().update(local_config)
             logger.info(
                 f"[ModelsHandler] search credential set: {key_field}={'***' if api_key else ''}, {anonymous_field}={anonymous_on}")
             return json.dumps({"status": "success", "provider": provider})
         if provider == "searxng":
             # SearXNG uses an instance URL, not an API key.
             instance_url = (data.get("url") or "").strip() if isinstance(data.get("url"), str) else ""
-            local_config = conf()
+            local_config = copy.deepcopy(conf())
             file_cfg = self._read_file_config()
             self._set_nested_namespace_value(local_config, "tools", "web_search", "searxng_url", instance_url)
             self._set_nested_namespace_value(file_cfg, "tools", "web_search", "searxng_url", instance_url)
             if instance_url:
                 self._set_search_provider_disabled(local_config, file_cfg, provider, False)
+            validate_provider_bindings(local_config)
             self._write_file_config(file_cfg)
+            conf().update(local_config)
             logger.info(f"[ModelsHandler] search credential set: searxng_url={'***' if instance_url else ''}")
             return json.dumps({"status": "success", "provider": provider})
         else:
             key_field = f"{provider}_api_key"
             api_key = (data.get("api_key") or "").strip() if isinstance(data.get("api_key"), str) else ""
-            local_config = conf()
+            local_config = copy.deepcopy(conf())
             file_cfg = self._read_file_config()
             self._set_nested_namespace_value(local_config, "tools", "web_search", key_field, api_key)
             self._set_nested_namespace_value(file_cfg, "tools", "web_search", key_field, api_key)
             if api_key:
                 self._set_search_provider_disabled(local_config, file_cfg, provider, False)
+            validate_provider_bindings(local_config)
             self._write_file_config(file_cfg)
+            conf().update(local_config)
             logger.info(f"[ModelsHandler] search credential set: {key_field}={'***' if api_key else ''}")
             return json.dumps({"status": "success", "provider": provider})
 
@@ -2804,10 +2803,12 @@ class ModelsHandler:
         if not isinstance(enabled, bool):
             return json.dumps({"status": "error", "message": "enabled must be a boolean"})
 
-        local_config = conf()
+        local_config = copy.deepcopy(conf())
         file_cfg = self._read_file_config()
         self._set_search_provider_disabled(local_config, file_cfg, provider, not enabled)
+        validate_provider_bindings(local_config)
         self._write_file_config(file_cfg)
+        conf().update(local_config)
         logger.info(f"[ModelsHandler] search provider {provider} enabled={enabled}")
         return json.dumps({"status": "success", "provider": provider, "enabled": enabled})
 

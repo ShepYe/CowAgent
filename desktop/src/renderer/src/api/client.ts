@@ -1378,6 +1378,41 @@ class ApiClient {
   // Knowledge
   // ---------------------------------------------------------
 
+  async personalTasks(): Promise<{ status: string; tasks: PersonalTask[]; message?: string }> {
+    return this.request('/api/personal/tasks')
+  }
+
+  async submitPersonal(file: File, text: string, requestId: string): Promise<PersonalResponse> {
+    const form = new FormData()
+    form.append('file', file)
+    form.append('text', text)
+    form.append('request_id', requestId)
+    return this.postFormData('/api/personal/tasks', form)
+  }
+
+  async personalAction(task: PersonalTask, action: string, input?: string, source?: PersonalSourceAction): Promise<PersonalResponse> {
+    return this.request(`/api/personal/tasks/${encodeURIComponent(task.task_id)}`, {
+      method: 'POST', body: JSON.stringify({ action, attempt: task.attempt, input, ...source }),
+    })
+  }
+
+  async personalReference(taskId: string, publishId: string, ordinal = 0): Promise<{ status: string; message?: string; reference: PersonalReference }> {
+    return this.request(`/api/personal/tasks/${encodeURIComponent(taskId)}/reference/${encodeURIComponent(publishId)}?ordinal=${ordinal}`)
+  }
+
+  personalOriginal(taskId: string, attachmentId: string): string {
+    return this.withToken(`${this.baseUrl}/api/personal/tasks/${encodeURIComponent(taskId)}/original/${encodeURIComponent(attachmentId)}`)
+  }
+
+  async personalBinding(binding?: PersonalBinding): Promise<{ status: string; binding: PersonalBinding; message?: string }> {
+    const token = await this.getDesktopToken()
+    if (!token) throw new Error('请在桌面程序中设置本人绑定')
+    return this.request('/api/personal/binding', {
+      headers: { 'X-Cow-Desktop-Token': token },
+      ...(binding ? { method: 'POST', body: JSON.stringify({ binding }) } : {}),
+    })
+  }
+
   async getKnowledgeList(agentId?: string): Promise<KnowledgeList> {
     return this.request<{ status: string } & KnowledgeList>(this.scoped('/api/knowledge/list', agentId))
   }
@@ -1637,3 +1672,39 @@ class ApiClient {
 
 export const apiClient = new ApiClient()
 export default apiClient
+
+export interface PersonalTask {
+  task_id: string
+  receipt_id: string
+  status: string
+  stage: string
+  attempt: number
+  question?: string
+  outcome?: string
+  response?: string
+  updated_at: string
+  config_revision: string
+  notification: string
+  error?: { code: string; message?: string; retryable?: boolean }
+  payload?: { text?: string; filename?: string }
+  attachments: { attachment_id: string; filename: string; sha256: string }[]
+  result_refs: Record<string, unknown>[]
+}
+export interface PersonalResponse { status: string; message?: string; code?: string; task?: PersonalTask }
+export interface PersonalBinding { channel_instance_id: string; app_id: string; tenant_id: string; sender_open_id: string }
+
+export interface PersonalSourceAction {
+  document_id: string
+  expected_state: number
+  reason?: string
+  purpose?: 'long_term' | 'transient'
+  request_id?: string
+}
+export interface PersonalReference {
+  text: string
+  location: Record<string, unknown>
+  current_status: string
+  ordinal: number
+  unit_count: number
+  units: { ordinal: number; location: Record<string, unknown> }[]
+}

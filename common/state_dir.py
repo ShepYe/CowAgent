@@ -92,6 +92,11 @@ def user_root(identity: Optional[RuntimeIdentity] = None) -> Path:
     every caller.
     """
     ident = _resolve(identity)
+    if ident.user_id == "local-owner":
+        from common.personal_tasks import personal_enabled
+
+        if personal_enabled():
+            return state_root(ident)
     if ident.user_id:
         return shared_root() / "users" / ident.user_id
     return state_root(ident)

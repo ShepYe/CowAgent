@@ -30,6 +30,7 @@ import type {
 } from '../types'
 import Markdown from '../components/Markdown'
 import KnowledgeGraph from '../components/KnowledgeGraph'
+import PersonalTasksPanel from './PersonalTasksPanel'
 import { DocActions, DocEditor, DocNotice, DocView } from '../components/DocEditor'
 import { createDocEditorStore } from '../store/docEditorStore'
 import { askConfirm } from '../store/confirmStore'
@@ -41,7 +42,7 @@ interface KnowledgePageProps {
   baseUrl: string
 }
 
-type Tab = 'docs' | 'graph'
+type Tab = 'docs' | 'graph' | 'personal'
 
 const KNOWLEDGE_IMPORT_MAX_FILES = 100
 const KNOWLEDGE_IMPORT_MAX_FILE_SIZE = 10 * 1024 * 1024
@@ -774,6 +775,7 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
               active={tab === 'graph'}
               onClick={() => void switchTab('graph')}
             />
+            <TabBtn icon={Upload} label="资料任务" active={tab === 'personal'} onClick={() => void switchTab('personal')} />
           </div>
           <NewMenu
             open={menuOpen}
@@ -799,7 +801,7 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
         />
       </div>
 
-      {tab === 'docs' ? (
+      {tab === 'personal' ? <PersonalTasksPanel /> : tab === 'docs' ? (
         <div
           className="flex-1 flex min-h-0 border-t border-default relative"
           onDragEnter={(e) => {

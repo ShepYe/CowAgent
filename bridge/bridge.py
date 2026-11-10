@@ -7,6 +7,29 @@ from common.singleton import singleton
 from config import conf
 from translate.factory import create_translator
 from voice.factory import create_voice
+from contextlib import contextmanager
+from contextvars import ContextVar
+
+_task_bridge = ContextVar("cow_task_bridge", default=None)
+
+
+def current_bridge():
+    """Resolve clients from the active attempt, or the legacy singleton."""
+    scoped = _task_bridge.get()
+    return scoped if scoped is not None else Bridge()
+
+
+@contextmanager
+def bridge_for_config_revision(revision):
+    """Create uncached clients inside the task's validated config scope."""
+    from models.config_revision import use_config_revision
+    with use_config_revision(revision):
+        bridge = Bridge.new_instance()
+        token = _task_bridge.set(bridge)
+        try:
+            yield bridge
+        finally:
+            _task_bridge.reset(token)
 
 
 @singleton

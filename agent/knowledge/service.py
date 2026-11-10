@@ -89,9 +89,13 @@ class KnowledgeService:
             raise ValueError("path outside knowledge dir")
         if not candidate.exists() and not allow_missing:
             raise FileNotFoundError(f"path not found: {rel_path}")
+        from agent.knowledge.personal_assistant import guard_path
+        guard_path(candidate)
         return rel_path, candidate
 
     def _ensure_not_protected(self, rel_path: str):
+        from agent.knowledge.personal_assistant import guard_path
+        guard_path(Path(self.knowledge_dir) / rel_path, write=True)
         if rel_path in self.PROTECTED_FILES:
             raise ValueError(f"protected knowledge file: {rel_path}")
 
@@ -241,7 +245,9 @@ class KnowledgeService:
                     continue
                 if rel in self.PROTECTED_FILES:
                     continue
-                entries.append((rel, self._extract_title(md, md.stem)))
+                from agent.knowledge.personal_assistant import readable
+                if readable(md):
+                    entries.append((rel, self._extract_title(md, md.stem)))
             return entries
 
         all_entries = collect(root)
@@ -663,6 +669,9 @@ class KnowledgeService:
                 sub_files, sub_children = self._scan_dir(full, stats)
                 children.append({"dir": name, "files": sub_files, "children": sub_children})
             elif name.lower().endswith(".md"):
+                from agent.knowledge.personal_assistant import readable
+                if not readable(full):
+                    continue
                 size = os.path.getsize(full)
                 if not is_root:
                     stats["pages"] += 1
@@ -758,6 +767,8 @@ class KnowledgeService:
             try:
                 # utf-8-sig: files saved by Windows editors may carry a BOM,
                 # which would otherwise hide the "# " title line.
+                from agent.knowledge.personal_assistant import guard_path
+                guard_path(md_file)
                 content = md_file.read_text(encoding="utf-8-sig")
                 first_line = content.strip().split("\n")[0]
                 if first_line.startswith("# "):

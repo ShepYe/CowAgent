@@ -191,6 +191,39 @@ class ChatChannel(Channel):
     def _handle(self, context: Context):
         if context is None or not context.content:
             return
+        from common.personal_tasks import personal_enabled, task_scope
+        if context.get("config_revision") or personal_enabled():
+            from models.config_revision import ConfigUnavailable
+            from bridge.bridge import bridge_for_config_revision
+            try:
+                if context.get("personal_task_id"):
+                    from common.personal_tasks import TaskStore, OWNER
+                    task = TaskStore().claim(OWNER, context["personal_task_id"])
+                    context["personal_attempt"] = task["attempt"]
+                with bridge_for_config_revision(context.get("config_revision")), task_scope(context.get("personal_task_id")):
+                    return self._handle_scoped(context)
+            except ConfigUnavailable:
+                self._personal_failure(context, "config_unavailable")
+                self._send_reply(context, Reply(ReplyType.ERROR,
+                    "config_unavailable：原配置修订不可用，请重新提交。"))
+                return
+            except Exception:
+                self._personal_failure(context, "processing_failed")
+                raise
+        return self._handle_scoped(context)
+
+    @staticmethod
+    def _personal_failure(context, code):
+        if context.get("personal_task_id") and context.get("personal_attempt"):
+            from common.personal_tasks import TaskStore, OWNER
+            store = TaskStore()
+            task = store.get(OWNER, context["personal_task_id"])
+            if task["status"] == "running":
+                store.fail(OWNER, task["task_id"], task["attempt"], code, task["stage"])
+
+    def _handle_scoped(self, context: Context):
+        if context is None or not context.content:
+            return
         # The single point where an inbound message is bound to an identity.
         # Everything below reads it from the ambient context instead of being
         # handed a workspace path.
@@ -198,6 +231,16 @@ class ChatChannel(Channel):
             logger.debug("[chat_channel] handling context: {}".format(context))
             # reply的构建步骤
             reply = self._generate_reply(context)
+
+            if context.get("personal_task_id"):
+                from common.personal_tasks import TaskStore, OWNER
+                store = TaskStore()
+                task = store.get(OWNER, context["personal_task_id"])
+                if task["status"] == "cancelled":
+                    reply = Reply(ReplyType.INFO, "任务已取消，原始资料保留。")
+                elif task["status"] == "running":
+                    store.wait_input(OWNER, task["task_id"], task["attempt"],
+                                     str(getattr(reply, "content", "") or "请补充资料用途或版本关系。"))
 
             logger.debug("[chat_channel] decorating reply: {}".format(reply))
 
@@ -207,6 +250,9 @@ class ChatChannel(Channel):
 
                 # reply的发送步骤
                 self._send_reply(context, reply)
+                if context.get("personal_task_id"):
+                    from common.personal_tasks import TaskStore, OWNER
+                    TaskStore().notification(OWNER, context["personal_task_id"], "sent")
 
     def _identity_for(self, context: Context) -> RuntimeIdentity:
         """Resolve who this message is for.
@@ -215,7 +261,9 @@ class ChatChannel(Channel):
         rather than resolved twice. Without this the bridge would serve the
         bound Agent while workspace paths still resolved to the default one.
         """
+        from common.personal_tasks import personal_enabled
         return RuntimeIdentity(
+            user_id="local-owner" if personal_enabled() else None,
             agent_id=context.get("agent_id"),
             session_id=context.get("session_id"),
         )
@@ -540,6 +588,10 @@ class ChatChannel(Channel):
     _BYPASS_QUEUE_COMMANDS = ("/cancel",)
 
     def produce(self, context: Context):
+        from common.personal_tasks import personal_enabled
+        if personal_enabled() and not context.get("config_revision"):
+            from models.config_revision import capture_config_revision
+            context["config_revision"] = capture_config_revision()
         session_id = context["session_id"]
         try:
             from bridge.bridge import Bridge

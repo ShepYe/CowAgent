@@ -73,6 +73,11 @@ class Write(BaseTool):
             # Resolve path (may raise PermissionError for protected locations)
             absolute_path = self._resolve_path(path)
 
+            from agent.knowledge.personal_assistant import guard_path
+            guard_path(absolute_path, write=True)
+            from agent.knowledge.purpose import guard_memory_write
+            guard_memory_write(absolute_path, self.config.get("workspace_root") or self.cwd)
+
             # Create parent directory (if needed)
             parent_dir = os.path.dirname(absolute_path)
             if parent_dir:
