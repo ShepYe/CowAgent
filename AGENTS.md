@@ -13,3 +13,7 @@
 ### Domain docs
 
 采用 single-context：根目录 `CONTEXT.md` 与 `docs/adr/`；探索领域前读取 `docs/agents/domain.md`。
+
+### 重大变更文档
+
+起草、修订或审查重大及契约性变更的规格／计划，或准备实现此类变更时，使用 [major-change-docs-gate](.agents/skills/major-change-docs-gate/SKILL.md)；普通改动走原流程。
