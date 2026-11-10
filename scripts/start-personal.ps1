@@ -48,8 +48,9 @@ try {
     }
     if (!(Test-Python311 $pythonExe)) { throw '仓库 .venv 需要使用已验证的 Python 3.11；请调整环境后重试。' }
 
-    $probe = "import importlib.util,sys; names=['web','requests','aiohttp','numpy','markdown_it','regex','lark_oapi','pypdf','docx','openpyxl','zai','dashscope','tiktoken','playwright']; missing=[n for n in names if importlib.util.find_spec(n) is None]; print(', '.join(missing)); sys.exit(bool(missing))"
-    $missing = & $pythonExe -c $probe
+    $dependencyCheck = Join-Path $repo 'scripts\check_personal_deps.py'
+    $requirementFiles = @((Join-Path $repo 'requirements.txt'), (Join-Path $desktop 'build\requirements-desktop.txt'))
+    $missing = & $pythonExe $dependencyCheck @requirementFiles
     $pythonReady = $LASTEXITCODE -eq 0
     $nodeReady = (Test-Path -LiteralPath (Join-Path $desktop 'node_modules\electron\dist\electron.exe')) -and
                  (Test-Path -LiteralPath (Join-Path $desktop 'node_modules\vite\bin\vite.js')) -and
@@ -59,8 +60,10 @@ try {
     }
     if (!$CheckOnly -and (!$pythonReady -or $SetupOnly)) {
         Write-Host '正在准备 Python 依赖…'
-        Invoke-Checked $pythonExe @('-m', 'pip', 'install', '-r', (Join-Path $repo 'requirements.txt'), '-r', (Join-Path $desktop 'build\requirements-desktop.txt'))
-        Invoke-Checked $pythonExe @('-c', $probe)
+        & $pythonExe -c 'import importlib.util,sys; sys.exit(importlib.util.find_spec(''pip'') is None)'
+        if ($LASTEXITCODE -ne 0) { Invoke-Checked $pythonExe @('-m', 'ensurepip', '--upgrade') }
+        Invoke-Checked $pythonExe @('-m', 'pip', 'install', '-r', $requirementFiles[0], '-r', $requirementFiles[1])
+        Invoke-Checked $pythonExe (@($dependencyCheck) + $requirementFiles)
     }
     if (!$CheckOnly -and (!$nodeReady -or $SetupOnly)) {
         Push-Location $desktop
