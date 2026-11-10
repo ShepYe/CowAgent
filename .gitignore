@@ -79,3 +79,6 @@ desktop/resources/bin/
 
 # Persistent Agent Mail credentials and npm runtime created by the optional compose overlay.
 docker/agent-mail-data/
+
+# 项目开发日志纳入版本管理
+!docs/codex/logs/
