@@ -47,7 +47,8 @@ from channel.web.api.knowledge import (  # noqa: F401
     KnowledgeListHandler, KnowledgeReadHandler,
 )
 from channel.web.api.personal import (  # noqa: F401
-    PersonalTasksHandler, PersonalTaskHandler, PersonalOriginalHandler, PersonalBindingHandler, PersonalReferenceHandler,
+    PersonalTasksHandler, PersonalTaskHandler, PersonalOriginalHandler,
+    PersonalBindingHandler, PersonalReferenceHandler,
 )
 from channel.web.api.logs import LogsDownloadHandler, LogsHandler  # noqa: F401
 from channel.web.api.memory import (  # noqa: F401
@@ -226,4 +227,7 @@ def build_app():
     why WebChannel, which only runs the server, asks for the app instead of
     assembling one.
     """
-    return web.application(URLS, globals(), autoreload=False)
+    app = web.application(URLS, globals(), autoreload=False)
+    from channel.web.core.desktop_dev import desktop_dev_cors
+    app.add_processor(desktop_dev_cors)
+    return app

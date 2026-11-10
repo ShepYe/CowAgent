@@ -2,6 +2,10 @@
 
 Cross-platform desktop client for CowAgent, built with Electron + React + TypeScript.
 
+## Windows 中文启动入口
+
+在仓库根目录运行 `.\start-personal.cmd`，即可从源码启动 Electron 与 Python；本机需已有 Python 3.11 和 Node.js 18+，缺失的项目依赖由脚本自动补齐。React 热更新使用 `.\start-personal.cmd -Dev`。参数、数据目录、日志和停止方式见[本地启动说明](../docs/codex/本地启动.md)。
+
 ## Development
 
 ### Prerequisites

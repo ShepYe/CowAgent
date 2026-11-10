@@ -214,6 +214,7 @@ function probeViteDevServer(port: number): Promise<boolean> {
 }
 
 async function findViteDevServer(): Promise<string | null> {
+  if (process.env.COW_DESKTOP_RENDERER_MODE === 'built') return null
   for (const port of VITE_DEV_PORTS) {
     if (await probeViteDevServer(port)) {
       return `http://localhost:${port}`
