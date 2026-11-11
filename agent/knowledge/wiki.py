@@ -1,10 +1,12 @@
 """多来源主题页：不可变发布、正文索引和可追溯的出处目录。"""
 import hashlib
 import json
+import posixpath
 import re
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
+from urllib.parse import unquote, urlsplit
 
 from common.atomic_write import write_text_atomic
 from agent.knowledge.parser import SourceError
@@ -27,6 +29,8 @@ def ensure_schema(db):
         db.execute(statement)
     db.execute('CREATE INDEX IF NOT EXISTS wiki_sources_document ON wiki_sources(document,revision)')
     db.execute('CREATE INDEX IF NOT EXISTS wiki_dependencies_page ON wiki_dependencies(page)')
+    from agent.knowledge.catalog import ensure_schema as ensure_catalog
+    ensure_catalog(db)
     # Existing successful wiki publications are sufficient evidence of the
     # ownership transfer, even if those pages have since been paused.
     db.execute('INSERT OR IGNORE INTO wiki_legacy_retirements SELECT s.document,s.publication FROM wiki_sources s JOIN wiki_publications p ON p.id=s.publication WHERE p.verified=1')
@@ -151,11 +155,12 @@ def _valid(db, service, publication, seen=None):
         return False
 
 
-def refresh(db, service):
+def refresh(db, service, *, project=True):
     for pub in db.execute('SELECT v.* FROM wiki_publications v JOIN wiki_pages p ON p.current=v.id WHERE p.status=\'active\'').fetchall():
         if not _valid(db, service, pub):
             suspend_pages(db, [pub['page']], '来源、上游版本、正文或索引校验失效')
-    project_indexes(db, service)
+    if project:
+        project_indexes(db, service)
 
 
 def project_indexes(db, service):
@@ -173,11 +178,13 @@ def _project_indexes(db, service):
     records = []
     for pub in db.execute('SELECT v.* FROM wiki_publications v JOIN wiki_pages p ON p.current=v.id ORDER BY v.rowid'):
         if _valid(db, service, pub):
-            records.append(json.loads(pub['record']))
+            from agent.knowledge.catalog import effective
+            records.append(effective(db, json.loads(pub['record'])))
     # Avoid creating wiki artifacts in untouched legacy workspaces.
     if not records and not db.execute('SELECT 1 FROM wiki_publications LIMIT 1').fetchone():
         return
     service.knowledge.mkdir(parents=True, exist_ok=True)
+    registered_paths = {row[0].removeprefix('knowledge/') for row in db.execute('SELECT path FROM wiki_publications')}
     for name in ('index.md', 'log.md'):
         path = service.knowledge / name
         if not path.resolve().is_relative_to(service.knowledge.resolve()):
@@ -185,8 +192,9 @@ def _project_indexes(db, service):
         previous = path.read_text(encoding='utf-8') if path.exists() else ''
         start, end = '<!-- wiki-projection:start -->', '<!-- wiki-projection:end -->'
         content = re.sub(re.escape(start) + r'.*?' + re.escape(end) + r'\s*', '', previous, flags=re.S)
-        # Existing directory builders may also have listed these managed paths.
-        content = '\n'.join(line for line in content.splitlines() if not re.search(r'\]\((?:\./|knowledge/)?wiki/', line)).rstrip()
+        if name == 'index.md':
+            content = _strip_registered_index_entries(content, registered_paths)
+        content = content.rstrip()
         lines = []
         for record in sorted(records, key=lambda r: (r['category'], r['title'], r['page_id'])):
             title = record['title'].replace('[', '\\[').replace(']', '\\]')
@@ -201,15 +209,40 @@ def _project_indexes(db, service):
             write_text_atomic(path, text, newline='')
 
 
+def _strip_registered_index_entries(content, registered_paths):
+    """接管旧生成器遗留的完整登记条目，保留普通说明及未托管链接。"""
+    entry = re.compile(r'^\s*[-*+]\s+\[.*\]\(\s*<?([^\n()<>]+?)>?\s*\)(?:\s*(?:—|–|--?).*)?\s*$')
+    lines = []
+    for line in content.splitlines(keepends=True):
+        match = entry.fullmatch(line.rstrip('\r\n'))
+        if match:
+            try:
+                link = urlsplit(match[1])
+                target = unquote(link.path).replace('\\', '/')
+                if target.startswith('knowledge/'):
+                    target = target[len('knowledge/'):]
+                target = posixpath.normpath(target)
+                if not link.scheme and not link.netloc and target in registered_paths:
+                    continue
+            except ValueError:
+                pass
+        lines.append(line)
+    return ''.join(lines)
+
+
 def _public_source(source):
     return {k: v for k, v in source.items() if k not in ('parse_hash',)}
 
 
-def _ref(record, source_ordinal=0):
+def _ref(record, source_ordinal=0, db=None):
+    if db is not None:
+        from agent.knowledge.catalog import effective
+        record = effective(db, record)
     sources = [dict(_public_source(s), source_ordinal=i) for i, s in enumerate(record['sources'])]
     main = sources[source_ordinal]
     return dict(**{k: main[k] for k in ('document_id', 'revision_id', 'parse_id', 'ordinal', 'location', 'filename', 'source_state_snapshot')},
-                title=record['title'], category=record['category'], page_id=record['page_id'],
+                title=record['title'], category=record['category'], category_mode=record.get('category_mode', 'auto'),
+                category_revision=record.get('category_revision', 0), page_id=record['page_id'],
                 page_version=record['page_version'], publish_id=record['page_version'], path=record['path'],
                 sources=sources, related_page_ids=record['related_page_ids'], depends_on=record['depends_on'],
                 task_id=record['task_id'], outcome='published', searchable=True, index_mode='keyword',
@@ -347,7 +380,7 @@ class WikiService:
             if batch['published']:
                 if any(not _valid(db, self.source, db.execute('SELECT * FROM wiki_publications WHERE id=?', (r['page_version'],)).fetchone()) for r in records):
                     raise SourceError('version_conflict', '该批次历史发布已失效')
-                return [_ref(r) for r in records]
+                return [_ref(r, db=db) for r in records]
             self._check_graph(db, records)
             changed_ids = {r['page_id'] for r in records}
             chosen_revisions = {}
@@ -369,6 +402,11 @@ class WikiService:
             # Immutable paths mean failed/crashed candidates never overwrite an
             # old effective page. Uncommitted files are rejected by guard_path.
             for record in records:
+                from agent.knowledge.catalog import metadata
+                organization = metadata(db, record)
+                if organization['category_mode'] == 'manual':
+                    record['category'] = organization['category']
+                record['created_at'] = datetime.now(timezone.utc).isoformat()
                 text = '# ' + record['title'] + '\n\n' + '\n\n'.join(b['content'] for b in record['blocks']) + '\n'
                 target = self.workspace / record['path']
                 if (not target.resolve().is_relative_to((self.knowledge / 'wiki').resolve())
@@ -399,6 +437,8 @@ class WikiService:
                                (document, revision, head[1] + 1 if head else 1))
             suspend_pages(db, changed_ids, '上游知识页版本已更新')
             for record in records:
+                from agent.knowledge.catalog import published
+                published(db, record)
                 db.execute("INSERT INTO wiki_pages VALUES(?,?,'active',NULL) ON CONFLICT(id) DO UPDATE SET current=excluded.current,status='active',reason=NULL", (record['page_id'], record['page_version']))
             for record in records:
                 pub = db.execute('SELECT * FROM wiki_publications WHERE id=?', (record['page_version'],)).fetchone()
@@ -406,13 +446,33 @@ class WikiService:
                     raise SourceError('index_failed', '知识页发布提交前回读核验失败')
             db.execute('UPDATE wiki_batches SET published=1 WHERE id=?', (batch_id,))
             project_indexes(db, self.source)
-            return [_ref(r) for r in records]
+            return [_ref(r, db=db) for r in records]
 
     def current(self, page_id):
         with self.source.transaction() as db:
             refresh(db, self.source)
             pub = db.execute('SELECT v.* FROM wiki_pages p JOIN wiki_publications v ON v.id=p.current WHERE p.id=?', (page_id,)).fetchone()
-            return _ref(json.loads(pub['record'])) if _valid(db, self.source, pub) else None
+            return _ref(json.loads(pub['record']), db=db) if _valid(db, self.source, pub) else None
+
+    def catalog(self):
+        from agent.knowledge.catalog import catalog
+        return catalog(self)
+
+    def history(self, offset=0, limit=50):
+        from agent.knowledge.catalog import history
+        return history(self, offset, limit)
+
+    def version(self, publish_id=None, *, path=None):
+        from agent.knowledge.catalog import version
+        return version(self, publish_id, path=path)
+
+    def set_page_category(self, page_id, expected_version, expected_category_revision, category):
+        from agent.knowledge.catalog import change
+        return change(self, page_id, expected_version, expected_category_revision, category)
+
+    def reset_page_category(self, page_id, expected_version, expected_category_revision):
+        from agent.knowledge.catalog import change
+        return change(self, page_id, expected_version, expected_category_revision, reset=True)
 
     def read_reference(self, publish_id, ordinal=0, historical=False):
         if type(ordinal) is not int or ordinal < 0:
@@ -423,7 +483,8 @@ class WikiService:
             pub = db.execute('SELECT * FROM wiki_publications WHERE id=?', (publish_id,)).fetchone()
             if not pub:
                 raise SourceError('invalid_request', '知识页引用不存在')
-            record = json.loads(pub['record'])
+            from agent.knowledge.catalog import verify_archive
+            record, _ = verify_archive(db, self.source, pub)
             valid = _valid(db, self.source, pub)
             if not valid and not historical:
                 raise SourceError('version_conflict', '知识页已暂停、替代或校验失效')
@@ -435,7 +496,7 @@ class WikiService:
             if _hash(Path(original).read_bytes()) != revision['sha256']:
                 raise SourceError('storage_failed', '原件哈希不符')
             page = db.execute('SELECT * FROM wiki_pages WHERE id=?', (record['page_id'],)).fetchone()
-            result = _ref(record)
+            result = _ref(record, db=db) if valid else _ref(record)
             result.update(source)
             result.update(source_ordinal=ordinal, original=original, valid=valid, searchable=valid,
                           current_status='current' if valid else ('superseded' if page['current'] != publish_id else 'paused'),
@@ -471,7 +532,7 @@ class WikiService:
                 if not score:
                     continue
                 record = json.loads(row['record'])
-                ref = _ref(record)
+                ref = _ref(record, db=db)
                 source_ordinals = record['blocks'][row['ordinal']]['source_ordinals']
                 main = record['sources'][source_ordinals[0]]
                 ref.update({k: main[k] for k in ('document_id', 'revision_id', 'parse_id', 'ordinal', 'location', 'filename', 'source_state_snapshot')})

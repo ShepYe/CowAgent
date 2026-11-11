@@ -6,6 +6,7 @@ import apiClient from '../api/client'
 import { workspaceHrefOf } from '../lib/fileKind'
 import { useWorkspaceStore } from '../store/workspaceStore'
 import { useLightboxStore } from './Lightbox'
+import { headingAnchor, isInternalDocumentLink } from '../lib/knowledgeNavigation'
 
 /**
  * Markdown renderer aligned 1:1 with the web console (markdown-it + highlight.js
@@ -33,6 +34,19 @@ const md: MarkdownIt = new MarkdownIt({
     }
   },
 })
+
+const defaultHeadingOpen = md.renderer.rules.heading_open
+md.renderer.rules.heading_open = (tokens, idx, options, env, renderer) => {
+  if (env?.knowledgeLinks) {
+    const text = tokens[idx + 1]?.children?.filter(token => ['text', 'code_inline'].includes(token.type)).map(token => token.content).join('') || tokens[idx + 1]?.content || ''
+    const base = headingAnchor(text)
+    const counts: Map<string, number> = env.headingCounts || (env.headingCounts = new Map())
+    const count = counts.get(base) || 0
+    counts.set(base, count + 1)
+    tokens[idx].attrSet('id', count ? `${base}-${count}` : base)
+  }
+  return defaultHeadingOpen ? defaultHeadingOpen(tokens, idx, options, env, renderer) : renderer.renderToken(tokens, idx, options)
+}
 
 // CommonMark's flanking rules treat every Unicode punctuation alike, so
 // `是**"引号"**——` never opens emphasis: the quote after `**` is punctuation
@@ -232,7 +246,7 @@ interface MarkdownProps {
 const Markdown: React.FC<MarkdownProps> = ({ content, onInternalLink, imageBaseDir }) => {
   const rootRef = useRef<HTMLDivElement>(null)
 
-  const html = useMemo(() => md.render(content || '', { imageBaseDir }), [content, imageBaseDir])
+  const html = useMemo(() => md.render(content || '', { imageBaseDir, knowledgeLinks: !!onInternalLink }), [content, imageBaseDir, onInternalLink])
 
   // Delegate clicks: images zoom, copy buttons on code blocks, internal doc links.
   const handleClick = useCallback(
@@ -251,7 +265,7 @@ const Markdown: React.FC<MarkdownProps> = ({ content, onInternalLink, imageBaseD
         const a = target.closest('a') as HTMLAnchorElement | null
         if (a) {
           const href = a.getAttribute('href') || ''
-          if (href.endsWith('.md') && !/^https?:\/\//i.test(href)) {
+          if (isInternalDocumentLink(href)) {
             e.preventDefault()
             onInternalLink(href)
             return

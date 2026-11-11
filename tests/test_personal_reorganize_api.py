@@ -28,7 +28,11 @@ def test_reorganize_reuses_verified_original_without_touching_parent(api, tmp_pa
     assert 'source_action' not in child['payload']
     assert 'knowledge_ingest' in child['payload']['text']
     assert child['config_revision'] == 'cfg-test'
-    assert child['attachments'] == before['attachments']
+    assert [{key: value for key, value in attachment.items()
+             if key not in {'source_document_id', 'source_revision_id'}}
+            for attachment in child['attachments']] == before['attachments']
+    assert child['attachments'][0]['source_document_id'] == ref['document_id']
+    assert child['attachments'][0]['source_revision_id'] == ref['revision_id']
     assert child['download_complete']
     assert child['origin']['parent_task_id'] == parent['task_id']
     assert store.get(OWNER, parent['task_id']) == before

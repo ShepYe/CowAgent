@@ -15,6 +15,7 @@ import {
   ArrowRightLeft,
   Pencil,
   Trash2,
+  ArrowLeft,
 } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
@@ -26,6 +27,8 @@ import type {
   KnowledgeFile,
   KnowledgeList,
   KnowledgeReadResult,
+  KnowledgeCatalog,
+  KnowledgeCatalogPage,
   KnowledgeGraph as KnowledgeGraphData,
 } from '../types'
 import Markdown from '../components/Markdown'
@@ -37,6 +40,11 @@ import { askConfirm } from '../store/confirmStore'
 import AgentScopeSelect from '../components/AgentScopeSelect'
 import Tooltip from '../components/Tooltip'
 import { useAgentStore, selectMultiAgent } from '../store/agentStore'
+import KnowledgeCatalogView, { KnowledgeCatalogGroups } from '../components/KnowledgeCatalog'
+import KnowledgeHistory from '../components/KnowledgeHistory'
+import KnowledgeVersionView from '../components/KnowledgeVersionView'
+import KnowledgeCategoryMenu from '../components/KnowledgeCategoryMenu'
+import { knowledgeLinkAddress, legacyKnowledgeTree, pageCategoryAction, resolveKnowledgeLink, scrollToKnowledgeAnchor, stripMatchingHeading } from '../lib/knowledgeNavigation'
 
 interface KnowledgePageProps {
   baseUrl: string
@@ -116,13 +124,7 @@ const formatSize = (bytes: number): string => {
 // that repeats it looks duplicated. Drop that first H1 (and any blank lines
 // right after it) when it matches the title; leave the body untouched otherwise.
 function stripDuplicateH1(content: string, title: string): string {
-  if (!content) return content
-  const norm = (s: string) => s.trim().toLowerCase()
-  // Skip a leading blank/whitespace region, then match the first `# heading`.
-  const m = content.match(/^\s*#\s+(.+?)\s*(?:\r?\n|$)/)
-  if (!m) return content
-  if (norm(m[1]) !== norm(title)) return content
-  return content.slice(m[0].length).replace(/^\s*\r?\n/, '')
+  return stripMatchingHeading(content, title)
 }
 
 // Flatten the tree into category paths (for destination selectors).
@@ -166,7 +168,7 @@ interface DialogState {
 // Index pages the Agent maintains; the backend refuses to move or delete them.
 const isProtectedPage = (path: string) => PROTECTED_KNOWLEDGE_PAGES.includes(path) || /^(wiki|managed)\//.test(path)
 
-const displayCategory = (path: string) => path.startsWith('managed/') ? '资料原文' : path.split('/').slice(path.startsWith('wiki/') ? 1 : 0, -1).join(' / ') || '未分类'
+const displayCategory = (path: string) => PROTECTED_KNOWLEDGE_PAGES.includes(path) ? '' : path.startsWith('managed/') ? '资料原文' : path.startsWith('wiki/') ? '' : path.split('/').slice(0, -1).join(' / ') || '未分类'
 
 // Where a document can be moved to: any category but the one it is already in.
 const moveTargets = (categories: string[], path: string) => {
@@ -193,48 +195,6 @@ function firstFile(list: KnowledgeList): { path: string; title: string } | null 
     if (hit) return hit
   }
   return null
-}
-
-// Find a document by its bare filename anywhere in the tree (root files first,
-// then a DFS). Used to resolve relative `../foo.md` links from index docs.
-function findFileByName(list: KnowledgeList, filename: string): { path: string; title: string } | null {
-  for (const f of list.root_files || []) {
-    if (f.name === filename) return { path: f.name, title: f.title || f.name }
-  }
-  const walk = (dir: KnowledgeDir, prefix: string): { path: string; title: string } | null => {
-    const dirPath = prefix ? `${prefix}/${dir.dir}` : dir.dir
-    for (const f of dir.files) {
-      if (f.name === filename) return { path: `${dirPath}/${f.name}`, title: f.title || f.name }
-    }
-    for (const c of dir.children) {
-      const hit = walk(c, dirPath)
-      if (hit) return hit
-    }
-    return null
-  }
-  for (const d of list.tree || []) {
-    const hit = walk(d, '')
-    if (hit) return hit
-  }
-  return null
-}
-
-// Resolve a relative `.md` link (from a document body) into a knowledge path.
-// Supports `knowledge/…/x.md`, `category/x.md`, and bare/relative `../x.md`
-// (matched by filename).
-function resolveKnowledgeLink(list: KnowledgeList, href: string): { path: string; title: string } | null {
-  const clean = href.split('#')[0].split('?')[0]
-  if (!clean.endsWith('.md')) return null
-  if (clean.startsWith('knowledge/')) {
-    const path = clean.replace(/^knowledge\//, '')
-    return { path, title: findTitle(list, path) }
-  }
-  if (/^[a-z0-9_-]+\/[a-z0-9_.-]+\.md$/i.test(clean) && !clean.startsWith('/') && !clean.startsWith('.')) {
-    return { path: clean, title: findTitle(list, clean) }
-  }
-  // Relative/other path: fall back to matching by filename.
-  const filename = clean.split('/').pop() || clean
-  return findFileByName(list, filename)
 }
 
 // Resolve a document's display title from its path, falling back to the stem.
@@ -265,6 +225,15 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
   const navigate = useNavigate()
   const [tab, setTab] = useState<Tab>('docs')
   const [data, setData] = useState<KnowledgeList | null>(null)
+  const [catalog, setCatalog] = useState<KnowledgeCatalog | null>(null)
+  const [catalogError, setCatalogError] = useState('')
+  const [knowledgeRevision, setKnowledgeRevision] = useState(0)
+  const [historyPublishId, setHistoryPublishId] = useState<string | null>(null)
+  const [pendingAnchor, setPendingAnchor] = useState<{ path: string; anchor: string } | null>(null)
+  const viewerRef = useRef<HTMLDivElement>(null)
+  const loadSequence = useRef(0)
+  const loadedScope = useRef<string | null>(null)
+  const navigationSequence = useRef(0)
   const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState('')
 
@@ -291,10 +260,18 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
   const activePath = doc?.path ?? null
   // Taken from the tree rather than from whatever opened the page, so a save
   // that rewrote the H1 retitles the header as soon as the tree is re-read.
-  const docTitle = doc ? (data ? findTitle(data, doc.path, doc.title) : doc.title) : ''
+  const currentPage = catalog?.pages.find(page => page.path === activePath && page.searchable)
+  const docTitle = currentPage?.title || (doc ? (data ? findTitle(data, doc.path, doc.title) : doc.title) : '')
+  const legacyTree = useMemo(() => data ? legacyKnowledgeTree(data) : null, [data])
 
   const [graph, setGraph] = useState<KnowledgeGraphData | null>(null)
   const [graphLoading, setGraphLoading] = useState(false)
+  const graphSequence = useRef(0)
+  const invalidateGraph = useCallback(() => {
+    graphSequence.current++
+    setGraph(null)
+    setGraphLoading(false)
+  }, [])
 
   // Management UI state.
   const [menuOpen, setMenuOpen] = useState(false)
@@ -314,21 +291,74 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
 
   const openDoc = useCallback(
     (path: string, title: string) => {
+      navigationSequence.current++
+      setHistoryPublishId(null)
+      setPendingAnchor(null)
       void knowledgeEditor.getState().open({ path, title, agentId: viewingAgentId })
     },
     [viewingAgentId]
   )
 
-  // Open an internal knowledge link (relative `.md`) from within a doc body.
-  // Falls back silently when the target can't be resolved in the current tree.
   const openInternalLink = useCallback(
-    (href: string) => {
-      if (!data) return
-      const hit = resolveKnowledgeLink(data, href)
-      if (hit) openDoc(hit.path, hit.title)
+    async (href: string, sourcePath = activePath || '') => {
+      if (!data) { showStatus('目录尚未就绪，请稍后重试', true); return }
+      if (href.startsWith('#')) {
+        try {
+          if (!scrollToKnowledgeAnchor(viewerRef.current, decodeURIComponent(href.slice(1)))) showStatus('未找到该文档位置', true)
+        } catch { showStatus('链接编码无效', true) }
+        return
+      }
+      const hit = resolveKnowledgeLink(data, href, sourcePath, catalog?.pages)
+      if (!hit) {
+        const address = knowledgeLinkAddress(href, sourcePath)
+        if (!address?.path.startsWith('wiki/')) { showStatus('未找到对应知识页或链接位置无效', true); return }
+        const mine = ++navigationSequence.current
+        try {
+          const result = await apiClient.getKnowledgeVersionByPath(address.path, viewingAgentId || undefined)
+          if (mine !== navigationSequence.current) return
+          if (result.status !== 'success') throw new Error(result.message || '未找到对应历史发布')
+          if (!(await knowledgeEditor.getState().guard()) || mine !== navigationSequence.current) return
+          setHistoryPublishId(result.version.publish_id)
+          if (address.anchor) setPendingAnchor({ path: result.version.path || address.path, anchor: address.anchor })
+        } catch (e) { if (mine === navigationSequence.current) showStatus(e instanceof Error ? e.message : '历史链接读取失败', true) }
+        return
+      }
+      openDoc(hit.path, hit.title)
+      if (hit.anchor) setPendingAnchor({ path: hit.path, anchor: hit.anchor })
     },
-    [data, openDoc]
+    [data, catalog, activePath, openDoc, showStatus, viewingAgentId]
   )
+
+  const returnToDirectory = async () => {
+    const mine = ++navigationSequence.current
+    setPendingAnchor(null)
+    if (await knowledgeEditor.getState().close() && mine === navigationSequence.current) setHistoryPublishId(null)
+  }
+
+  useEffect(() => {
+    if (docLoading || !pendingAnchor || pendingAnchor.path !== activePath || historyPublishId) return
+    const timer = setTimeout(() => {
+      if (!scrollToKnowledgeAnchor(viewerRef.current, pendingAnchor.anchor)) showStatus('已打开知识页，未找到指定位置', true)
+      setPendingAnchor(null)
+    }, 0)
+    return () => clearTimeout(timer)
+  }, [docLoading, activePath, content, pendingAnchor, historyPublishId, showStatus])
+
+  const loadKnowledge = useCallback(async () => {
+    const sequence = ++loadSequence.current
+    const [fresh, result] = await Promise.all([
+      apiClient.getKnowledgeList(viewingAgentId || undefined),
+      apiClient.getKnowledgeCatalog(viewingAgentId || undefined).catch(() => null),
+    ])
+    if (sequence !== loadSequence.current) return null
+    loadedScope.current = `${baseUrl}:${viewingAgentId}`
+    setData(fresh)
+    setCatalog(result?.status === 'success' ? result : null)
+    setCatalogError(result?.status === 'success' ? '' : result?.message || '当前目录读取失败，请刷新重试')
+    setKnowledgeRevision(v => v + 1)
+    invalidateGraph()
+    return fresh
+  }, [baseUrl, viewingAgentId, invalidateGraph])
 
   // Reload the tree. When targetPath is given, open it; null means the open doc
   // no longer exists, so fall back to the first one; otherwise keep the
@@ -336,8 +366,8 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
   const refresh = useCallback(
     async (targetPath?: string | null) => {
       try {
-        const fresh = await apiClient.getKnowledgeList(viewingAgentId || undefined)
-        setData(fresh)
+        const fresh = await loadKnowledge()
+        if (!fresh) return null
         if (targetPath) {
           openDoc(targetPath, findTitle(fresh, targetPath))
         } else if (targetPath === null || !activePath) {
@@ -346,11 +376,11 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
         }
         return fresh
       } catch (e) {
-        console.error('Failed to load knowledge:', e)
+        showStatus('知识目录读取失败，请重试', true)
         return null
       }
     },
-    [openDoc, activePath, viewingAgentId]
+    [openDoc, activePath, loadKnowledge, showStatus]
   )
 
   useEffect(() => {
@@ -362,21 +392,26 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
       // and its graph and reopen the first file of the new base. Anything
       // unsaved was already asked about by setScope, which is the only way in.
       knowledgeEditor.getState().forget()
-      setGraph(null)
+      navigationSequence.current++
+      setHistoryPublishId(null)
+      setCatalog(null)
+      invalidateGraph()
       try {
-        const fresh = await apiClient.getKnowledgeList(viewingAgentId || undefined)
-        if (cancelled) return
-        setData(fresh)
+        const fresh = await loadKnowledge()
+        if (cancelled || !fresh) return
         const first = firstFile(fresh)
         if (first) openDoc(first.path, first.title)
       } catch (e) {
-        console.error('Failed to load knowledge:', e)
+        if (!cancelled) showStatus('知识目录读取失败，请重试', true)
       } finally {
         if (!cancelled) setLoading(false)
       }
     })()
     return () => {
       cancelled = true
+      loadSequence.current++
+      navigationSequence.current++
+      graphSequence.current++
     }
     // Reload on base URL or viewed-Agent change; refresh() handles in-page edits.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -385,8 +420,24 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
   const setScope = async (id: string) => {
     // Another Agent's base replaces the open document, edit and all.
     if (!(await knowledgeEditor.getState().guard())) return
+    navigationSequence.current++
+    loadSequence.current++
+    invalidateGraph()
     setScopeAgentId(id)
     localStorage.setItem('cow_knowledge_agent', id)
+  }
+
+  const changePageCategory = async (page: KnowledgeCatalogPage, category?: string) => {
+    const action = pageCategoryAction(page, category)
+    const result = await apiClient.knowledgeAction({ ...action, ...(viewingAgentId ? { agent_id: viewingAgentId } : {}) })
+    if (result.status !== 'success') {
+      const message = typeof result.message === 'string' ? result.message : '分类已变化，请核对后重试'
+      showStatus(message, true, true)
+      await refresh()
+      throw new Error(message)
+    }
+    await refresh()
+    showStatus(category === undefined ? '已恢复自动分类' : '分类已保存')
   }
 
   // A save can rewrite the page's H1 - its title in the tree - and always moves
@@ -401,30 +452,34 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
   )
 
   const loadGraph = useCallback(async () => {
-    if (graph) return
+    if (graph || loadedScope.current !== `${baseUrl}:${viewingAgentId}`) return
+    const mine = ++graphSequence.current
     setGraphLoading(true)
     try {
-      setGraph(await apiClient.getKnowledgeGraph(viewingAgentId || undefined))
+      const result = await apiClient.getKnowledgeGraph(viewingAgentId || undefined)
+      if (mine === graphSequence.current) setGraph(result)
     } catch (e) {
+      if (mine !== graphSequence.current) return
       console.error('Failed to load graph:', e)
       setGraph({ nodes: [], links: [] })
     } finally {
-      setGraphLoading(false)
+      if (mine === graphSequence.current) setGraphLoading(false)
     }
-  }, [graph, viewingAgentId])
+  }, [baseUrl, graph, viewingAgentId])
+
+  useEffect(() => { if (tab === 'graph' && !loading && !graph && !graphLoading) void loadGraph() }, [tab, loading, knowledgeRevision, graph, graphLoading, loadGraph])
 
   const onPersonalKnowledgeChanged = useCallback(() => {
     // 任务发布版本或有效性变化后刷新统计，并让图谱下次打开时读取新数据。
-    setGraph(null)
+    invalidateGraph()
     void refresh()
-  }, [refresh])
+  }, [refresh, invalidateGraph])
 
   const switchTab = async (next: Tab) => {
     if (next === tab) return
     // The graph tab hides the documents panel, text area and all.
     if (!(await knowledgeEditor.getState().guard())) return
     setTab(next)
-    if (next === 'graph') void loadGraph()
   }
 
   // Jump from a graph node to its document.
@@ -718,20 +773,20 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
     )
   }
 
-  const isEmpty = !data || totalPages === 0
+  const isEmpty = !data || (totalPages === 0 && !(data.root_files?.length) && !catalog?.pages.length)
 
   return (
-    <div className="flex-1 flex flex-col min-h-0">
+    <div className="flex-1 flex flex-col min-h-0 min-w-0 max-w-full [overflow-wrap:anywhere]">
       {/* Header */}
-      <div className="flex items-center justify-between px-6 pt-5 pb-3 flex-shrink-0">
-        <div>
+      <div className="flex flex-wrap items-center justify-between gap-3 px-4 sm:px-6 pt-5 pb-3 flex-shrink-0 min-w-0">
+        <div className="min-w-0">
           <h2 className="text-xl font-bold text-content">{t('knowledge_title')}</h2>
           {!isEmpty && <p className="text-xs text-content-tertiary mt-1">{statsLabel}</p>}
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex min-w-0 max-w-full flex-wrap items-center gap-2">
           {status && (
             <span
-              className={`text-xs max-w-[260px] truncate ${
+              className={`text-xs max-w-full lg:max-w-[260px] truncate ${
                 status.error ? 'text-danger' : 'text-content-tertiary'
               }`}
               title={status.text}
@@ -739,8 +794,10 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
               {status.text}
             </span>
           )}
-          <AgentScopeSelect value={viewingAgentId} onChange={(id) => void setScope(id)} />
-          <div className="flex items-center gap-1 bg-inset-2 rounded-btn p-0.5">
+          <div className="min-w-0 max-w-full [&>div]:max-w-full [&_button]:max-w-full">
+            <AgentScopeSelect value={viewingAgentId} onChange={(id) => void setScope(id)} />
+          </div>
+          <div className="flex min-w-0 max-w-full flex-wrap items-center gap-1 bg-inset-2 rounded-btn p-0.5">
             <TabBtn
               icon={Files}
               label={t('knowledge_tab_docs')}
@@ -753,7 +810,7 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
               active={tab === 'graph'}
               onClick={() => void switchTab('graph')}
             />
-            <TabBtn icon={Upload} label="资料任务" active={tab === 'personal'} onClick={() => void switchTab('personal')} />
+            <TabBtn icon={Upload} label="资料" active={tab === 'personal'} onClick={() => void switchTab('personal')} />
           </div>
           <NewMenu
             open={menuOpen}
@@ -798,7 +855,7 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
         </div>
       ) : tab === 'docs' ? (
         <div
-          className="flex-1 flex min-h-0 border-t border-default relative"
+          className="flex-1 flex min-h-0 min-w-0 border-t border-default relative"
           onDragEnter={(e) => {
             if (e.dataTransfer?.types?.includes('Files')) {
               e.preventDefault()
@@ -828,7 +885,7 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
             </div>
           )}
           {/* Tree sidebar */}
-          <div className="w-72 flex-shrink-0 flex flex-col border-r border-default min-h-0">
+          <div className={`w-full lg:w-64 min-w-0 flex-shrink-0 flex-col lg:border-r border-default min-h-0 ${doc || historyPublishId ? 'hidden lg:flex' : 'flex'}`}>
             <div className="p-3 flex-shrink-0">
               <div className="relative">
                 <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-content-tertiary" />
@@ -841,27 +898,39 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
               </div>
             </div>
             <div className="flex-1 overflow-y-auto px-2 pb-3">
-              <Tree
-                data={data}
+              <div className="mb-4 space-y-1">
+                {[['index.md', '知识索引'], ['log.md', '整理记录']].map(([path, title]) => <button key={path} type="button" onClick={() => openDoc(path, title)}
+                  className={`w-full rounded-btn px-3 py-2 text-left text-sm ${activePath === path && !historyPublishId ? 'bg-accent-soft text-accent' : 'text-content-secondary hover:bg-surface-2'}`}>{title}</button>)}
+              </div>
+              {catalogError && <div role="alert" className="mb-3 px-2 text-xs text-danger">{catalogError}<button type="button" onClick={() => void refresh()} className="ml-2 underline">重试</button></div>}
+              <KnowledgeCatalogGroups pages={catalog?.pages || []} search={search} activePath={historyPublishId ? null : activePath} onOpen={openDoc} compact />
+              {legacyTree && <div className="mt-4 border-t border-default pt-3"><Tree
+                data={{ ...legacyTree, root_files: legacyTree.root_files?.filter(f => !PROTECTED_KNOWLEDGE_PAGES.includes(f.name)) }}
                 search={search.trim().toLowerCase()}
                 activePath={activePath}
                 onOpen={openDoc}
                 actions={treeActions}
-              />
+              /></div>}
             </div>
           </div>
 
           {/* Document viewer / editor */}
-          <div className="flex-1 min-w-0 flex flex-col min-h-0">
-            {!doc ? (
+          <div ref={viewerRef} className={`flex-1 min-w-0 flex-col min-h-0 ${doc || historyPublishId ? 'flex' : 'hidden lg:flex'}`}>
+            <button type="button" onClick={() => void returnToDirectory()}
+              className="m-3 inline-flex w-fit max-w-full items-center gap-1 text-sm text-content-secondary lg:hidden"><ArrowLeft size={14} />返回目录</button>
+            {historyPublishId ? <div className="flex-1 overflow-y-auto">
+              <KnowledgeVersionView key={`${viewingAgentId}:${historyPublishId}`} publishId={historyPublishId} agentId={viewingAgentId || undefined}
+                anchor={pendingAnchor?.anchor} onAnchorResolved={found => { setPendingAnchor(null); if (!found) showStatus('已打开历史版本，未找到指定位置', true) }}
+                onBack={() => openDoc('log.md', '整理记录')} onOpenCurrent={openDoc} onInternalLink={openInternalLink} />
+            </div> : !doc ? (
               <div className="h-full flex flex-col items-center justify-center text-content-tertiary">
                 <FileText size={28} className="mb-3 opacity-50" />
                 <p className="text-sm">{t('knowledge_select_hint')}</p>
               </div>
             ) : (
               <>
-                <div className="flex items-center gap-3 px-6 py-3 flex-shrink-0 border-b border-subtle">
-                  <h3 className="flex-1 min-w-0 text-sm font-semibold text-content truncate">
+                {!PROTECTED_KNOWLEDGE_PAGES.includes(doc.path) && <div className="flex flex-wrap items-center gap-x-3 gap-y-2 px-4 sm:px-6 py-3 flex-shrink-0 min-w-0 border-b border-subtle">
+                  <h3 className="basis-full lg:basis-0 lg:flex-1 min-w-0 text-base font-semibold text-content truncate">
                     {docTitle}
                     {edit?.dirty && (
                       <span className="text-accent" title={t('ws_edit_unsaved')}>
@@ -870,20 +939,26 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
                       </span>
                     )}
                   </h3>
-                  {/* index.md is where the page opens, so the reason its Edit
-                      button is missing has to be on screen, not implied. */}
                   <span
-                    className={`text-xs text-content-tertiary truncate max-w-[45%] ${
+                    className={`text-xs text-content-tertiary truncate max-w-full lg:max-w-[45%] ${
                       readonly ? '' : 'font-mono'
                     }`}
                     title={readonly || undefined}
                   >
-                    {activePath ? displayCategory(activePath) : ''}
+                    {currentPage?.category || (activePath ? displayCategory(activePath) : '')}
                   </span>
+                  {currentPage && <KnowledgeCategoryMenu key={currentPage.page_id} page={currentPage} categories={catalog?.categories || []} onChange={changePageCategory} />}
                   <DocActions store={knowledgeEditor} textareaRef={editorRef} />
-                </div>
+                </div>}
                 <DocNotice store={knowledgeEditor} />
-                {edit ? (
+                {doc.path === 'index.md' ? <div className="flex-1 overflow-y-auto">
+                  {catalogError && <p role="alert" className="px-6 pt-4 text-sm text-danger">{catalogError}</p>}
+                  <KnowledgeCatalogView pages={catalog?.pages || []} onOpen={openDoc} legacyContent={catalog?.legacy_content}
+                    onInternalLink={href => openInternalLink(href, 'index.md')} imageBaseDir={doc.dir} />
+                </div> : doc.path === 'log.md' ? <div className="flex-1 overflow-y-auto">
+                  <KnowledgeHistory key={viewingAgentId} agentId={viewingAgentId || undefined} revision={knowledgeRevision}
+                    onOpenVersion={id => { navigationSequence.current++; setPendingAnchor(null); setHistoryPublishId(id) }} onInternalLink={href => openInternalLink(href, 'log.md')} />
+                </div> : edit ? (
                   // Keyed so switching the edited page remounts the text area
                   // and reseeds it, instead of keeping the previous page's text.
                   <div className="flex-1 min-h-0 overflow-hidden">
@@ -891,7 +966,7 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
                   </div>
                 ) : (
                   <DocView store={knowledgeEditor}>
-                    <div className="max-w-3xl mx-auto px-6 py-6">
+                    <div className="min-w-0 max-w-3xl mx-auto px-4 sm:px-6 py-6">
                       {docLoading ? (
                         <div className="flex items-center text-content-tertiary py-8">
                           <Loader2 size={16} className="animate-spin mr-2" />
@@ -899,7 +974,7 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
                       ) : (
                         <Markdown
                           content={stripDuplicateH1(content, docTitle)}
-                          onInternalLink={openInternalLink}
+                          onInternalLink={href => openInternalLink(href, doc.path)}
                           imageBaseDir={doc.dir}
                         />
                       )}

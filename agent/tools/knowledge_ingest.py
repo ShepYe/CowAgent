@@ -69,14 +69,19 @@ class KnowledgeIngest(BaseTool):
                     task = store.claim(owner, task_id)
             task = store.get(owner, task_id)
             if task["status"] == "succeeded":
+                refs = []
                 for ref in task.get("result_refs", []):
+                    display = dict(ref)
                     if ref.get("publish_id"):
                         workspace = self.config.get("workspace_root") or self.config.get("cwd")
                         if not workspace:
                             from common import state_dir
                             workspace = state_dir.state_root()
-                        SourceService(workspace, owner).read_reference(ref["publish_id"], ref.get("source_ordinal", 0))
-                return ToolResult.success(task)
+                        current = SourceService(workspace, owner).read_reference(ref["publish_id"], ref.get("source_ordinal", 0))
+                        if ref.get('page_id'):
+                            display.update({key: current[key] for key in ('category', 'category_mode', 'category_revision')})
+                    refs.append(display)
+                return ToolResult.success(dict(task, result_refs=refs))
             attempt = task["attempt"]
             purpose = args.get("purpose")
             if purpose not in ("long_term", "transient", "waiting") or not args.get("reason"):

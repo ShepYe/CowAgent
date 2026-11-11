@@ -37,6 +37,9 @@ import type {
   KnowledgeAction,
   KnowledgeImportPayload,
   KnowledgeReadResult,
+  KnowledgeCatalog,
+  KnowledgeHistory,
+  KnowledgeVersion,
   WorkspaceEntry,
   WorkspaceReadResult,
   WorkspaceTree,
@@ -1426,6 +1429,22 @@ class ApiClient {
     return this.request<{ status: string } & KnowledgeList>(this.scoped('/api/knowledge/list', agentId))
   }
 
+  async getKnowledgeCatalog(agentId?: string): Promise<KnowledgeCatalog> {
+    return this.request(this.scoped('/api/knowledge/catalog', agentId))
+  }
+
+  async getKnowledgeHistory(offset = 0, limit = 20, agentId?: string): Promise<KnowledgeHistory> {
+    return this.request(this.scoped(`/api/knowledge/history?offset=${offset}&limit=${limit}`, agentId))
+  }
+
+  async getKnowledgeVersion(publishId: string, agentId?: string): Promise<{ status: string; message?: string; version: KnowledgeVersion }> {
+    return this.request(this.scoped(`/api/knowledge/version?publish_id=${encodeURIComponent(publishId)}`, agentId))
+  }
+
+  async getKnowledgeVersionByPath(path: string, agentId?: string): Promise<{ status: string; message?: string; version: KnowledgeVersion }> {
+    return this.request(this.scoped(`/api/knowledge/version?path=${encodeURIComponent(path)}`, agentId))
+  }
+
   // `mtime` and `editable` are what an editor needs to offer a safe save: the
   // baseline a stale write is rejected against, and whether the page may be
   // written back at all (index.md and log.md are the Agent's to maintain).
@@ -1696,7 +1715,7 @@ export interface PersonalTask {
   notification: string
   error?: { code: string; message?: string; retryable?: boolean }
   payload?: { text?: string; filename?: string; source_action?: Record<string, unknown>; reorganize?: { document_id: string; revision_id: string; expected_state: number } }
-  attachments: { attachment_id: string; filename: string; sha256: string }[]
+  attachments: { attachment_id: string; filename: string; sha256: string; source_document_id?: string; source_revision_id?: string }[]
   result_refs: Record<string, unknown>[]
 }
 export interface PersonalResponse { status: string; message?: string; code?: string; task?: PersonalTask }

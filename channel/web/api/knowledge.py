@@ -37,6 +37,45 @@ class KnowledgeListHandler:
             return json.dumps({"status": "error", "message": str(e)})
 
 
+class _KnowledgeCatalogReadHandler:
+    method = 'catalog'
+
+    def GET(self):
+        _require_auth()
+        web.header('Content-Type', 'application/json; charset=utf-8')
+        try:
+            from agent.knowledge.service import KnowledgeService
+            from agent.knowledge.parser import SourceError
+            params = web.input(agent_id='', offset='0', limit='50', publish_id='', path='')
+            service = KnowledgeService(_get_workspace_root(agent_id=_request_agent_id(params)))
+            if self.method == 'history':
+                try:
+                    offset, limit = int(params.offset), int(params.limit)
+                except (ValueError, TypeError):
+                    raise SourceError('invalid_request', '分页参数无效')
+                result = service.history(offset, limit)
+            elif self.method == 'version':
+                result = {'version': service.version(params.publish_id, path=params.path)}
+            else:
+                result = service.catalog()
+            return json.dumps({'status': 'success', **result}, ensure_ascii=False)
+        except (ValueError, OSError) as exc:
+            return json.dumps({'status': 'error', 'code': getattr(exc, 'code', 'invalid_request'),
+                               'message': '知识请求无法完成'}, ensure_ascii=False)
+
+
+class KnowledgeCatalogHandler(_KnowledgeCatalogReadHandler):
+    pass
+
+
+class KnowledgeHistoryHandler(_KnowledgeCatalogReadHandler):
+    method = 'history'
+
+
+class KnowledgeVersionHandler(_KnowledgeCatalogReadHandler):
+    method = 'version'
+
+
 class KnowledgeReadHandler:
     def GET(self):
         _require_auth()
@@ -84,6 +123,8 @@ class KnowledgeActionHandler:
         web.header('Content-Type', 'application/json; charset=utf-8')
         try:
             body = json.loads(web.data() or b"{}")
+            if not isinstance(body, dict) or not isinstance(body.get('payload', {}), dict):
+                return json.dumps({'status': 'error', 'code': 400, 'message': '请求参数无效', 'payload': None}, ensure_ascii=False)
             action = body.get("action", "")
             payload = body.get("payload") or {}
             from agent.knowledge.service import KnowledgeService
@@ -91,7 +132,7 @@ class KnowledgeActionHandler:
             # possibly an embedding call, possibly a wait on the index the
             # Agent is using - runs behind the response.
             result = KnowledgeService(
-                _get_workspace_root(agent_id=_request_agent_id(body)),
+                _get_workspace_root(agent_id=_scoped_agent_id(body)),
                 reindex_in_background=True,
             ).dispatch(action, payload)
             return json.dumps({

@@ -303,7 +303,7 @@ class SourceService:
                     record = json.loads(publication['record'])
                     ordinal = next(i for i, source in enumerate(record['sources'])
                                    if source['document_id'] == document_id and source['revision_id'] == revision_id)
-                    return _ref(record, ordinal)
+                    return _ref(record, ordinal, db=db)
             doc = self._document(db, document_id)
             pubs = db.execute("SELECT * FROM publications WHERE document=? AND revision=?", (document_id, revision_id)).fetchall()
             for pub in reversed(pubs):

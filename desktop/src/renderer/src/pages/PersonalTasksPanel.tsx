@@ -1,75 +1,61 @@
 import Markdown from '../components/Markdown'
-import React, { useCallback, useEffect, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { ArrowLeft, ArrowUpRight, BookOpen, ChevronDown, FileText, History, Info, Loader2, Plus, RefreshCw, Search, Settings2, Upload, X } from 'lucide-react'
 import { askConfirm } from '../store/confirmStore'
+import Tooltip from '../components/Tooltip'
+import { Btn, Modal, TextInput } from './settings/primitives'
 import apiClient, { type PersonalTask, type PersonalSourceAction, type PersonalReference } from '../api/client'
+import { buildMaterials, materialSource, materialResults, materialKnowledgeLabel, materialReorganizeSource, readableFilename, taskActions,
+  taskStatuses as statuses, taskStages as stages, personalTaskTitle, personalOutcomeLabel, personalKnowledgeFingerprint,
+  canResubmit, isTransportFilename, type Material, type SourceRef } from './personalMaterials'
+export { personalTaskTitle, personalOutcomeLabel, personalKnowledgeFingerprint } from './personalMaterials'
 
-const statuses: Record<string, string> = { queued: '已接收', running: '处理中', waiting_input: '等待补充', succeeded: '已完成', failed: '失败', cancelled: '已取消', needs_reconcile: '待核对' }
-const stages: Record<string, string> = { receive: '接收', download: '保存原件', decide: '判断用途', parse: '解析', publish: '发布', pending_index: '已保存，待索引', done: '完成' }
-const outcomes: Record<string, string> = { transient: '临时使用', duplicate: '重复资料' }
-export function personalOutcomeLabel(task: PersonalTask): string {
-  if (task.outcome !== 'published') return outcomes[task.outcome || ''] || task.outcome || ''
-  const publications = task.result_refs.filter(ref => typeof ref.publish_id === 'string')
-  const verified = publications.filter(ref => ref.current_searchable === true).length
-  return !verified ? '已发布（当前不可检索）' : verified === publications.length ? '当前可检索' : '部分可检索'
-}
-const canResubmit = (task: PersonalTask) => task.status === 'failed' && task.error?.code === 'config_unavailable' && task.attachments.length > 0 && !task.result_refs.length && !task.payload?.source_action
-
-function isTransportFilename(value: string): boolean {
-  const name = value.replace(/\\/g, '/').split('/').pop() || ''
-  return /^file_v\d+_/i.test(name) || /^(?:[a-f0-9]{32}|[a-f0-9]{64})(?:\.[^.]+)?$/i.test(name)
-}
-
-export function personalTaskTitle(task: PersonalTask): string {
-  const title = task.result_refs.find(ref => typeof ref.title === 'string' && ref.title.trim() && !isTransportFilename(ref.title))?.title
-  if (typeof title === 'string') return title
-  const filenames = task.attachments.map(item => item.filename).filter(Boolean)
-  if (!filenames.length && task.payload?.filename) filenames.push(task.payload.filename)
-  return filenames.map(name => isTransportFilename(name) ? '资料处理任务' : name).join('、') || '知识整理任务'
-}
-
-export function personalKnowledgeFingerprint(tasks: PersonalTask[]): string {
-  return JSON.stringify(tasks.flatMap(task => task.result_refs
-    .filter(ref => typeof ref.publish_id === 'string')
-    .map(ref => JSON.stringify([task.task_id, task.status, ref.page_id, ref.page_version, ref.publish_id,
-      ref.current_searchable === true, ref.title, ref.category, ref.path]))).sort())
-}
-
-export default function PersonalTasksPanel({ onOpenKnowledge, onKnowledgeChanged }: {
+type RunAction = (task: PersonalTask, name: string, source?: PersonalSourceAction, input?: string) => Promise<boolean>
+interface PanelProps {
   onOpenKnowledge?: (path: string, title: string) => void
   onKnowledgeChanged?: () => void
-}) {
+}
+export default function PersonalTasksPanel({ onOpenKnowledge, onKnowledgeChanged }: PanelProps) {
   const [tasks, setTasks] = useState<PersonalTask[]>([])
+  const [loading, setLoading] = useState(true)
+  const [selected, setSelected] = useState<string | null>(null)
+  const [search, setSearch] = useState('')
   const [reference, setReference] = useState<{ taskId: string; publishId: string } | null>(null)
   const [referenceVersion, setReferenceVersion] = useState(0)
   const [message, setMessage] = useState('')
   const [success, setSuccess] = useState('')
   const [busy, setBusy] = useState('')
+  const [uploadOpen, setUploadOpen] = useState(false)
   const [text, setText] = useState('')
   const [file, setFile] = useState<File | null>(null)
-  const [inputs, setInputs] = useState<Record<string, string>>({})
   const requestId = useRef(crypto.randomUUID())
   const resubmitRequestIds = useRef(new Map<string, string>())
   const fileInput = useRef<HTMLInputElement>(null)
-  const knowledgeFingerprint = useRef<string | null>(null)
-  const knowledgeChangedCallback = useRef(onKnowledgeChanged)
-  useEffect(() => { knowledgeChangedCallback.current = onKnowledgeChanged }, [onKnowledgeChanged])
+  const fingerprint = useRef<string | null>(null)
+  const changedCallback = useRef(onKnowledgeChanged)
+  useEffect(() => { changedCallback.current = onKnowledgeChanged }, [onKnowledgeChanged])
   const load = useCallback(async () => {
     try {
       const res = await apiClient.personalTasks()
       if (res.status !== 'success') throw new Error(res.message || '读取任务失败')
       setTasks(res.tasks)
-      const fingerprint = personalKnowledgeFingerprint(res.tasks)
-      if (knowledgeFingerprint.current !== fingerprint) {
-        knowledgeFingerprint.current = fingerprint
-        knowledgeChangedCallback.current?.()
-      }
+      const next = personalKnowledgeFingerprint(res.tasks)
+      if (fingerprint.current !== next) { fingerprint.current = next; changedCallback.current?.() }
     } catch (e) { setMessage(e instanceof Error ? e.message : '读取任务失败') }
+    finally { setLoading(false) }
   }, [])
+  useEffect(() => { void load(); const timer = setInterval(() => void load(), 4000); return () => clearInterval(timer) }, [load])
+  const materials = useMemo(() => buildMaterials(tasks), [tasks])
+  const visible = materials.filter(item => item.title.toLowerCase().includes(search.toLowerCase()))
+  const active = materials.find(item => item.key === selected)
+  const uploadTrigger = useRef<HTMLButtonElement>(null)
+  const closeUpload = useCallback(() => { setUploadOpen(false); uploadTrigger.current?.focus() }, [])
   useEffect(() => {
-    void load()
-    const timer = setInterval(() => void load(), 4000)
-    return () => clearInterval(timer)
-  }, [load])
+    if (!uploadOpen) return
+    const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape') closeUpload() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [uploadOpen, closeUpload])
   const submit = async () => {
     if (!file || busy) return
     if (file.size > 100 * 1024 * 1024) { setMessage('文件超过 100 MiB 上限'); return }
@@ -79,57 +65,173 @@ export default function PersonalTasksPanel({ onOpenKnowledge, onKnowledgeChanged
       if (res.status !== 'success') throw new Error(res.message || '提交失败')
       setFile(null); setText(''); requestId.current = crypto.randomUUID()
       if (fileInput.current) fileInput.current.value = ''
-      await load()
+      closeUpload(); await load()
     } catch (e) { setMessage(e instanceof Error ? e.message : '提交失败') }
     finally { setBusy('') }
   }
-  const action = async (task: PersonalTask, name: string, source?: PersonalSourceAction) => {
-    if (busy || (name === 'resubmit' && !canResubmit(task))) return
-    if (name === 'withdraw' && !(await askConfirm({ titleKey: 'personal_withdraw', msgKey: 'personal_withdraw_confirm', okKey: 'personal_withdraw' }))) return
+  const action: RunAction = async (task, name, source, input) => {
+    if (busy || (name === 'resubmit' && !canResubmit(task))) return false
+    if (name === 'withdraw' && !(await askConfirm({ titleKey: 'personal_withdraw', msgKey: 'personal_withdraw_confirm', okKey: 'personal_withdraw' }))) return false
     setBusy(task.task_id); setMessage(''); setSuccess('')
     try {
-      let resubmitRequestId: string | undefined
+      let resubmitId: string | undefined
       if (name === 'resubmit') {
         const key = `${task.task_id}:${task.attempt}`
-        resubmitRequestId = resubmitRequestIds.current.get(key) ?? crypto.randomUUID()
-        resubmitRequestIds.current.set(key, resubmitRequestId)
+        resubmitId = resubmitRequestIds.current.get(key) ?? crypto.randomUUID()
+        resubmitRequestIds.current.set(key, resubmitId)
       }
-      const res = await apiClient.personalAction(task, name, inputs[task.task_id], source, resubmitRequestId)
+      const res = await apiClient.personalAction(task, name, input, source, resubmitId)
       if (res.status !== 'success') throw new Error(res.message || '操作失败')
-      setSuccess(name === 'resubmit' ? '已创建新任务，使用当前配置处理原附件，旧任务记录已保留。' : '操作成功')
+      setSuccess(name === 'reorganize' || name === 'resubmit' ? '已创建处理任务' : '操作成功')
       setReferenceVersion(v => v + 1)
-    } catch (e) { setMessage(e instanceof Error ? e.message : '操作失败') }
+      return true
+    } catch (e) { setMessage(e instanceof Error ? e.message : '操作失败'); return false }
     finally { await load(); setBusy('') }
   }
-  const button = 'px-3 py-1.5 rounded-btn border border-default text-sm disabled:opacity-50'
-  return <div className="flex-1 overflow-auto border-t border-default p-6 space-y-4">
-    <div className="flex flex-wrap gap-2 items-center">
-      <input ref={fileInput} aria-label="选择资料" type="file" accept=".pdf,.docx,.xlsx,.md,.txt" disabled={!!busy} onChange={e => { setFile(e.target.files?.[0] || null); requestId.current = crypto.randomUUID() }} />
-      <input className="bg-inset border border-default rounded-btn px-3 py-2 flex-1" placeholder="补充用途" aria-label="资料用途" value={text} disabled={!!busy} onChange={e => { setText(e.target.value); requestId.current = crypto.randomUUID() }} />
-      <span title="正常分享后由助手自主整理；仅临时使用时请在用途里说明。支持 PDF、DOCX、XLSX、MD、TXT，单件不超过 100 MiB。">?</span>
-      <button className={button} disabled={!file || !!busy} onClick={() => void submit()}>{busy === 'submit' ? '接收中…' : '发送资料'}</button>
-      <button className={button} onClick={() => void load()}>刷新</button>
+  return <div className="flex-1 min-h-0 min-w-0 flex flex-col border-t border-default bg-base text-sm">
+    <div className="flex items-center gap-3 px-4 py-3 border-b border-default bg-surface">
+      <div className="flex-1 min-w-0 relative"><Search size={15} className="absolute left-3 top-2.5 text-content-tertiary" /><TextInput aria-label="搜索资料" placeholder="搜索资料" value={search} onChange={e => setSearch(e.target.value)} className="pl-9" /></div>
+      <Tooltip label="刷新资料"><button aria-label="刷新资料" onClick={() => void load()} className="p-2 rounded-btn text-content-secondary hover:bg-surface-2"><RefreshCw size={16} /></button></Tooltip>
+      <button ref={uploadTrigger} onClick={() => setUploadOpen(true)} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-btn bg-accent text-accent-contrast hover:bg-accent-hover"><Plus size={15} />添加资料</button>
     </div>
-    {reference && <ReferenceBrowser taskId={reference.taskId} publishId={reference.publishId} version={`${referenceVersion}:${JSON.stringify(tasks.find(t => t.task_id === reference.taskId)?.result_refs.map(r => [r.current_searchable, r.source_state, (r.sources as Record<string, unknown>[] | undefined)?.map(s => s.source_state)]))}`} onClose={() => setReference(null)} />}
-    {message && <div role="alert" className="text-danger text-sm">{message}</div>}
-    {success && <div role="status" className="text-sm">{success}</div>}
-    {!tasks.length && <div className="text-content-tertiary text-sm">暂无资料任务</div>}
-    {tasks.map(task => <article key={task.task_id} className="rounded-lg border border-default p-4 space-y-2">
-      <div className="flex justify-between gap-3"><strong>{personalTaskTitle(task)}</strong><span>{statuses[task.status] || task.status} · {stages[task.stage] || task.stage}{task.outcome ? ` · ${personalOutcomeLabel(task)}` : ''}</span></div>
-      <div className="text-xs text-content-tertiary" title={`任务 ${task.task_id}\n配置 ${task.config_revision}\n通知 ${task.notification}`}>第 {task.attempt} 次 · {new Date(task.updated_at).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })} <span>?</span></div>
-      {task.error && <div role="alert" className="text-danger text-sm">{task.error.code === 'config_unavailable' ? '任务原配置不可用，无法继续使用原配置处理。' : `${task.error.code}${task.error.message ? ` · ${task.error.message}` : ''}`}</div>}
-      {task.response && <details><summary className="cursor-pointer text-sm text-content-secondary">处理记录</summary><Markdown content={task.response} /></details>}
-
-      {task.status === 'waiting_input' && <div className="flex gap-2"><label className="flex-1">{task.question}<input aria-label="补充用途" className="w-full bg-inset border border-default rounded-btn px-3 py-2" value={inputs[task.task_id] || ''} onChange={e => setInputs({ ...inputs, [task.task_id]: e.target.value })} /></label><button className={button} disabled={!!busy || !inputs[task.task_id]?.trim()} onClick={() => void action(task, 'update_input')}>补充用途</button></div>}
-      <div className="flex gap-2 flex-wrap">
-        {canResubmit(task) ? <button className={button} disabled={!!busy} title="复用原附件，按当前配置创建新任务；旧任务及其记录会保留。请求失败后可再次点击。" onClick={() => void action(task, 'resubmit')}>按当前配置重新处理</button> : task.status === 'failed' && task.error?.code !== 'config_unavailable' && task.error?.retryable && <button className={button} disabled={!!busy} onClick={() => void action(task, 'retry')}>重试</button>}
-        {['queued', 'running', 'waiting_input'].includes(task.status) && <button className={button} disabled={!!busy} onClick={() => void action(task, 'cancel')}>{busy === task.task_id ? '处理中…' : '取消'}</button>}
-
-        {task.attachments.map(a => <a className={button} key={a.attachment_id} href={apiClient.personalOriginal(task.task_id, a.attachment_id)} target="_blank" rel="noreferrer" title={a.filename}>打开原件</a>)}
-      </div>
-      {task.result_refs.map((ref, i) => <SourceControls key={`${String(ref.document_id)}:${i}`} source={ref} busy={!!busy} onAction={(name, source) => action(task, name, source)} onOpenKnowledge={onOpenKnowledge} onReference={() => setReference({ taskId: task.task_id, publishId: ref.publish_id as string })} />)}
-    </article>)}
+    {message && <div role="alert" className="px-4 py-2 text-danger bg-danger-soft">{message}</div>}
+    {success && <div role="status" className="px-4 py-2 text-accent bg-accent-soft">{success}</div>}
+    {loading ? <div role="status" className="flex flex-1 items-center justify-center gap-2 text-content-tertiary"><Loader2 size={18} className="animate-spin" />读取资料…</div> : <MaterialsLayout materials={visible} active={active} selected={selected} onSelect={setSelected} onBack={() => setSelected(null)}>
+      {active && <MaterialDetail key={active.key} material={active} busy={!!busy} onAction={action} onOpenKnowledge={onOpenKnowledge}
+        onReference={(task, ref) => setReference({ taskId: task.task_id, publishId: String(ref.publish_id) })} />}
+    </MaterialsLayout>}
+    <Modal open={uploadOpen} title="添加资料" onClose={closeUpload} footer={<><Btn onClick={closeUpload}>取消</Btn><Btn variant="primary" disabled={!file || !!busy} onClick={() => void submit()}>{busy === 'submit' ? '接收中…' : '发送资料'}</Btn></>}>
+      <input ref={fileInput} className="hidden" tabIndex={-1} aria-label="选择资料文件" type="file" accept=".pdf,.docx,.xlsx,.md,.txt" disabled={!!busy}
+        onChange={e => { setFile(e.target.files?.[0] || null); requestId.current = crypto.randomUUID() }} />
+      <button onClick={() => fileInput.current?.click()} disabled={!!busy} className="w-full rounded-card border border-dashed border-strong bg-inset px-5 py-7 text-content-secondary hover:border-accent transition-colors flex flex-col items-center gap-2">
+        <Upload size={22} className="text-accent" /><span>{file ? readableFilename(file.name) : '选择资料文件'}</span>
+      </button>
+      <TextInput autoFocus aria-label="资料用途" placeholder="补充用途（可选）" value={text} disabled={!!busy} onChange={e => { setText(e.target.value); requestId.current = crypto.randomUUID() }} />
+      <Tooltip label="支持 PDF、DOCX、XLSX、MD、TXT，单件不超过 100 MiB。助手自主整理；仅临时使用时请在用途中说明。"><button aria-label="资料格式与用途说明" className="text-content-tertiary"><Info size={14} /></button></Tooltip>
+    </Modal>
+    <Modal open={!!reference} size="lg" title="资料出处" onClose={() => setReference(null)}>
+      {reference && <ReferenceBrowser taskId={reference.taskId} publishId={reference.publishId}
+        version={`${referenceVersion}:${JSON.stringify(tasks.find(t => t.task_id === reference.taskId)?.result_refs.map(r => [r.current_searchable, r.source_state, (r.sources as SourceRef[] | undefined)?.map(s => s.source_state)]))}`}
+        onClose={() => setReference(null)} />}
+    </Modal>
   </div>
+}
+
+export function MaterialsLayout({ materials, active, selected, onSelect, onBack, children }: {
+  materials: Material[]; active?: Material; selected: string | null; onSelect: (key: string) => void; onBack: () => void; children?: React.ReactNode
+}) {
+  const listRef = useRef<HTMLDivElement>(null)
+  const detailRef = useRef<HTMLDivElement>(null)
+  useEffect(() => { if (selected && active) detailRef.current?.focus() }, [selected, !!active])
+  const back = () => { const selectedRow = listRef.current?.querySelector<HTMLButtonElement>('[aria-current="true"]'); onBack(); requestAnimationFrame(() => selectedRow?.focus()) }
+  const documents = materials.filter(item => !item.recordOnly)
+  const records = materials.filter(item => item.recordOnly)
+  const row = (material: Material) => <button key={material.key} aria-current={selected === material.key} onClick={() => onSelect(material.key)}
+    className={`w-full text-left rounded-btn px-3 py-3 mb-1 transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent ${selected === material.key ? 'bg-accent-soft text-accent' : 'text-content hover:bg-surface-2'}`}>
+    <div className="flex items-start gap-2"><FileText size={16} className="shrink-0 mt-0.5 opacity-70" /><span className="font-medium break-words line-clamp-2">{material.title}</span></div>
+    <div className="pl-6 mt-1.5 text-xs text-content-tertiary">{material.recordOnly ? '独立处理记录' : materialKnowledgeLabel(material)}</div>
+    <div className="pl-6 mt-1 text-xs text-content-secondary">最近处理：{statuses[material.tasks[0].status] || material.tasks[0].status}</div>
+  </button>
+  return <div className="flex-1 min-h-0 min-w-0 flex">
+    <div ref={listRef} aria-label="资料列表" className={`${active ? 'hidden lg:block' : 'block'} w-full lg:w-72 xl:w-80 shrink-0 overflow-y-auto border-r border-default bg-surface p-2`}>
+      <div className="px-3 py-2 text-xs text-content-tertiary">资料 · {documents.length}</div>
+      {!materials.length && <p className="px-3 py-8 text-content-tertiary text-center">暂无资料</p>}
+      {documents.map(row)}
+      {records.length > 0 && <details open={active?.recordOnly || undefined} className="mt-3 border-t border-default pt-3" aria-label="其他处理记录">
+        <summary className="cursor-pointer px-3 py-2 text-xs text-content-secondary">其他处理记录（{records.length}）</summary>
+        {records.map(row)}
+      </details>}
+    </div>
+    <div ref={detailRef} tabIndex={-1} aria-label="资料详情" onKeyDown={e => { if (e.key === 'Escape' && !e.defaultPrevented && !(e.target as HTMLElement).closest('[role="dialog"]')) back() }}
+      className={`${active ? 'flex' : 'hidden lg:flex'} min-w-0 flex-1 flex-col overflow-y-auto focus:outline-none`}>
+      {active ? <><div className="lg:hidden px-4 pt-3"><button onClick={back} className="inline-flex items-center gap-1 text-content-secondary py-1"><ArrowLeft size={15} />返回资料列表</button></div>{children}</> : <div className="m-auto flex flex-col items-center gap-3 text-content-tertiary"><BookOpen size={28} /><span>选择一份资料查看详情</span></div>}
+    </div>
+  </div>
+}
+
+export function MaterialDetail({ material, busy, onAction, onOpenKnowledge, onReference }: {
+  material: Material; busy: boolean; onAction: RunAction; onOpenKnowledge?: PanelProps['onOpenKnowledge']; onReference: (task: PersonalTask, ref: SourceRef) => void
+}) {
+  const source = materialSource(material)
+  const state = source?.source.source_state as { state: number; validity: string; purpose: string } | undefined
+  const results = materialResults(material)
+  const original = material.originals[0]
+  const reorganize = materialReorganizeSource(material)
+  const current = results.some(item => item.ref.current_searchable === true)
+  const latest = material.tasks[0]
+  const reorganizeId = useRef(crypto.randomUUID())
+  useEffect(() => { reorganizeId.current = crypto.randomUUID() }, [material.key, state?.state])
+  return <article className="p-4 md:p-6 space-y-6 max-w-4xl w-full mx-auto">
+    <header className="space-y-3">
+      <div className="flex items-start justify-between gap-3"><h3 className="text-lg font-semibold text-content break-words">{material.title}</h3>
+        {source && <SourceManager source={source.source} busy={busy} onAction={(name, value) => onAction(source.task, name, value)} />}
+      </div>
+      <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-content-secondary">
+        {state && <span>{purposeLabels[state.purpose] || state.purpose} · {validityLabels[state.validity] || state.validity}</span>}
+        <span className={current ? 'text-accent' : ''}>{materialKnowledgeLabel(material)}</span>
+        <span className={latest.status === 'failed' ? 'text-danger' : ''}>最近处理：{statuses[latest.status] || latest.status}{latest.status === 'failed' && current ? '，旧知识仍有效' : ''}</span>
+      </div>
+      <div className="flex flex-wrap gap-2">
+        {original && <a className={btn} href={apiClient.personalOriginal(original.task.task_id, original.attachment.attachment_id)} target="_blank" rel="noreferrer" title={original.attachment.filename}>打开原件 <ArrowUpRight size={13} className="inline" /></a>}
+        {reorganize && state?.validity === 'active' && state.purpose === 'long_term' && <Btn disabled={busy} onClick={() => void onAction(reorganize.task, 'reorganize', { document_id: material.documentId!, expected_state: state.state, request_id: reorganizeId.current })}><RefreshCw size={13} className="inline mr-1.5" />重新整理</Btn>}
+      </div>
+    </header>
+    <section aria-label="知识结果" className="space-y-3">
+      <h4 className="text-sm font-semibold text-content flex items-center gap-2"><BookOpen size={15} className="text-accent" />知识结果 <span className="text-content-tertiary font-normal">{results.length}</span></h4>
+      {!results.length && <div className="rounded-card border border-default bg-surface px-4 py-5 text-content-tertiary">尚无知识结果</div>}
+      {results.map(({ task, ref }) => <KnowledgeResult key={String(ref.publish_id)} source={ref} onOpenKnowledge={onOpenKnowledge} onReference={() => onReference(task, ref)} />)}
+    </section>
+    {!material.recordOnly && <section aria-label="原件与视觉" className="space-y-3 border-t border-default pt-5">
+      <h4 className="text-sm font-semibold text-content flex items-center gap-2"><FileText size={15} className="text-accent" />原件与视觉</h4>
+      <div className="rounded-card bg-surface border border-default p-4 space-y-2">
+        <div className="text-content-secondary" title={original?.attachment.filename || String(source?.source.filename || '')}>{readableFilename(original?.attachment.filename || source?.source.filename)}</div>
+        {source ? <><VisualCoverage source={source.source} /><VisualWarnings source={source.source} /></> : <span className="text-xs text-content-tertiary">来源尚未登记</span>}
+      </div>
+    </section>}
+    <section aria-label="处理历史" className="border-t border-default pt-5 space-y-3">
+      <h4 className="text-sm font-semibold text-content flex items-center gap-2"><History size={15} className="text-accent" />处理历史 <span className="font-normal text-content-tertiary">{material.tasks.length}</span></h4>
+      {material.tasks.map((task, index) => <TaskHistory key={task.task_id} task={task} busy={busy} latest={index === 0} onAction={onAction}
+        historyResults={material.results.filter(item => item.task.task_id === task.task_id && !results.some(current => current.ref.publish_id === item.ref.publish_id)).map(item => item.ref)}
+        onReference={ref => onReference(task, ref)} />)}
+    </section>
+  </article>
+}
+
+export function KnowledgeResult({ source, onReference, onOpenKnowledge }: { source: SourceRef; onReference: () => void; onOpenKnowledge?: PanelProps['onOpenKnowledge'] }) {
+  return <div className="rounded-card border border-default bg-surface p-4 flex flex-wrap items-start gap-3 justify-between">
+    <div className="min-w-0 flex-1 basis-48 space-y-1.5"><div className="font-medium text-content break-words">{readableFilename(source.title, '知识结果')}</div>
+      <div className="flex flex-wrap gap-2 text-xs"><span className="text-content-tertiary">{String(source.category || '未分类')}</span><span className={source.current_searchable === true ? 'text-accent' : 'text-content-tertiary'}>{source.current_searchable === true ? '当前可检索' : '当前不可检索'}</span></div>
+    </div>
+    <div className="flex gap-2 flex-wrap justify-start min-w-0">
+      {typeof source.path === 'string' && onOpenKnowledge && <Btn disabled={source.current_searchable !== true} onClick={() => onOpenKnowledge(source.path as string, String(source.title || '知识页'))}>查看知识页</Btn>}
+      {typeof source.publish_id === 'string' && <Btn onClick={onReference}>查看出处</Btn>}
+    </div>
+  </div>
+}
+
+export function TaskHistory({ task, busy, latest, onAction, historyResults = [], onReference }: { task: PersonalTask; busy: boolean; latest: boolean; onAction: RunAction; historyResults?: SourceRef[]; onReference?: (ref: SourceRef) => void }) {
+  const [input, setInput] = useState('')
+  const actions = taskActions(task)
+  const interactive = actions.length > 0
+  return <details open={interactive ? true : undefined} className="rounded-card border border-default bg-surface px-4 py-3">
+    <summary className="cursor-pointer text-content-secondary flex flex-wrap gap-2 items-center">
+      <span className={task.status === 'failed' ? 'text-danger' : ''}>{latest ? '最近处理' : '历史处理'} · {statuses[task.status] || task.status}</span>
+      <span className="text-xs text-content-tertiary">{new Date(task.updated_at).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}</span>
+      <Tooltip label={`任务 ${task.task_id}；第 ${task.attempt} 次；配置 ${task.config_revision}；通知 ${task.notification}`}><span tabIndex={0} aria-label="处理记录信息"><Info size={13} /></span></Tooltip>
+    </summary>
+    <div className="pt-3 space-y-3">
+      <div className="text-xs text-content-tertiary">{stages[task.stage] || task.stage}{task.outcome ? ` · ${personalOutcomeLabel(task)}` : ''}</div>
+      {task.error && <div role="alert" className="text-danger">{task.error.code === 'config_unavailable' ? '原配置不可用，可按当前配置重新处理。' : task.error.message || task.error.code}</div>}
+      {task.status === 'waiting_input' && <label className="block text-content-secondary space-y-2"><span>{task.question || '补充资料用途'}</span><TextInput aria-label="补充用途" value={input} disabled={busy} onChange={e => setInput(e.target.value)} /></label>}
+      <div className="flex gap-2 flex-wrap">{actions.map(name => <Btn key={name} disabled={busy || (name === 'update_input' && !input.trim())} onClick={() => void onAction(task, name, undefined, input)}>{({ resubmit: '按当前配置重新处理', retry: '重试', cancel: '取消', update_input: '补充用途' } as Record<string, string>)[name]}</Btn>)}</div>
+      {historyResults.length > 0 && <div aria-label="历史知识结果" className="space-y-2">{historyResults.map(ref => <div key={String(ref.publish_id)} className="flex items-center justify-between gap-2 text-xs text-content-secondary">
+        <span>{readableFilename(ref.title || ref.filename, ref.page_id ? '历史知识页' : '原文投影')} · 历史记录</span>
+        {onReference && typeof ref.publish_id === 'string' && <Btn onClick={() => onReference(ref)}>查看历史出处</Btn>}
+      </div>)}</div>}
+      {task.response && <details><summary className="cursor-pointer text-content-tertiary">原始回复</summary><Markdown content={task.response} /></details>}
+      {task.attachments.length > 0 && <details><summary className="cursor-pointer text-xs text-content-tertiary">本次附件</summary><div className="flex flex-wrap gap-2 pt-2">{task.attachments.map(attachment => <a className={btn} key={attachment.attachment_id} href={apiClient.personalOriginal(task.task_id, attachment.attachment_id)} target="_blank" rel="noreferrer" title={attachment.filename}>{readableFilename(attachment.filename)}</a>)}</div></details>}
+    </div>
+  </details>
 }
 
 const btn = 'px-3 py-1.5 rounded-btn border border-default text-sm disabled:opacity-50'
@@ -180,44 +282,135 @@ export function SourceControls({ source, busy, onAction, onReference, onOpenKnow
 }
 
 function SourceEntryControls({ source, busy, onAction, onReference, onOpenKnowledge, sourceOnly = false }: {
-  source: Record<string, unknown>; busy: boolean
-  onAction: (name: string, source: PersonalSourceAction) => Promise<void>
+  source: SourceRef; busy: boolean
+  onAction: (name: string, source: PersonalSourceAction) => Promise<void | boolean>
   onReference?: () => void
-  onOpenKnowledge?: (path: string, title: string) => void
+  onOpenKnowledge?: PanelProps['onOpenKnowledge']
   sourceOnly?: boolean
 }) {
-  const state = source.source_state as { state: number; validity: string; purpose: string; current: string | null } | null
-  const [reason, setReason] = useState('')
-  const [purpose, setPurpose] = useState<'long_term' | 'transient'>('long_term')
-  const requestId = useRef(crypto.randomUUID())
-  const documentId = typeof source.document_id === 'string' ? source.document_id : ''
   const filename = typeof source.filename === 'string' ? source.filename : ''
-  const sourceTitle = String((sourceOnly ? source.filename : source.title) || source.filename || '资料原文')
-  const transportName = isTransportFilename(filename) || isTransportFilename(sourceTitle)
-  const dispatch = async (name: string) => {
-    if (!state) return
-    await onAction(name, { document_id: documentId, expected_state: state.state, reason: name === 'withdraw' ? undefined : reason.trim(), purpose, request_id: requestId.current })
-  }
-  useEffect(() => { requestId.current = crypto.randomUUID() }, [state?.state])
+  const title = String((sourceOnly ? source.filename : source.title) || source.filename || '资料原文')
+  const state = source.source_state as { validity: string; purpose: string } | null
   return <section className="border-t border-default pt-3 space-y-2">
-    <div className="text-xs text-content-tertiary"><strong title={transportName ? filename || sourceTitle : undefined}>{transportName ? '来源原件' : sourceTitle}</strong>{!sourceOnly && ` · ${String(source.category || '未分类')}`}{state && ` · ${purposeLabels[state.purpose] || state.purpose} · ${validityLabels[state.validity] || state.validity}`}{sourceOnly ? ` · ${source.source_status === 'current' ? '来源当前有效' : source.source_status === 'superseded_or_changed' ? '来源版本或状态已变化' : source.source_status === 'unavailable' ? '来源待核对' : ''}` : ` · ${source.current_searchable === true ? '当前可检索' : '当前不可检索'}`}</div>
-    <VisualWarnings source={source} />
-    <VisualCoverage source={source} />
+    <div className="text-xs text-content-tertiary"><strong title={isTransportFilename(filename) || isTransportFilename(title) ? filename || title : undefined}>{isTransportFilename(filename) || isTransportFilename(title) ? '来源原件' : title}</strong>{!sourceOnly && ` · ${String(source.category || '未分类')}`}{state && ` · ${purposeLabels[state.purpose] || state.purpose} · ${validityLabels[state.validity] || state.validity}`}{!sourceOnly && ` · ${source.current_searchable === true ? '当前可检索' : '当前不可检索'}`}</div>
+    <VisualWarnings source={source} /><VisualCoverage source={source} />
     <div className="flex gap-2 flex-wrap">
-      {typeof source.page_id === 'string' && typeof source.path === 'string' && onOpenKnowledge && <button className={btn} disabled={source.current_searchable !== true} onClick={() => onOpenKnowledge(source.path as string, String(source.title || '知识页'))}>查看知识页</button>}
-      {state?.validity === 'active' && state.purpose === 'long_term' && documentId && <button className={btn} disabled={busy} title="复用原件，使用当前配置创建模型整理任务；新发布成功前保留旧有效结果。" onClick={() => void dispatch('reorganize')}>重新整理</button>}
-      {typeof source.publish_id === 'string' && onReference && <button className={btn} onClick={onReference}>查看出处</button>}
-      {state && documentId && <>
-        <input className="flex-1 bg-inset border border-default rounded-btn px-3 py-2" aria-label="更正或用途修订依据" placeholder="更正或用途修订依据" disabled={busy} value={reason} onChange={e => { setReason(e.target.value); requestId.current = crypto.randomUUID() }} />
-        <span title="更正或用途变化会立即屏蔽旧引用。改为长期不会自动重新发布；重新长期发布会创建独立任务，成功后才可检索。">?</span>
-        {state.validity !== 'corrected' && <button className={btn} disabled={busy || !reason.trim()} onClick={() => void dispatch('correct')}>登记更正</button>}
-        <select aria-label="修订资料用途" className="bg-inset border border-default rounded-btn px-2" disabled={busy} value={purpose} onChange={e => setPurpose(e.target.value as 'long_term' | 'transient')}><option value="long_term">长期资料</option><option value="transient">临时使用</option></select>
-        <button className={btn} disabled={busy || !reason.trim() || purpose === state.purpose} onClick={() => void dispatch('change_purpose')}>修订用途</button>
-        {(!state.current || state.validity !== 'active') && <button className={btn} disabled={busy || !reason.trim()} onClick={() => void dispatch('republish')}>重新长期发布</button>}
-        {state.validity === 'active' && <button className={btn} disabled={busy} onClick={() => void dispatch('withdraw')}>撤回</button>}
-      </>}
+      {typeof source.page_id === 'string' && typeof source.path === 'string' && onOpenKnowledge && <Btn disabled={source.current_searchable !== true} onClick={() => onOpenKnowledge(source.path as string, String(source.title || '知识页'))}>查看知识页</Btn>}
+      {typeof source.publish_id === 'string' && onReference && <Btn onClick={onReference}>查看出处</Btn>}
+      <SourceManager source={source} busy={busy} onAction={onAction} />
     </div>
   </section>
+}
+
+export function PurposeSelect({ value, disabled, onChange }: { value: string; disabled: boolean; onChange: (value: 'long_term' | 'transient') => void }) {
+  const [open, setOpen] = useState(false)
+  const root = useRef<HTMLDivElement>(null)
+  const trigger = useRef<HTMLButtonElement>(null)
+  const options = [{ value: 'long_term' as const, label: '长期资料' }, { value: 'transient' as const, label: '临时使用' }]
+  useEffect(() => {
+    if (!open) return
+    root.current?.querySelector<HTMLButtonElement>('[aria-selected="true"]')?.focus()
+    const outside = (event: MouseEvent) => { if (!root.current?.contains(event.target as Node)) setOpen(false) }
+    document.addEventListener('mousedown', outside)
+    return () => document.removeEventListener('mousedown', outside)
+  }, [open])
+  return <div ref={root} className="relative" onKeyDown={event => {
+    if (event.key === 'Escape' && open) { event.stopPropagation(); event.preventDefault(); setOpen(false); trigger.current?.focus() }
+    if (open && ['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+      event.preventDefault()
+      const buttons = [...(root.current?.querySelectorAll<HTMLButtonElement>('[role="option"]') || [])]
+      const index = buttons.indexOf(document.activeElement as HTMLButtonElement)
+      buttons[event.key === 'Home' ? 0 : event.key === 'End' ? buttons.length - 1 : (index + (event.key === 'ArrowUp' ? -1 : 1) + buttons.length) % buttons.length]?.focus()
+    }
+  }}>
+    <button ref={trigger} type="button" aria-label="修订资料用途" aria-haspopup="listbox" aria-expanded={open} disabled={disabled}
+      onClick={() => setOpen(!open)} onKeyDown={event => { if (event.key === 'ArrowDown') { event.preventDefault(); setOpen(true) } }}
+      className="w-full flex items-center justify-between px-3 py-2 rounded-btn border border-strong bg-inset text-content disabled:opacity-50">{purposeLabels[value] || value}<ChevronDown size={14} /></button>
+    {open && <div role="listbox" aria-label="资料用途选项" className="absolute z-[70] left-0 right-0 top-full mt-1 p-1 rounded-btn border border-default bg-elevated shadow-lg">
+      {options.map(option => <button key={option.value} type="button" role="option" aria-selected={value === option.value}
+        onClick={() => { onChange(option.value); setOpen(false); trigger.current?.focus() }}
+        className={`w-full text-left rounded-btn px-3 py-2 focus:bg-accent-soft focus:text-accent ${value === option.value ? 'text-accent bg-accent-soft' : 'text-content-secondary hover:bg-surface-2'}`}>{option.label}</button>)}
+    </div>}
+  </div>
+}
+
+export function SourceManagementForm({ source, busy, reason, purpose, onReason, onPurpose, onSubmit, onClose }: {
+  source: SourceRef; busy: boolean; reason: string; purpose: 'long_term' | 'transient'; onReason: (value: string) => void;
+  onPurpose: (value: 'long_term' | 'transient') => void; onSubmit: (name: string) => void; onClose: () => void
+}) {
+  const state = source.source_state as { state: number; purpose: string; validity: string; current?: string | null } | null
+  const [operation, setOperation] = useState('')
+  if (!state || typeof source.document_id !== 'string') return null
+  const operations = [
+    { value: 'change_purpose', label: '修改用途' },
+    ...(state.validity !== 'corrected' ? [{ value: 'correct', label: '标记内容有误' }] : []),
+    ...(state.validity === 'active' ? [{ value: 'withdraw', label: '撤回资料' }] : []),
+    ...(!state.current || state.validity !== 'active' ? [{ value: 'republish', label: '重新长期发布' }] : []),
+  ]
+  const selected = operations.find(item => item.value === operation)
+  return <div className="space-y-4">
+    <div className="flex items-center justify-between text-content-secondary"><span title={String(source.filename || '')}>{readableFilename(source.filename)}</span>
+      <Tooltip label="更正、撤回或改为临时会暂停所有引用该资料的知识页及其派生内容；恢复长期用途不会自动恢复旧页。"><button type="button" aria-label="来源变更影响" className="p-1 text-content-tertiary"><Info size={15} /></button></Tooltip>
+    </div>
+    <div role="group" aria-label="选择来源操作" className="flex flex-wrap gap-2">{operations.map(item => <button key={item.value} type="button" aria-pressed={operation === item.value} disabled={busy}
+      onClick={() => setOperation(item.value)} className={`px-3 py-2 rounded-btn border text-sm transition-colors ${operation === item.value ? 'border-accent bg-accent-soft text-accent' : 'border-default text-content-secondary hover:bg-surface-2'}`}>{item.label}</button>)}</div>
+    {selected && <div className="space-y-4 border-t border-default pt-4">
+      {operation === 'change_purpose' && <PurposeSelect value={purpose} disabled={busy} onChange={onPurpose} />}
+      {operation !== 'withdraw' && <label className="block space-y-2 text-content-secondary"><span>{operation === 'correct' ? '内容有误的依据' : operation === 'republish' ? '重新发布依据' : '用途修订依据'}</span><TextInput autoFocus aria-label="更正或用途修订依据" disabled={busy} value={reason} onChange={e => onReason(e.target.value)} /></label>}
+      <div className="flex justify-end"><Btn variant={operation === 'withdraw' ? 'danger' : 'primary'} disabled={busy || (operation !== 'withdraw' && !reason.trim()) || (operation === 'change_purpose' && purpose === state.purpose)} onClick={() => onSubmit(operation)}>
+        {operation === 'change_purpose' ? '保存用途' : selected.label}
+      </Btn></div>
+    </div>}
+  </div>
+}
+
+export function SourceManager({ source, busy, onAction }: { source: SourceRef; busy: boolean; onAction: (name: string, source: PersonalSourceAction) => Promise<void | boolean> }) {
+  const [open, setOpen] = useState(false)
+  const [reason, setReason] = useState('')
+  const state = source.source_state as { state: number; purpose: string } | undefined
+  const [purpose, setPurpose] = useState<'long_term' | 'transient'>(state?.purpose === 'transient' ? 'transient' : 'long_term')
+  const requestId = useRef(crypto.randomUUID())
+  const trigger = useRef<HTMLButtonElement>(null)
+  const body = useRef<HTMLDivElement>(null)
+  const close = useCallback(() => { setOpen(false); trigger.current?.focus() }, [])
+  useEffect(() => { requestId.current = crypto.randomUUID() }, [state?.state, reason, purpose])
+  useEffect(() => {
+    if (!open) return
+    const surface = body.current?.parentElement?.parentElement
+    const initialFocus = body.current?.querySelector<HTMLButtonElement>('[aria-label="选择来源操作"] button:not(:disabled)')
+      || surface?.querySelector<HTMLButtonElement>('button:not(:disabled)')
+    initialFocus?.focus()
+    const key = (event: KeyboardEvent) => {
+      if (event.defaultPrevented) return
+      if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); if (!busy) close() }
+      if (event.key === 'Tab') {
+        const focusable = [...(surface?.querySelectorAll<HTMLElement>('button:not(:disabled),input:not(:disabled),[tabindex="0"]') || [])]
+        const first = focusable[0], last = focusable[focusable.length - 1]
+        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus() }
+        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus() }
+      }
+    }
+    window.addEventListener('keydown', key)
+    return () => window.removeEventListener('keydown', key)
+  }, [open, busy, close])
+  if (!state || !Number.isInteger(state.state) || typeof source.document_id !== 'string') return null
+  const dispatch = async (name: string) => {
+    if (busy) return
+    const result = await onAction(name, { document_id: source.document_id as string, expected_state: state.state,
+      reason: name === 'withdraw' ? undefined : reason.trim(), purpose, request_id: requestId.current })
+    if (result !== false) close()
+  }
+  return <>
+    <button ref={trigger} type="button" disabled={busy} onClick={() => { setOpen(true); setPurpose(state.purpose === 'transient' ? 'transient' : 'long_term') }}
+      className="inline-flex items-center gap-1.5 text-sm text-content-secondary hover:text-accent px-2 py-2 rounded-btn hover:bg-accent-soft disabled:opacity-50"><Settings2 size={14} />来源管理</button>
+    <Modal open={open} title="来源管理" onClose={() => { if (!busy) close() }}>
+      <div ref={body} role="dialog" aria-modal="true" aria-label="来源管理" onKeyDown={event => {
+        if (event.key === 'Escape' && !event.defaultPrevented) { event.preventDefault(); event.stopPropagation(); if (!busy) close() }
+      }}>
+        <SourceManagementForm source={source} busy={busy} reason={reason} purpose={purpose} onReason={setReason} onPurpose={setPurpose} onSubmit={name => void dispatch(name)} onClose={close} />
+      </div>
+    </Modal>
+  </>
 }
 
 function locationLabel(location: Record<string, unknown>): string {

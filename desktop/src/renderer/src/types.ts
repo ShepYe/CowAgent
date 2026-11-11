@@ -1156,6 +1156,7 @@ export interface KnowledgeFile {
   name: string
   title: string
   size: number
+  category?: string
 }
 
 // A directory node in the knowledge tree (recursive).
@@ -1191,9 +1192,68 @@ export interface KnowledgeGraph {
   links: Array<{ source: string; target: string }>
 }
 
+export interface KnowledgeCatalogPage {
+  page_id: string
+  page_version: string
+  publish_id?: string
+  title: string
+  category: string
+  category_mode: 'auto' | 'manual'
+  category_revision: number
+  /** 知识根相对的真实不可变路径，与有效分类分开。 */
+  path: string
+  searchable: boolean
+}
+
+export interface KnowledgeCatalog {
+  status: string
+  message?: string
+  pages: KnowledgeCatalogPage[]
+  categories: string[]
+  legacy_content?: string
+}
+
+export interface KnowledgeHistoryEvent {
+  id: string
+  event_type: 'published' | 'updated' | 'category_changed' | 'category_auto'
+  created_at: string
+  page_id: string
+  page_version: string
+  publish_id: string
+  title: string
+  category: string
+  current_status: 'current' | 'superseded' | 'paused'
+  searchable: boolean
+}
+
+export interface KnowledgeHistory {
+  status: string
+  message?: string
+  events: KnowledgeHistoryEvent[]
+  total: number
+  has_more: boolean
+  legacy_content: string
+}
+
+export interface KnowledgeVersion {
+  page_id: string
+  page_version: string
+  publish_id: string
+  title: string
+  category: string
+  content: string
+  created_at: string
+  current_status: 'current' | 'superseded' | 'paused'
+  searchable: boolean
+  path?: string
+  current_path?: string
+}
+
 // An optional `agent_id` scopes the write to a specific Agent's knowledge base
 // (used by the Knowledge page's per-Agent view). Omitted in single-Agent mode.
 export type KnowledgeAction = { agent_id?: string } & (
+  | { action: 'set_page_category'; payload: { page_id: string; expected_version: string; expected_category_revision: number; category: string } }
+  | { action: 'reset_page_category'; payload: { page_id: string; expected_version: string; expected_category_revision: number } }
   | { action: 'create_category'; payload: { path: string } }
   | { action: 'create_document'; payload: { path: string; content: string; overwrite?: boolean } }
   // `expected_mtime` is the timestamp the editor started from; the backend

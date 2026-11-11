@@ -45,6 +45,7 @@ from channel.web.api.integrations import IntegrationsHandler  # noqa: F401
 from channel.web.api.knowledge import (  # noqa: F401
     KnowledgeActionHandler, KnowledgeGraphHandler, KnowledgeImportHandler,
     KnowledgeListHandler, KnowledgeReadHandler,
+    KnowledgeCatalogHandler, KnowledgeHistoryHandler, KnowledgeVersionHandler,
 )
 from channel.web.api.personal import (  # noqa: F401
     PersonalTasksHandler, PersonalTaskHandler, PersonalOriginalHandler,
@@ -168,6 +169,9 @@ URLS = (
     '/api/personal/binding', 'PersonalBindingHandler',
     '/api/personal/feishu-pairing', 'PersonalFeishuPairingHandler',
     '/api/knowledge/list', 'KnowledgeListHandler',
+    '/api/knowledge/catalog', 'KnowledgeCatalogHandler',
+    '/api/knowledge/history', 'KnowledgeHistoryHandler',
+    '/api/knowledge/version', 'KnowledgeVersionHandler',
     '/api/knowledge/read', 'KnowledgeReadHandler',
     '/api/knowledge/graph', 'KnowledgeGraphHandler',
     '/api/knowledge/action', 'KnowledgeActionHandler',

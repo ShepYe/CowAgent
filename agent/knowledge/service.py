@@ -236,6 +236,16 @@ class KnowledgeService:
         if not root.is_dir():
             return False
 
+        # Wiki owns all registered wiki entries. Keep the filesystem builder
+        # in a separate replaceable block once a workspace has wiki history.
+        wiki = None
+        if (Path(self.workspace_root) / '.personal_sources' / 'sources.sqlite3').is_file():
+            from agent.knowledge.wiki import WikiService
+            candidate = WikiService(self.workspace_root)
+            with candidate.source.transaction() as db:
+                if db.execute('SELECT 1 FROM wiki_publications LIMIT 1').fetchone():
+                    wiki = candidate
+
         def collect(dir_path: Path) -> list:
             # Return sorted (rel_path, title) tuples for *.md under dir_path,
             # excluding protected files at the knowledge root and dot files.
@@ -245,6 +255,8 @@ class KnowledgeService:
                 if any(part.startswith(".") for part in md.relative_to(root).parts):
                     continue
                 if rel in self.PROTECTED_FILES:
+                    continue
+                if wiki is not None and rel.startswith('wiki/'):
                     continue
                 from agent.knowledge.personal_assistant import readable
                 if readable(md):
@@ -295,7 +307,17 @@ class KnowledgeService:
         content = "\n".join(lines).rstrip() + "\n"
         index_path = root / "index.md"
         try:
-            write_text_atomic(index_path, content)
+            if wiki is None:
+                write_text_atomic(index_path, content)
+            else:
+                from agent.knowledge.wiki import refresh
+                with wiki.source.transaction() as db:
+                    previous = index_path.read_text(encoding='utf-8') if index_path.exists() else ''
+                    start, end = '<!-- knowledge-index:start -->', '<!-- knowledge-index:end -->'
+                    preserved = re.sub(re.escape(start) + r'.*?' + re.escape(end) + r'\s*', '', previous, flags=re.S).rstrip()
+                    generated = start + '\n' + content + end + '\n'
+                    write_text_atomic(index_path, (preserved + '\n\n' if preserved else '') + generated)
+                    refresh(db, wiki.source)
             return True
         except Exception as exc:
             logger.warning(f"[KnowledgeService] Failed to rebuild index.md: {exc}")
@@ -696,6 +718,10 @@ class KnowledgeService:
         parts = path.relative_to(Path(self.knowledge_dir)).parts
         if len(parts) == 1 and parts[0] in self.PROTECTED_FILES:
             return {'index.md': '知识索引', 'log.md': '整理记录'}[parts[0]], '知识管理'
+        if parts[0] == 'wiki':
+            for page in self.catalog()['pages']:
+                if page['path'] == path.relative_to(Path(self.knowledge_dir)).as_posix():
+                    return page['title'], page['category']
         if parts[0] == 'managed':
             from agent.knowledge.personal_assistant import SourceService
             service = SourceService(self.workspace_root)
@@ -888,6 +914,18 @@ class KnowledgeService:
     # ------------------------------------------------------------------
     # dispatch — single entry point for protocol messages
     # ------------------------------------------------------------------
+    def catalog(self):
+        from agent.knowledge.wiki import WikiService
+        return WikiService(self.workspace_root).catalog()
+
+    def history(self, offset=0, limit=50):
+        from agent.knowledge.wiki import WikiService
+        return WikiService(self.workspace_root).history(offset, limit)
+
+    def version(self, publish_id=None, *, path=None):
+        from agent.knowledge.wiki import WikiService
+        return WikiService(self.workspace_root).version(publish_id, path=path)
+
     def dispatch(self, action: str, payload: Optional[dict] = None) -> dict:
         """
         Dispatch a knowledge management action.
@@ -898,8 +936,17 @@ class KnowledgeService:
         """
         from agent.workspace.service import WorkspaceConflictError
 
+        from agent.knowledge.parser import SourceError
         payload = payload or {}
         try:
+            if action in {"set_page_category", "reset_page_category"}:
+                from agent.knowledge.wiki import WikiService
+                wiki = WikiService(self.workspace_root)
+                args = [payload.get(k) for k in ("page_id", "expected_version", "expected_category_revision")]
+                if action == "set_page_category":
+                    args.append(payload.get("category"))
+                result = getattr(wiki, action)(*args)
+                return {"action": action, "code": 200, "message": "success", "payload": result}
             if action == "list":
                 result = self.list_tree()
                 return {"action": action, "code": 200, "message": "success", "payload": result}
@@ -941,6 +988,9 @@ class KnowledgeService:
                 return {"action": action, "code": 400, "message": f"unknown action: {action}", "payload": None}
             return {"action": action, "code": 200, "message": "success", "payload": result}
 
+        except SourceError as e:
+            code = {"invalid_request": 400, "version_conflict": 409, "forbidden": 403}.get(e.code, 500)
+            return {"action": action, "code": code, "error_code": e.code, "message": str(e), "payload": None}
         except WorkspaceConflictError as e:
             # Flagged apart from the other 409s: the client can resolve this
             # one by saving again over what the Agent wrote mid-edit.

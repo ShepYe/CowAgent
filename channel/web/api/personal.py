@@ -109,6 +109,8 @@ def _decorate(task):
                 if ref.get('page_id'):
                     current = _wiki_service().current(ref['page_id'])
                     ref['current_searchable'] = bool(current and current.get('searchable') is True and current.get('publish_id') == ref.get('publish_id'))
+                    if ref['current_searchable']:
+                        ref.update({key: current[key] for key in ('category', 'category_mode', 'category_revision')})
                 else:
                     current = service.current_publication(ref['document_id'], ref.get('revision_id'))
                     if current and current.get('publish_id') == ref.get('publish_id') and current.get('searchable') is True:
@@ -138,7 +140,33 @@ def _decorate(task):
                 ref['source_state'] = None
                 ref['current_searchable'] = False
         refs.append(ref)
-    return {**task, 'result_refs': refs}
+    return {**task, 'result_refs': refs, 'attachments': _decorate_attachments(task)}
+
+
+def _decorate_attachments(task):
+    """逻辑身份来自受信登记决定，字节校验只验证该关联。"""
+    attachments = []
+    for raw in task.get('attachments', []):
+        item = {k: v for k, v in raw.items() if k not in ('source_document_id', 'source_revision_id')}
+        try:
+            decision = (task.get('attachment_decisions') or {}).get(item['attachment_id']) or {}
+            binding = decision.get('source')
+            if not binding and len(task['attachments']) == 1:
+                binding = (task.get('payload') or {}).get('source_action') or (task.get('payload') or {}).get('reorganize')
+            if binding:
+                service = _source_service()
+                if decision.get('workspace') and Path(decision['workspace']).resolve() != service.workspace:
+                    raise ValueError('来源工作区不符')
+                revision = service.registered_revision(binding['document_id'], binding['revision_id'])
+                digest = revision['sha256']
+                if (hashlib.sha256(Path(revision['original']).read_bytes()).hexdigest() != digest
+                        or item['sha256'] != digest or hashlib.sha256(Path(item['path']).read_bytes()).hexdigest() != digest):
+                    raise ValueError('原件核验失败')
+                item.update(source_document_id=binding['document_id'], source_revision_id=binding['revision_id'])
+        except (ValueError, OSError, KeyError, TypeError):
+            pass
+        attachments.append(item)
+    return attachments
 
 
 class PersonalTasksHandler:
