@@ -321,6 +321,9 @@ class FeiShuChanel(ChatChannel):
                 raise Exception("lark_oapi not installed / could not be installed")
 
     def startup(self):
+        self._startup_event.clear()
+        self._startup_error = None
+        self._personal_binding_required = False
         # Recorded here, at the very top, rather than once the connection is up:
         # cold start plus the long-connection handshake can take a minute or two,
         # and a message the user sends while waiting for the client to come up is
@@ -342,9 +345,16 @@ class FeiShuChanel(ChatChannel):
             try:
                 binding_for(self)
             except ValueError:
-                self.report_startup_error("请在桌面绑定本人飞书身份")
-                return
-            register(self)
+                from channel.feishu.pairing import pairing
+                self._personal_binding_required = True
+                error = "请在桌面 设置 → 集成 → 本人飞书绑定 中开始绑定"
+                self.report_startup_error(error)
+                logger.warning("[FeiShu] %s (instance=%s)", error, self.instance_id or 'feishu')
+                if not pairing.active_for(self):
+                    return
+                logger.info("[FeiShu] 本人绑定连接已启用；确认前仅接受一次性绑定码")
+            else:
+                register(self)
 
         # 命令行启动场景：缺少凭据时尝试通过 lark.register_app 在终端弹二维码
         # 引导用户扫码创建应用。Web 控制台启动同样会走到这里，但控制台用户通常
@@ -464,7 +474,9 @@ class FeiShuChanel(ChatChannel):
                 if msg.get("chat_type") == "group" and not msg.get("mentions") and msg.get("message_type") in ("text", "post"):
                     return
 
-                logger.debug(f"[FeiShu] websocket receive event: {lark.JSON.marshal(data, indent=2)}")
+                from common.personal_tasks import personal_enabled
+                if not personal_enabled():
+                    logger.debug(f"[FeiShu] websocket receive event: {lark.JSON.marshal(data, indent=2)}")
 
                 # 处理消息
                 self._handle_message_event(event)
@@ -755,6 +767,9 @@ class FeiShuChanel(ChatChannel):
         """
         from common.personal_tasks import personal_enabled
         if personal_enabled():
+            from channel.feishu.pairing import pairing
+            if pairing.capture(self, event):
+                return
             from channel.feishu.personal import receive
             from common.personal_tasks import TaskError
             try:

@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
+import { Link } from 'react-router-dom'
 import {
   Loader2,
   Plug,
@@ -34,8 +35,8 @@ const QR_PROVIDERS: Record<string, 'weixin' | 'feishu'> = { weixin: 'weixin', fe
 
 // A running WeChat channel reports its own login state, which does not always
 // match "connected": it can still be booting, or be waiting for someone to
-// scan its QR. Anything else (including every other channel) has nothing
-// pending and is simply shown as connected.
+// scan its QR. Startup errors and missing personal binding take precedence
+// over this pending state in the status badge.
 type Pending = 'none' | 'scanning' | 'starting'
 
 const pendingState = (ch: ChannelInfo): Pending => {
@@ -130,12 +131,13 @@ const ChannelsPage: React.FC<ChannelsPageProps> = ({ baseUrl }) => {
   const settling =
     channels.some((c) => pendingState(c) !== 'none') ||
     instances.some((c) => pendingState(c) !== 'none')
+  const watchingStartup = settling || [...channels, ...instances].some(c => c.name === 'feishu' && c.active)
   useEffect(() => {
-    if (!settling) return
+    if (!watchingStartup) return
     const id = setInterval(() => void loadChannels(true), 3000)
     return () => clearInterval(id)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settling])
+  }, [watchingStartup])
 
   const { connected, available } = useMemo(() => {
     // In multi-Agent mode the multi-instance-ready types are represented by
@@ -189,6 +191,8 @@ const ChannelsPage: React.FC<ChannelsPageProps> = ({ baseUrl }) => {
       agent_id: '',
       members: [],
       login_status: undefined,
+      startup_error: undefined,
+      personal_binding_required: undefined,
       fields: ch.fields.map((f) => ({ ...f, value: f.type === 'bool' ? f.value : '' })),
     }
   }
@@ -430,20 +434,28 @@ const ModeTab: React.FC<{ icon: LucideIcon; label: string; active: boolean; onCl
   </button>
 )
 
-// The connection status dot + label (waiting-to-scan / starting / connected),
+// The connection status dot + label, with startup failures taking precedence,
 // shared by the instance and non-instance title rows.
 const StatusBadge: React.FC<{ channel: ChannelInfo; pending: Pending }> = ({ channel, pending }) => (
-  <>
+  <span className="inline-flex items-center gap-2" title={channel.startup_error || (channel.personal_binding_required ? '请先在桌面绑定本人飞书身份，再重新连接' : undefined)}>
     <span
       className={`w-2 h-2 rounded-full flex-shrink-0 ${
-        pending !== 'none'
-          ? 'bg-warning animate-pulse'
-          : channel.active
-            ? 'bg-accent'
-            : 'bg-content-tertiary'
+        channel.startup_error
+          ? 'bg-danger'
+          : channel.personal_binding_required
+            ? 'bg-warning'
+            : pending !== 'none'
+              ? 'bg-warning animate-pulse'
+              : channel.active
+                ? 'bg-accent'
+                : 'bg-content-tertiary'
       }`}
     />
-    {pending === 'scanning' ? (
+    {channel.startup_error ? (
+      <span className="text-xs text-danger">{channel.personal_binding_required ? '未就绪' : '连接失败'}</span>
+    ) : channel.personal_binding_required ? (
+      <span className="text-xs text-warning">未就绪</span>
+    ) : pending === 'scanning' ? (
       <span className={`text-xs ${channel.login_status === 'scanned' ? 'text-accent' : 'text-warning'}`}>
         {channel.login_status === 'scanned' ? t('weixin_scan_scanned') : t('weixin_scan_waiting')}
       </span>
@@ -452,7 +464,7 @@ const StatusBadge: React.FC<{ channel: ChannelInfo; pending: Pending }> = ({ cha
     ) : channel.active ? (
       <span className="text-xs text-accent">{t('channels_connected')}</span>
     ) : null}
-  </>
+  </span>
 )
 
 // The title row for an instance card: the friendly instance name as the heading,
@@ -694,6 +706,11 @@ const ChannelCard: React.FC<{
           </p>
         </div>
 
+        {channel.active && (channel.startup_error || channel.personal_binding_required) && (
+          <Btn variant="ghost" onClick={() => run('connect')} disabled={busy}>
+            重新连接
+          </Btn>
+        )}
         {channel.active ? (
           <Btn variant="danger" onClick={() => run('disconnect')} disabled={busy}>
             {t('channels_disconnect')}
@@ -704,6 +721,14 @@ const ChannelCard: React.FC<{
           </Btn>
         )}
       </div>
+
+      {channel.personal_binding_required && (
+        <div className="mt-3 pl-12">
+          <Link className="text-sm text-accent hover:underline" to="/settings?tab=integrations#personal-feishu-binding">
+            绑定本人
+          </Link>
+        </div>
+      )}
 
       {/* Agent binding: a connected instance in multi-Agent mode picks which
           Agent(s) own the conversation. Hidden entirely in single-Agent mode. */}

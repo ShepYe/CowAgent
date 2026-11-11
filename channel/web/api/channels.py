@@ -29,6 +29,19 @@ from config import conf, get_data_root, get_weixin_credentials_path
 class ChannelsHandler:
     """API for managing external channel configurations (feishu, dingtalk, etc)."""
 
+    @staticmethod
+    def _startup_state(name):
+        manager = _live_channel_manager()
+        channel = manager.get_channel(name) if manager else None
+        if channel is None:
+            return {}
+        state = {}
+        if getattr(channel, '_startup_error', None):
+            state['startup_error'] = channel._startup_error
+        if getattr(channel, '_personal_binding_required', False):
+            state['personal_binding_required'] = True
+        return state
+
     CHANNEL_DEFS = OrderedDict([
         ("weixin", {
             "label": {"zh": "微信", "en": "WeChat"},
@@ -286,6 +299,7 @@ class ChannelsHandler:
                 "active": True,
                 "fields": fields_out,
             }
+            card.update(cls._startup_state(inst.instance_id))
             # A Weixin instance is only "connected" once its scan login is
             # done; surface the live state so a card waiting for a scan says
             # so (and offers the QR) instead of claiming to be connected.
@@ -349,6 +363,8 @@ class ChannelsHandler:
                     "active": ch_name in active_channels,
                     "fields": fields_out,
                 }
+                if ch_name in active_channels:
+                    ch_info.update(self._startup_state(ch_name))
                 if ch_name == "weixin" and ch_name in active_channels:
                     ch_info["login_status"] = self._get_weixin_login_status()
                 channels.append(ch_info)
@@ -564,7 +580,7 @@ class ChannelsHandler:
                     clear_fn(channel_name)
                 logger.info(f"[WebChannel] Starting channel '{channel_name}'...")
                 mgr.start([channel_name], first_start=False)
-                logger.info(f"[WebChannel] Channel '{channel_name}' start completed")
+                logger.info(f"[WebChannel] Channel '{channel_name}' startup dispatched")
             except Exception as e:
                 logger.error(f"[WebChannel] Failed to start channel '{channel_name}': {e}",
                              exc_info=True)

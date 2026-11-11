@@ -48,7 +48,7 @@ from channel.web.api.knowledge import (  # noqa: F401
 )
 from channel.web.api.personal import (  # noqa: F401
     PersonalTasksHandler, PersonalTaskHandler, PersonalOriginalHandler,
-    PersonalBindingHandler, PersonalReferenceHandler,
+    PersonalBindingHandler, PersonalReferenceHandler, PersonalFeishuPairingHandler,
 )
 from channel.web.api.logs import LogsDownloadHandler, LogsHandler  # noqa: F401
 from channel.web.api.memory import (  # noqa: F401
@@ -166,6 +166,7 @@ URLS = (
     '/api/personal/tasks/([^/]+)/reference/([^/]+)', 'PersonalReferenceHandler',
     '/api/personal/tasks/([^/]+)', 'PersonalTaskHandler',
     '/api/personal/binding', 'PersonalBindingHandler',
+    '/api/personal/feishu-pairing', 'PersonalFeishuPairingHandler',
     '/api/knowledge/list', 'KnowledgeListHandler',
     '/api/knowledge/read', 'KnowledgeReadHandler',
     '/api/knowledge/graph', 'KnowledgeGraphHandler',

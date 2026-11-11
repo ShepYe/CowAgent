@@ -148,6 +148,12 @@ def _config_write_guard():
 
 
 def _write_config_file_for_write(config_path: str, data: dict) -> None:
+    from common.settings_revision import writing
+    with writing():
+        _write_config_file_atomic(config_path, data)
+
+
+def _write_config_file_atomic(config_path: str, data: dict) -> None:
     """Write ``data`` to ``config_path`` without truncating the old file first.
 
     Every console save reads config.json, changes a few keys and writes the whole

@@ -902,6 +902,8 @@ export interface ChannelInfo {
   active: boolean
   fields: ChannelField[]
   login_status?: string
+  startup_error?: string
+  personal_binding_required?: boolean
   // Multi-instance fields (present only for one-card-per-instance entries the
   // backend returns in `data.instances` when the install is in multi-Agent
   // mode). Absent on legacy per-type cards, keeping single-Agent behavior.

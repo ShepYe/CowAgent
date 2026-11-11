@@ -136,12 +136,15 @@ def is_loopback_host(host: str) -> bool:
     return host in ("localhost", "::1") or host.startswith("127.")
 
 
-def save_config_values(values: dict) -> None:
+def save_config_values(values: dict, *, before_save=None) -> None:
     """Write top-level keys to config.json and the live config together."""
     from channel.web.api.config import _settings_save_lock
     from config import conf, get_data_root
+    from common.settings_revision import lock as revision_lock
 
-    with _settings_save_lock:
+    with _settings_save_lock, revision_lock:
+        if before_save:
+            before_save()
         file_cfg = _read_config_file_for_write()
         file_cfg.update(values)
         _write_config_file_for_write(os.path.join(get_data_root(), "config.json"), file_cfg)

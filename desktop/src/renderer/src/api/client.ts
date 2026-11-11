@@ -1413,6 +1413,15 @@ class ApiClient {
     })
   }
 
+  async personalFeishuPairing(body?: PersonalFeishuPairingAction): Promise<PersonalFeishuPairingResponse> {
+    const token = await this.getDesktopToken()
+    if (!token) throw new Error('请在桌面程序中绑定本人飞书')
+    return this.request('/api/personal/feishu-pairing', {
+      headers: { 'X-Cow-Desktop-Token': token },
+      ...(body ? { method: 'POST', body: JSON.stringify(body) } : {}),
+    })
+  }
+
   async getKnowledgeList(agentId?: string): Promise<KnowledgeList> {
     return this.request<{ status: string } & KnowledgeList>(this.scoped('/api/knowledge/list', agentId))
   }
@@ -1692,6 +1701,25 @@ export interface PersonalTask {
 }
 export interface PersonalResponse { status: string; message?: string; code?: string; task?: PersonalTask }
 export interface PersonalBinding { channel_instance_id: string; app_id: string; tenant_id: string; sender_open_id: string }
+
+export interface PersonalFeishuPairing {
+  state: 'idle' | 'waiting' | 'pending' | 'expired' | 'confirmed'
+  pairing_id?: string
+  channel_instance_id?: string
+  app_id?: string
+  command?: string
+  expires_in?: number
+  connection_error?: string
+  candidate?: PersonalBinding
+}
+
+export type PersonalFeishuPairingAction =
+  | { action: 'start'; channel_instance_id: string }
+  | { action: 'confirm' | 'cancel'; pairing_id: string }
+
+export type PersonalFeishuPairingResponse =
+  | { status: 'success'; pairing: PersonalFeishuPairing; binding: PersonalBinding }
+  | { status: 'error'; message: string; code: string }
 
 export interface PersonalSourceAction {
   document_id: string

@@ -147,7 +147,9 @@ def write(settings: Mapping[str, Any], roster: Mapping[str, Any]) -> Path:
     )
     if bootstrapped:
         payload["channel_instances"] = bootstrapped
-    write_text_atomic(path, json.dumps(payload, indent=4, ensure_ascii=False) + "\n")
+    from common.settings_revision import writing
+    with writing():
+        write_text_atomic(path, json.dumps(payload, indent=4, ensure_ascii=False) + "\n")
     return path
 
 

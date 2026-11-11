@@ -32,6 +32,9 @@ def _error(exc, task=None):
         'storage_failed': '保存失败，请检查本机存储',
         'idempotency_conflict': '提交标识与已有内容冲突',
         'limit_exceeded': '文件超过 100 MiB 上限',
+        'pairing_unavailable': '绑定码已失效或机器人配置已改变，请重新开始绑定',
+        'channel_unavailable': '请先在渠道页配置并连接飞书机器人',
+        'websocket_required': '引导绑定需要飞书长连接模式',
     }.get(code, '请求无法完成'), task=task)
 
 
@@ -260,5 +263,77 @@ class PersonalBindingHandler:
             from channel.web.api.integrations import save_config_values
             save_config_values({'personal_feishu_binding': {k: v.strip() for k, v in binding.items()}})
             return _reply(status='success', binding=binding)
+        except (ValueError, OSError) as exc:
+            return _error(exc)
+
+
+def _pairing_channel(instance_id):
+    from channel.web.core._common import _live_channel_manager
+    manager = _live_channel_manager()
+    channel = manager.get_channel(instance_id) if manager and isinstance(instance_id, str) else None
+    if (channel is None or channel.channel_type != 'feishu' or
+            not channel.cfg('feishu_app_id') or not channel.cfg('feishu_app_secret')):
+        raise TaskError('channel_unavailable')
+    if channel.cfg('feishu_event_mode', 'websocket') != 'websocket':
+        raise TaskError('websocket_required')
+    return manager, channel
+
+
+class PersonalFeishuPairingHandler:
+    @staticmethod
+    def _view():
+        from channel.feishu.pairing import pairing
+        from config import conf
+        view = pairing.snapshot()
+        if view['state'] in {'waiting', 'pending'}:
+            from channel.web.core._common import _live_channel_manager
+            manager = _live_channel_manager()
+            channel = manager.get_channel(view['channel_instance_id']) if manager else None
+            error = getattr(channel, '_startup_error', None)
+            if isinstance(error, str) and '本人飞书绑定' not in error:
+                view['connection_error'] = error
+        return _reply(status='success', pairing=view, binding=conf().get('personal_feishu_binding') or {})
+
+    def GET(self):
+        PersonalBindingHandler._auth()
+        return self._view()
+
+    def POST(self):
+        PersonalBindingHandler._auth()
+        try:
+            from common.personal_tasks import personal_enabled
+            if not personal_enabled():
+                raise TaskError('forbidden')
+            from channel.feishu.pairing import pairing, configuration_revision
+            body = _body()
+            action = body.get('action')
+            if action == 'start':
+                manager, channel = _pairing_channel(body.get('channel_instance_id'))
+                pairing.begin(channel.instance_id or 'feishu', channel.cfg('feishu_app_id'), configuration_revision)
+                # A blocked startup returned before opening the socket. Restart
+                # only that channel; the rest of the user's channels stay live.
+                thread = getattr(channel, '_ws_thread', None)
+                if thread is None or not thread.is_alive():
+                    import threading
+                    threading.Thread(target=manager.restart,
+                                     args=(channel.instance_id or 'feishu',), daemon=True).start()
+            elif action == 'confirm':
+                current = pairing.snapshot()
+                manager, channel = _pairing_channel(current.get('channel_instance_id'))
+                from channel.web.api.integrations import save_config_values
+                pairing.confirm(body.get('pairing_id'), channel.cfg('feishu_app_id'),
+                                lambda binding: save_config_values({'personal_feishu_binding': binding},
+                                                                  before_save=pairing.check_revision))
+                from channel.feishu.personal import register
+                register(channel)
+                # A live binding-only connection can now receive owner messages.
+                channel._personal_binding_required = False
+                if channel._startup_error and '本人飞书绑定' in channel._startup_error:
+                    channel.report_startup_success()
+            elif action == 'cancel':
+                pairing.cancel(body.get('pairing_id'))
+            else:
+                raise TaskError('invalid_request')
+            return self._view()
         except (ValueError, OSError) as exc:
             return _error(exc)
