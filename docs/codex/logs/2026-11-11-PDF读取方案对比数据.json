@@ -1,0 +1,519 @@
+{
+  "created_at": "2026-11-11T21:31:46.417013+08:00",
+  "baseline_commit": "1100e6d63a7905c12618c83deab8538b18bd5a7b",
+  "configuration": {
+    "config_path": "C:\\Users\\10400\\.cow-personal\\config.json",
+    "provider": "MUZE-LLM",
+    "base_url": "https://api.muzeai.top/v1",
+    "model": "gpt-6.1-sol",
+    "main_reasoning_effort": "high",
+    "agent_context_budget": 500000,
+    "vision_provider_model": "auto; observed main model success in all six calls",
+    "native_transport": "Responses input_file file_data base64",
+    "vision_transport": "production call_vision; api_type auto uses Chat Completions without explicit reasoning effort"
+  },
+  "sources": [
+    {
+      "filename": "ZN-Z129E校准套件官方规格书.pdf",
+      "pages": 12,
+      "bytes": 740049,
+      "sha256": "ee02561a1630a95e45919a251c60923920dad4946acb7191ae7357446d0d1543",
+      "original_unchanged": true
+    },
+    {
+      "filename": "如何定义校准件-是徳.pdf",
+      "pages": 68,
+      "bytes": 11071892,
+      "sha256": "cb890ea940c6a1fd9c678513dd63ea91ae96b4d993929c2735299c80d1615d1e",
+      "original_unchanged": true
+    },
+    {
+      "filename": "网分S参数网络的嵌入和去嵌.pdf",
+      "pages": 29,
+      "bytes": 818194,
+      "sha256": "fb264c8f1978d52da184ca61c6fe11685c8c13ab58b5fa2cecb622f80e602a05",
+      "original_unchanged": true
+    },
+    {
+      "filename": "网分测量的误差校准.pdf",
+      "pages": 19,
+      "bytes": 1258222,
+      "sha256": "8f2fd9d87d95c00b1d18ff5be05d70a20aa7f37c14350738d950aa874d197b55",
+      "original_unchanged": true
+    }
+  ],
+  "sample_map": [
+    {
+      "id": "gold-01",
+      "source_path": "D:\\Yepu\\Documents_YePu\\公司资料\\仪表手册\\网络分析仪\\校准件\\ZN-Z129E校准套件官方规格书.pdf",
+      "original_physical_page": 9,
+      "sample_pdf_page": 1,
+      "question": "根据本页 Effective system data 中 ZN-Z129 与 ZN-Z129E 两张表，在 30 GHz 时分别给出 Directivity、Match、Tracking 的限值（含不等号和单位）；再给出只有 ZN-Z129E 表列出的最高频段及这三项限值。",
+      "answer": "30 GHz 属于 26.5–40 GHz 列：ZN-Z129 为 Directivity >25 dB、Match >22 dB、Tracking <0.21 dB；ZN-Z129E 为 >24 dB、>21 dB、<0.24 dB。只有 ZN-Z129E 列出的最高频段为 40–43.5 GHz，对应 >22 dB、>20 dB、<0.25 dB。",
+      "required_answer_items": [
+        "30 GHz 定位至 26.5–40 GHz 列",
+        "ZN-Z129：>25 dB / >22 dB / <0.21 dB",
+        "ZN-Z129E：>24 dB / >21 dB / <0.24 dB",
+        "ZN-Z129E 额外最高频段：40–43.5 GHz；>22 dB / >20 dB / <0.25 dB"
+      ]
+    },
+    {
+      "id": "gold-02",
+      "source_path": "D:\\Yepu\\Documents_YePu\\公司资料\\仪表手册\\网络分析仪\\校准件\\如何定义校准件-是徳.pdf",
+      "original_physical_page": 30,
+      "sample_pdf_page": 2,
+      "question": "只按 Figure 25 的箭头回答：选择 Line Z0 到哪个终点？选择 Connector Z0 后，Enable Zc Computation From C 的 yes 与 no 分支分别向右还是向下、进入什么 Zc 计算框？两支最终汇入哪个变换框？",
+      "answer": "Line Z0 向下直达 No impedance transformation。Connector Z0 进入 Enable Zc Computation From C：yes 分支向右后向下，进入 Zc 为 C0 与 computed εr 的函数；no 分支向下，进入 Zc 为 thru standard Offset Z0 与 Offset Loss 的函数。两支最终汇入 Zref = Connector Z0，Transform from Zc to Zref。",
+      "required_answer_items": [
+        "Line Z0 → No impedance transformation",
+        "yes：向右后向下；Zc = function of C0 and computed εr",
+        "no：向下；Zc = function of thru standard Offset Z0 and Offset Loss",
+        "两支汇入 Zref = Connector Z0；从 Zc 变换到 Zref"
+      ]
+    },
+    {
+      "id": "gold-03",
+      "source_path": "D:\\Yepu\\Documents_YePu\\公司资料\\仪表手册\\网络分析仪\\校准件\\如何定义校准件-是徳.pdf",
+      "original_physical_page": 53,
+      "sample_pdf_page": 3,
+      "question": "联合 Figure 27 与 Figure 28：Figure 27 的上方、下方左侧、下方右侧剖面分别是哪种连接器？Figure 28 左右两幅各是什么连接器？两图中 female 与 male 的左右排列是否一致？",
+      "answer": "Figure 27：上方为 7 mm Coaxial connector，下方左侧为 Female 3.5 mm，下方右侧为 Male 3.5 mm。Figure 28：左侧为 Female type-N，右侧为 Male type-N。排列一致，均为 female 在左、male 在右（Figure 27 指下方成对剖面）。",
+      "required_answer_items": [
+        "Figure 27 上方：7 mm Coaxial connector",
+        "Figure 27 下左 Female 3.5 mm；下右 Male 3.5 mm",
+        "Figure 28 左 Female type-N；右 Male type-N",
+        "两组成对剖面均 female 左、male 右"
+      ]
+    },
+    {
+      "id": "gold-04",
+      "source_path": "D:\\Yepu\\Documents_YePu\\公司资料\\仪表手册\\网络分析仪\\校准件\\网分S参数网络的嵌入和去嵌.pdf",
+      "original_physical_page": 6,
+      "sample_pdf_page": 4,
+      "question": "按 Figure 5 的水平箭头，从图左端沿上方通路向右经过哪三个传输系数？从图右端沿下方通路向左又依次经过哪三个？请同时给出三个网络从左到右的排列。",
+      "answer": "上方从左到右依次 FA21、S21、FB21；下方从右到左依次 FB12、S12、FA12。三个网络从左到右为 Fixture A、DUT、Fixture B。",
+      "required_answer_items": [
+        "上方：FA21 → S21 → FB21",
+        "下方沿向左箭头：FB12 → S12 → FA12",
+        "网络顺序：Fixture A → DUT → Fixture B"
+      ]
+    },
+    {
+      "id": "gold-05",
+      "source_path": "D:\\Yepu\\Documents_YePu\\公司资料\\仪表手册\\网络分析仪\\校准件\\网分S参数网络的嵌入和去嵌.pdf",
+      "original_physical_page": 28,
+      "sample_pdf_page": 5,
+      "question": "联合 Figure A1 与 A2，写出 [T] 左乘的右侧波变量列向量及所得左侧列向量（均按从上到下顺序），并从 Figure A2 的右侧矩阵读出 T21、T22 的 S 参数表达式。若 S21=2、S22=3，求这两个元素的值。",
+      "answer": "[a1, b1]^T = [T] [a2, b2]^T。T21 = -S22/S21，T22 = 1/S21；代入 S21=2、S22=3，T21=-1.5，T22=0.5。",
+      "required_answer_items": [
+        "右侧列向量从上到下为 a2、b2；左侧为 a1、b1",
+        "T21 = -S22/S21",
+        "T22 = 1/S21",
+        "代入得到 T21=-1.5，T22=0.5"
+      ]
+    },
+    {
+      "id": "gold-06",
+      "source_path": "D:\\Yepu\\Documents_YePu\\公司资料\\仪表手册\\网络分析仪\\校准件\\网分测量的误差校准.pdf",
+      "original_physical_page": 11,
+      "sample_pdf_page": 6,
+      "question": "根据 Figure 7 的勾/叉与列标题，T/R(one-port) 在 Reflection 四项中哪一项不能校正？T/R(response,isolation) 在 TRANSMISSION 四项中哪两项不能校正？图内星号给出的仪器例外是什么？S-parameter(two-port) 列对这些项目是什么状态？",
+      "answer": "Reflection 的 T/R(one-port) 不能校正 Load match；TRANSMISSION 的 T/R(response,isolation) 不能校正 Source match 和 Load match。星号说明 Keysight 8712ET 的 enhanced response cal 可在传输测量时校正 Source match。S-parameter(two-port) 列中这四类反射误差和四类传输误差均打勾，表示可以校正。",
+      "required_answer_items": [
+        "Reflection / T/R(one-port)：Load match 为叉",
+        "TRANSMISSION / T/R(response,isolation)：Source match、Load match 为叉",
+        "星号例外：Keysight 8712ET enhanced response cal 可校正传输 Source match",
+        "S-parameter(two-port)：反射四项和传输四项均可校正"
+      ]
+    }
+  ],
+  "comparison": {
+    "native": {
+      "calls": 1,
+      "elapsed_s": 38.069,
+      "input_tokens": 16056,
+      "output_tokens": 965,
+      "official_price_estimate_usd": 0.041762,
+      "answer": "**gold-01（合成PDF物理第1页）**\n\n30 GHz 属于 **26.5 GHz to 40 GHz** 频段：\n\n| 型号 | Directivity | Match | Tracking |\n|---|---:|---:|---:|\n| ZN-Z129 | > 25 dB | > 22 dB | < 0.21 dB |\n| ZN-Z129E | > 24 dB | > 21 dB | < 0.24 dB |\n\n只有 ZN-Z129E 表列出的最高频段为 **40 GHz to 43.5 GHz**：Directivity **> 22 dB**，Match **> 20 dB**，Tracking **< 0.25 dB**。\n\n**gold-02（合成PDF物理第2页，Figure 25）**\n\n- **Line Z₀**：向下 → **No impedance transformation**。\n- **Connector Z₀**：进入 **Enable Zc Computation From C** 判断框：\n  - **yes**：向右，再向下 → **Zc is a function of C₀ and computed εᵣ**。\n  - **no**：向下 → **Zc = function of thru standard Offset Z₀ and Offset Loss**。\n- 两支最终均汇入：**Zref = Connector Z₀；Transform from Zc to Zref**（从 Zc 变换到 Zref）。\n\n**gold-03（合成PDF物理第3页，Figure 27、28）**\n\n- Figure 27：\n  - 上方：**7 mm Coaxial connector**。\n  - 下方左侧：**Female 3.5 mm**。\n  - 下方右侧：**Male 3.5 mm**。\n- Figure 28：\n  - 左侧：**Female type-N**。\n  - 右侧：**Male type-N**。\n- 两图的 female／male 左右排列**一致：左 female，右 male**。\n\n**gold-04（合成PDF物理第4页，Figure 5）**\n\n- 上方通路，从左向右（→）：**FA₂₁ → S₂₁ → FB₂₁**。\n- 下方通路，从右向左（←）：依次经过 **FB₁₂、S₁₂、FA₁₂**。\n- 三个网络从左到右：**Fixture A → DUT → Fixture B**。\n\n**gold-05（合成PDF物理第5页，Figure A1、A2）**\n\n按 Figure A1：\n\\[\n\\begin{bmatrix}a_1\\\\b_1\\end{bmatrix}\n=\n[T]\\begin{bmatrix}a_2\\\\b_2\\end{bmatrix}.\n\\]\n即右侧列向量从上到下为 **a₂、b₂**，所得左侧列向量为 **a₁、b₁**。\n\n按 Figure A2 右侧矩阵：\n\\[\nT_{21}=-\\frac{S_{22}}{S_{21}},\\qquad\nT_{22}=\\frac{1}{S_{21}}.\n\\]\n\n代入 \\(S_{21}=2、S_{22}=3\\)：\n\\[\nT_{21}=-\\frac32=-1.5,\\qquad\nT_{22}=\\frac12=0.5.\n\\]\n\n**gold-06（合成PDF物理第6页，Figure 7）**\n\n- **T/R (one-port)，Reflection**：不能校正的是 **Load match**（叉）。\n- **T/R (response, isolation)，TRANSMISSION**：不能校正的是 **Source match、Load match**（叉）。\n- 星号例外：**Keysight 8712ET enhanced response cal** 可在**传输测量期间校正 Source match**。\n- **S-parameter (two-port)**：Reflection 四项和 TRANSMISSION 四项**全部为勾，均可校正**。"
+    },
+    "current": {
+      "calls": 7,
+      "elapsed_s": 202.204,
+      "preparation_s": 171.487,
+      "input_tokens": 17132,
+      "output_tokens": 6813,
+      "official_price_estimate_usd": 0.102394,
+      "answer": "### gold-01（合成PDF物理第1页）\n30 GHz 属于 **26.5–40 GHz** 频段：\n\n| 型号 | Directivity | Match | Tracking |\n|---|---:|---:|---:|\n| ZN-Z129 | > 25 dB | > 22 dB | < 0.21 dB |\n| ZN-Z129E | > 24 dB | > 21 dB | < 0.24 dB |\n\n只有 ZN-Z129E 表列出的最高频段为 **40–43.5 GHz**：Directivity **> 22 dB**，Match **> 20 dB**，Tracking **< 0.25 dB**。\n\n### gold-02（合成PDF物理第2页，Figure 25）\n- 选择 **Line Z₀** → **No impedance transformation**。\n- 选择 **Connector Z₀** → **Enable Zc Computation From C**：\n  - **yes：向右，再向下** → “Zc is a function of C₀ and computed εᵣ”计算框。\n  - **no：向下** → “Zc = function of thru standard Offset Z₀ and Offset Loss”计算框。\n- 两支最终均汇入：**Zref = Connector Z₀；Transform from Zc to Zref**，即 **Zc → Zref** 的变换框。\n\n### gold-03（合成PDF物理第3页，Figure 27、28）\n- **Figure 27**：上方为 **7 mm 同轴连接器**；下方左侧为 **3.5 mm female（母）连接器**；下方右侧为 **3.5 mm male（公）连接器**。\n- **Figure 28**：左侧为 **type-N female（N型母）连接器**；右侧为 **type-N male（N型公）连接器**。\n- 两图的 female/male 左右排列**一致：左 female，右 male**。\n\n### gold-04（合成PDF物理第4页，Figure 5）\n- 从左端沿上方通路向右，依次经过：**FA₂₁、S₂₁、FB₂₁**。图面方向为 **FA₂₁ → S₂₁ → FB₂₁**。\n- 从右端沿下方通路向左，依次经过：**FB₁₂、S₁₂、FA₁₂**。图面方向为 **FA₁₂ ← S₁₂ ← FB₁₂**。\n- 三个网络从左到右：**Fixture A、DUT、Fixture B**。\n\n### gold-05（合成PDF物理第5页，Figure A1、A2）\nFigure A1 给出：\n\\[\n\\begin{bmatrix}a_1\\\\b_1\\end{bmatrix}\n=\n[T]\\begin{bmatrix}a_2\\\\b_2\\end{bmatrix}.\n\\]\n即右侧波变量从上到下为 **a₂、b₂**，所得左侧波变量从上到下为 **a₁、b₁**。\n\nFigure A2 右侧矩阵给出：\n\\[\nT_{21}=-\\frac{S_{22}}{S_{21}},\\qquad\nT_{22}=\\frac{1}{S_{21}}.\n\\]\n代入 \\(S_{21}=2,\\ S_{22}=3\\)：\n\\[\nT_{21}=-\\frac32=-1.5,\\qquad T_{22}=\\frac12=0.5.\n\\]\n\n### gold-06（合成PDF物理第6页，Figure 7）\n- **T/R (one-port)**：Reflection 四项中，**Load match（负载匹配）**不能校正（×）。\n- **T/R (response, isolation)**：TRANSMISSION 四项中，**Source match（源匹配）**和 **Load match（负载匹配）**不能校正（×）。\n- **星号例外**：**Keysight 8712ET 的 enhanced response cal（增强响应校准）可在传输测量中校正 Source match**。\n- **S-parameter (two-port)**：Reflection 和 TRANSMISSION 中所列各项均为 **✓，可校正**。",
+      "coverage": [
+        {
+          "physical_page": 1,
+          "text": true,
+          "rendered": true,
+          "ocr": true,
+          "visual_interpretation": true,
+          "status": "partial",
+          "unprocessed_reason": "Loss 行可辨认为“0.01 dB · √f / GHz (nom.)”，但当前图像中根号横线覆盖范围较细小，无法可靠确认根号是否仅作用于 f，或作用于 f/GHz；未据此推断公式含义。",
+          "render_scale": 1.5,
+          "pixels": 1064754,
+          "attempts": 1
+        },
+        {
+          "physical_page": 2,
+          "text": true,
+          "rendered": true,
+          "ocr": true,
+          "visual_interpretation": true,
+          "status": "processed",
+          "unprocessed_reason": null,
+          "render_scale": 1.5,
+          "pixels": 1090584,
+          "attempts": 1
+        },
+        {
+          "physical_page": 3,
+          "text": true,
+          "rendered": true,
+          "ocr": true,
+          "visual_interpretation": true,
+          "status": "processed",
+          "unprocessed_reason": null,
+          "render_scale": 1.5,
+          "pixels": 1090584,
+          "attempts": 1
+        },
+        {
+          "physical_page": 4,
+          "text": true,
+          "rendered": true,
+          "ocr": true,
+          "visual_interpretation": true,
+          "status": "processed",
+          "unprocessed_reason": null,
+          "render_scale": 1.5,
+          "pixels": 1090584,
+          "attempts": 1
+        },
+        {
+          "physical_page": 5,
+          "text": true,
+          "rendered": true,
+          "ocr": true,
+          "visual_interpretation": true,
+          "status": "processed",
+          "unprocessed_reason": null,
+          "render_scale": 1.5,
+          "pixels": 1090584,
+          "attempts": 1
+        },
+        {
+          "physical_page": 6,
+          "text": true,
+          "rendered": true,
+          "ocr": true,
+          "visual_interpretation": true,
+          "status": "processed",
+          "unprocessed_reason": null,
+          "render_scale": 1.5,
+          "pixels": 1090584,
+          "attempts": 1
+        }
+      ]
+    },
+    "grading": {
+      "native": {
+        "content": "23/23",
+        "fully_correct_questions": "6/6",
+        "citation_pages": "6/6"
+      },
+      "current": {
+        "content": "23/23",
+        "fully_correct_questions": "6/6",
+        "citation_pages": "6/6"
+      },
+      "conclusion": "本题集两条路径均全对，未观察到任务内正确率差异；当前方案另有题目之外的页面覆盖缺口。"
+    },
+    "review_method": "agent visual review, not human blind review",
+    "scope": "one first-run comparison with identical questions; current produces additional reusable OCR/interpretation; read pagination and normal Agent orchestration overhead excluded",
+    "actual_gateway_bill_checked": false
+  },
+  "whole_12_page_test": {
+    "label": "whole-zn-native",
+    "time": "2026-11-11T21:17:07.413803+08:00",
+    "base_url": "https://api.muzeai.top/v1",
+    "model": "gpt-6.1-sol",
+    "effort": "high",
+    "endpoint": "responses",
+    "max_output_tokens": 6000,
+    "request_bytes": 988464,
+    "elapsed_s": 117.268,
+    "http_status": 200,
+    "response_bytes": 27697,
+    "status": "completed",
+    "returned_model": "gpt-6.1-sol",
+    "usage": {
+      "attribution": {
+        "items": {
+          "msg_0949656730d96697016af46ae10ed487d2b5c01e1350c1e902": {
+            "cache_write_tokens": 0,
+            "cached_tokens": 0,
+            "input_tokens": 36980,
+            "output_tokens": 0
+          },
+          "rs_0949656730d96697016af46ae5c98887d294ce47bd86a5d6cb": {
+            "cache_write_tokens": 0,
+            "cached_tokens": 0,
+            "input_tokens": 2,
+            "output_tokens": 516
+          },
+          "rs_0949656730d96697016af46afc909887d2845c36923cb79631": {
+            "cache_write_tokens": 0,
+            "cached_tokens": 0,
+            "input_tokens": 0,
+            "output_tokens": 282
+          },
+          "msg_0949656730d96697016af46b087e5087d2a79ad97937ff1d6c": {
+            "cache_write_tokens": 0,
+            "cached_tokens": 0,
+            "content": [
+              {
+                "cache_write_tokens": 0,
+                "cached_tokens": 0,
+                "input_tokens": 0,
+                "output_tokens": 4093
+              }
+            ],
+            "input_tokens": 0,
+            "output_tokens": 4093
+          }
+        }
+      },
+      "input_tokens": 36982,
+      "input_tokens_details": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0
+      },
+      "output_tokens": 4891,
+      "output_tokens_details": {
+        "reasoning_tokens": 798
+      },
+      "total_tokens": 41873
+    },
+    "incomplete_details": null,
+    "text": "以下仅依据附件作答。**页码均为物理页码，从PDF第1页起算**；不以目录页上的索引或页脚印刷页码代替定位。\n\n## 1. 型号、连接器类型及适用频率范围\n\n文件名称为 **R&S®ZN-Z1xx Calibration Kits（校准套件）**，版本 **01.01，2021年7月**，包含以下四个型号系列。\n\n| 型号系列 | 连接器类型 | 公头型号后缀 | 母头型号后缀 | 频率范围 | 依据物理页 |\n|---|---|---|---|---|---|\n| R&S®ZN-Z170 | Type N，50 Ω | .02 / .12 / .22 | .03 / .13 / .23 | DC～18 GHz | 第4～5页 |\n| R&S®ZN-Z135 | 3.5 mm | .02 / .12 / .22 | .03 / .13 / .23 | DC～26.5 GHz | 第4～6页 |\n| R&S®ZN-Z129 | 2.92 mm | .02 / .12 / .22 | .03 / .13 / .23 | DC～40 GHz | 第4、6～7页 |\n| R&S®ZN-Z129E | 2.92 mm | .02 / .12 / .22 | .03 / .13 / .23 | DC～43.5 GHz | 第4、8～9页 |\n\n**注意：**上表为各套件的电气频率范围。第9页的有效系统数据中，ZN-Z129、ZN-Z129E的首个频段从 **10 MHz** 开始，不能据其“DC起工作”的频率范围，自行把有效系统指标延伸到10 MHz以下。\n\n---\n\n## 2. 反射性能与有效系统数据\n\n以下按原表保留频段和指标的对应关系。公头、母头的下列性能限值相同，因此合并列出；其标准件模型参数并非全部相同。\n\n### 2.1 直通标准件（Through standard）的回波损耗\n\n以下数值在原文均标注为 **典型值（typ.）**。\n\n| 型号系列（公头、母头） | 频段 | 回波损耗 | 依据物理页 |\n|---|---|---:|---|\n| ZN-Z170 | DC～6 GHz | >40 dB（typ.） | 第4～5页 |\n| ZN-Z170 | 6～9 GHz | >36 dB（typ.） | 第4～5页 |\n| ZN-Z170 | 9～18 GHz | >32 dB（typ.） | 第4～5页 |\n| ZN-Z135 | DC～4 GHz | >34 dB（typ.） | 第5～6页 |\n| ZN-Z135 | 4～8 GHz | >32 dB（typ.） | 第5～6页 |\n| ZN-Z135 | 8～26.5 GHz | >30 dB（typ.） | 第5～6页 |\n| ZN-Z129 | DC～4 GHz | >32 dB（typ.） | 第6～7页 |\n| ZN-Z129 | 4～26.5 GHz | >30 dB（typ.） | 第6～7页 |\n| ZN-Z129 | 26.5～40 GHz | >28 dB（typ.） | 第6～7页 |\n| ZN-Z129E | DC～4 GHz | >30 dB（typ.） | 第8页 |\n| ZN-Z129E | 4～26.5 GHz | >26 dB（typ.） | 第8页 |\n| ZN-Z129E | 26.5～40 GHz | >21 dB（typ.） | 第8页 |\n| ZN-Z129E | 40～43.5 GHz | >19 dB（typ.） | 第8页 |\n\n### 2.2 匹配标准件（Match standard）的回波损耗\n\n| 型号系列（公头、母头） | 频段 | 回波损耗 | 依据物理页 |\n|---|---|---:|---|\n| ZN-Z170 | DC～6 GHz | >42 dB | 第4～5页 |\n| ZN-Z170 | 6～9 GHz | >36 dB | 第4～5页 |\n| ZN-Z170 | 9～18 GHz | >32 dB | 第4～5页 |\n| ZN-Z135 | DC～5 GHz | >42 dB | 第6页 |\n| ZN-Z135 | 5～15 GHz | >36 dB | 第6页 |\n| ZN-Z135 | 15～26.5 GHz | >32 dB | 第6页 |\n| ZN-Z129 | DC～4 GHz | >40 dB | 第7页 |\n| ZN-Z129 | 4～10 GHz | >33 dB | 第7页 |\n| ZN-Z129 | 10～26.5 GHz | >28 dB | 第7页 |\n| ZN-Z129 | 26.5～40 GHz | >25 dB | 第7页 |\n| ZN-Z129E | DC～4 GHz | >39 dB | 第8～9页 |\n| ZN-Z129E | 4～10 GHz | >33 dB | 第8～9页 |\n| ZN-Z129E | 10～26.5 GHz | >28 dB | 第8～9页 |\n| ZN-Z129E | 26.5～40 GHz | >24 dB | 第8～9页 |\n| ZN-Z129E | 40～43.5 GHz | >22 dB | 第8～9页 |\n\n所有型号、公母版本的匹配标准件，其**直流电阻均为50.0 Ω ±0.5 Ω**，见物理第4～9页相应表格。\n\n### 2.3 开路、短路标准件：相对标称相位的偏差\n\n这里的数值是**相位偏差，不是回波损耗**。\n\n| 型号系列（公头、母头） | 频段 | 开路标准件相位偏差 | 短路标准件相位偏差 | 依据物理页 |\n|---|---|---:|---:|---|\n| ZN-Z170 | DC～6 GHz | <2.0° | <1.5° | 第4～5页 |\n| ZN-Z170 | 6～9 GHz | <3.0° | <2.0° | 第4～5页 |\n| ZN-Z170 | 9～18 GHz | <4.0° | <3.5° | 第4～5页 |\n| ZN-Z135 | DC～4 GHz | <1.0° | <1.0° | 第5～6页 |\n| ZN-Z135 | 4～8 GHz | <2.0° | <2.0° | 第5～6页 |\n| ZN-Z135 | 8～26.5 GHz | <4.0° | <3.0° | 第5～6页 |\n| ZN-Z129 | DC～4 GHz | <1.5° | <1.5° | 第6～7页 |\n| ZN-Z129 | 4～10 GHz | <3.5° | <2.0° | 第6～7页 |\n| ZN-Z129 | 10～26.5 GHz | <4.5° | <3.5° | 第6～7页 |\n| ZN-Z129 | 26.5～40 GHz | <5.0° | <4.5° | 第6～7页 |\n| ZN-Z129E | DC～4 GHz | <1.5° | <1.5° | 第8～9页 |\n| ZN-Z129E | 4～10 GHz | <2.5° | <2.0° | 第8～9页 |\n| ZN-Z129E | 10～26.5 GHz | <4.5° | <3.5° | 第8～9页 |\n| ZN-Z129E | 26.5～43.5 GHz | <5.0° | <4.5° | 第8～9页 |\n\n原文脚注说明：\n\n- **开路标称相位**由偏移延迟、偏移损耗和边缘电容定义。\n- **短路标称相位**由偏移延迟、偏移损耗和短路电感定义。\n\n上述定义见物理第4～8页相关脚注。\n\n### 2.4 有效系统数据——全部位于物理第9页\n\n这些指标不是未经校准的套件单件指标。原文规定，其建立条件为：\n\n- 在 **R&S®ZNA、ZVA、ZNB或ZVT矢量网络分析仪**上执行适当的系统误差校准，例如 **UOSM**；\n- 使用存储在矢量网络分析仪中的套件模型数据；\n- 温度 **+18 ℃～+28 ℃**；\n- 测量带宽 **10 Hz**；\n- 校准端口标称功率 **0 dBm**。\n\n#### R&S®ZN-Z170：Type N，公头及母头\n\n| 项目 | DC～6 GHz | 6～9 GHz | 9～18 GHz |\n|---|---:|---:|---:|\n| 方向性（Directivity），dB | >42 | >36 | >32 |\n| 匹配（Match），dB | >33 | >29 | >25 |\n| 跟踪（Tracking），dB | <0.07 | <0.10 | <0.15 |\n\n#### R&S®ZN-Z135：3.5 mm，公头及母头\n\n| 项目 | DC～4 GHz | 4～8 GHz | 8～26.5 GHz |\n|---|---:|---:|---:|\n| 方向性（Directivity），dB | >42 | >36 | >32 |\n| 匹配（Match），dB | >37 | >31 | >26 |\n| 跟踪（Tracking），dB | <0.07 | <0.11 | <0.16 |\n\n#### R&S®ZN-Z129：2.92 mm，公头及母头\n\n| 项目 | 10 MHz～4 GHz | 4～10 GHz | 10～26.5 GHz | 26.5～40 GHz |\n|---|---:|---:|---:|---:|\n| 方向性（Directivity），dB | >40 | >33 | >28 | >25 |\n| 匹配（Match），dB | >34 | >28 | >24 | >22 |\n| 跟踪（Tracking），dB | <0.07 | <0.11 | <0.15 | <0.21 |\n\n#### R&S®ZN-Z129E：2.92 mm，公头及母头\n\n| 项目 | 10 MHz～4 GHz | 4～10 GHz | 10～26.5 GHz | 26.5～40 GHz | 40～43.5 GHz |\n|---|---:|---:|---:|---:|---:|\n| 方向性（Directivity），dB | >39 | >33 | >28 | >24 | >22 |\n| 匹配（Match），dB | >33 | >29 | >24 | >21 | >20 |\n| 跟踪（Tracking），dB | <0.07 | <0.11 | <0.15 | <0.24 | <0.25 |\n\n**原文边界与数值性质说明：**\n\n1. 第9页正文称套件可工作至0 Hz，但ZN-Z129、ZN-Z129E的有效系统数据表仅从10 MHz列起，**未另列0～10 MHz的有效系统数值**。\n2. 第3页明确：**典型值（typ.）、标称值（nom.）和实测值（meas.）不属于Rohde & Schwarz保证的数据**。因此不能把上述直通回波损耗的典型值当作保证限值。\n3. 上述频段端点按原表保留；原文未进一步解释相邻频段共用端点时的归属。\n\n---\n\n## 3. 校准标准件、配件及选件的区分\n\n### 3.1 原文明示的校准标准件\n\n各型号的电气数据均列有以下四类标准件，见物理第4～9页：\n\n| 原文名称 | 中文对应 | 附件中的证据 |\n|---|---|---|\n| Through standard | 直通标准件 | 各型号电气数据中的独立栏目 |\n| Open standard | 开路标准件 | 各型号电气数据中的独立栏目 |\n| Short standard | 短路标准件 | 各型号电气数据中的独立栏目 |\n| Match standard | 匹配标准件 | 各型号电气数据中的独立栏目 |\n\n物理第1页封面实物上也可见 **Open、Short、Through、Match** 标识。\n\n**但附件没有单独的装箱清单**，没有逐项写明标准件的独立件数、是否可拆卸，或其他随箱配件。不能自行补充扭矩扳手、量规、转接器、线缆、清洁工具、箱体或软件介质等为标配。\n\n另外，第4页机械数据中的 **“Gauge”及其尺寸范围**是机械参数栏目，**不能据此认定随套件附送量规工具**。\n\n### 3.2 订购版本：基础版、with DCV、with ACA\n\n物理第11页为每个系列列出三类订购版本，并分别提供公头、母头：\n\n| 版本 | 公头后缀 | 母头后缀 | 原文写法 |\n|---|---|---|---|\n| 基础版本 | .02 | .03 | Calibration kit… |\n| 带DCV版本 | .12 | .13 | …with DCV |\n| 带ACA版本 | .22 | .23 | …with ACA |\n\n各系列的订货号前段为：\n\n| 型号系列 | 订货号前段；与上述两位后缀组合 |\n|---|---|\n| ZN-Z170 | 1328.8163 |\n| ZN-Z135 | 1328.8157 |\n| ZN-Z129 | 1328.8140 |\n| ZN-Z129E | 1328.8170 |\n\n例如，ZN-Z129E母头基础版为 **1328.8170.03**，母头with ACA版本为 **1328.8170.23**。\n\n**附件未解释DCV、ACA的全称和具体交付内容**，因此只能将其认定为原文列明的可选订购版本，不能自行解释为某种硬件配件或某类证书。\n\n### 3.3 原文明确列为“Service options”的服务选项\n\n均见物理第11页，不属于校准标准件或硬件标配：\n\n| 服务选项 | 型号 | 年限 |\n|---|---|---|\n| 延长保修 | R&S®WE1～WE4 | 1～4年 |\n| 延长保修，含校准服务 | R&S®CW1～CW4 | 1～4年 |\n| 延长保修，含认可校准服务 | R&S®AW1～AW4 | 1～4年 |\n\n原文还注明：维修保障不包括错误操作或处理、不可抗力导致的缺陷，也不包括磨损件。\n\n---\n\n## 4. 图中实物／连接器与型号的对应关系\n\n### 4.1 封面实物照片——物理第1页\n\n照片机身标识能够读出：\n\n- **R&S®ZN-Z170**\n- **N（50 Ω）**\n- **DC to 18 GHz**\n\n因此，这张实物照片可明确对应到 **ZN-Z170系列、Type N 50 Ω、DC～18 GHz**。\n\n按封面照片中的位置，标准件标识为：\n\n| 照片位置 | 可见标识 | 对应功能 |\n|---|---|---|\n| 左侧接口附近 | Open | 开路 |\n| 上方接口附近 | Short | 短路 |\n| 中间斜置部分 | Through | 直通 |\n| 右下侧接口附近 | Match | 匹配 |\n\n**照片没有清楚标明具体的“.02/.12/.22”或“.03/.13/.23”订购后缀，也未以文字标注公头／母头，不能仅凭这张照片确认具体订购版本。**\n\n### 4.2 全系列连接器与型号的文字对应——物理第4页\n\n机械数据表明确给出：\n\n| 型号 | .02/.12/.22 | .03/.13/.23 |\n|---|---|---|\n| ZN-Z170 | Type N，50 Ω，公头 | Type N，50 Ω，母头 |\n| ZN-Z135 | 3.5 mm，公头 | 3.5 mm，母头 |\n| ZN-Z129、ZN-Z129E | 2.92 mm，公头 | 2.92 mm，母头 |\n\n第4页还给出外观材料区别：ZN-Z170、ZN-Z135、ZN-Z129为**黑色阳极氧化铝机身**；ZN-Z129E为**蓝色阳极氧化铝机身**。这是文字规格，**附件没有提供其他三个系列可逐一比对的实物照片**，不能把封面的ZN-Z170照片当成全部型号的实物图。\n\n---\n\n### 资料知识摘要（不超过150字）\n\n本资料涵盖ZN-Z170、ZN-Z135、ZN-Z129及ZN-Z129E，分别采用N型、3.5 mm及2.92 mm接口，最高频率18、26.5、40及43.5 GHz。列有开路、短路、匹配和直通标准件；有效系统指标须满足规定校准条件，建议校准周期为1年。"
+  },
+  "whole_68_page_first_attempt": {
+    "label": "whole-68-native",
+    "time": "2026-11-11T21:21:17.030456+08:00",
+    "base_url": "https://api.muzeai.top/v1",
+    "model": "gpt-6.1-sol",
+    "effort": "high",
+    "endpoint": "responses",
+    "max_output_tokens": 6000,
+    "request_bytes": 14764270,
+    "elapsed_s": 23.77,
+    "error": "HTTPSConnectionPool(host='api.muzeai.top', port=443): Max retries exceeded with url: /v1/responses (Caused by SSLError(SSLWantWriteError(3, 'The operation did not complete (write) (_ssl.c:2427)')))"
+  },
+  "whole_68_page_retry": {
+    "label": "whole-68-native-retry",
+    "time": "2026-11-11T21:26:57.747389+08:00",
+    "base_url": "https://api.muzeai.top/v1",
+    "model": "gpt-6.1-sol",
+    "effort": "high",
+    "endpoint": "responses",
+    "max_output_tokens": 6000,
+    "request_bytes": 14764270,
+    "elapsed_s": 89.036,
+    "http_status": 200,
+    "response_bytes": 7203,
+    "status": "completed",
+    "returned_model": "gpt-6.1-sol",
+    "usage": {
+      "attribution": {
+        "items": {
+          "msg_05bd9540a1abf415016af46d5bad2c87d2af0ed49c68af60e4": {
+            "cache_write_tokens": 0,
+            "cached_tokens": 0,
+            "input_tokens": 185516,
+            "output_tokens": 0
+          },
+          "rs_05bd9540a1abf415016af46d6a924887d29848fc1eec6b6ae2": {
+            "cache_write_tokens": 0,
+            "cached_tokens": 0,
+            "input_tokens": 2,
+            "output_tokens": 111
+          },
+          "msg_05bd9540a1abf415016af46d6fd11887d2b0f65b61a255aa28": {
+            "cache_write_tokens": 0,
+            "cached_tokens": 0,
+            "content": [
+              {
+                "cache_write_tokens": 0,
+                "cached_tokens": 0,
+                "input_tokens": 0,
+                "output_tokens": 586
+              }
+            ],
+            "input_tokens": 0,
+            "output_tokens": 586
+          }
+        }
+      },
+      "input_tokens": 185518,
+      "input_tokens_details": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0
+      },
+      "output_tokens": 697,
+      "output_tokens_details": {
+        "reasoning_tokens": 111
+      },
+      "total_tokens": 186215
+    },
+    "incomplete_details": null,
+    "text": "### 1. Figure 25 的分支与终点\n**所在位置：PDF物理第30页。**\n\n- 选择 **Line Z0**：沿左侧分支向下，到达 **“No impedance transformation”**（不进行阻抗变换）终点。\n- 选择 **Connector Z0**：进入 **“Enable Zc Computation From C”** 判断框：\n  - **yes 分支向右**，再向下进入右侧计算框：**“Zc is a function of C0 and computed εr”**，即由 \\(C_0\\) 和计算得到的相对介电常数 \\(\\varepsilon_r\\) 确定 \\(Z_c\\)。\n  - **no 分支向下**，进入中间计算框：**“Zc = function of thru standard Offset Z0 and Offset Loss”**，即由直通校准件的 Offset Z0 和 Offset Loss 确定 \\(Z_c\\)。\n- 两支最终汇入同一个变换框：**“Zref = Connector Z0 Transform from Zc to Zref”**，即令 \\(Z_{\\mathrm{ref}}\\) 为 Connector Z0，并从 \\(Z_c\\) 变换到 \\(Z_{\\mathrm{ref}}\\)。\n\n### 2. Figure 27 与 Figure 28 的连接器排列\n**两图均在PDF物理第53页；7 mm连接器无性别的文字说明在物理第52页。**\n\n| 图中位置 | 连接器 |\n|---|---|\n| Figure 27 上方 | **7 mm同轴连接器**，无性别 |\n| Figure 27 下方左侧 | **Female 3.5 mm**，3.5 mm母头 |\n| Figure 27 下方右侧 | **Male 3.5 mm**，3.5 mm公头 |\n| Figure 28 左侧 | **Female type-N**，N型母头 |\n| Figure 28 右侧 | **Male type-N**，N型公头 |\n\n**排列一致：两图均为左侧 female、右侧 male。**\n\n### 3. 主题与应记录的参数（不超过200字）\n本资料指导为Keysight矢量网络分析仪创建、修改校准套件，说明校准件模型、类别分配及其与SOLT、TRL等算法的配合（物理第4—6、20—32页）。定义校准件时应记录：①适用频率上下限（第11页）；②偏移延迟Offset delay（第8页）；③偏移特性阻抗Offset Z0（第10页）。"
+  },
+  "files_probe": {
+    "file": "D:\\CodeAndDesign\\CowAgent\\tmp\\pdf-compare\\probe.pdf",
+    "bytes": 32812,
+    "base_url": "https://api.muzeai.top/v1",
+    "upload_s": 2.412,
+    "http_status": 400,
+    "file_id": null,
+    "error": "{\"error\": {\"code\": \"\", \"message\": \"Model name not specified, model name cannot be empty (request id: 202611111325368848811388268d9d6cwOsl2Dg)\", \"type\": \"new_api_error\"}}"
+  },
+  "files_large_attempt": {
+    "file": "D:\\Yepu\\Documents_YePu\\公司资料\\仪表手册\\网络分析仪\\校准件\\如何定义校准件-是徳.pdf",
+    "bytes": 11071892,
+    "base_url": "https://api.muzeai.top/v1",
+    "upload_s": 36.364,
+    "error": "HTTPSConnectionPool(host='api.muzeai.top', port=443): Max retries exceeded with url: /v1/files (Caused by SSLError(SSLEOFError(8, 'EOF occurred in violation of protocol (_ssl.c:2427)')))"
+  },
+  "scan_probe": {
+    "expected": {
+      "code": "472913",
+      "blue_triangles": 3,
+      "red_circles": 2
+    },
+    "pdf_text_layer_characters": 0,
+    "native": {
+      "label": "probe-native-responses",
+      "time": "2026-11-11T21:15:19.275200+08:00",
+      "base_url": "https://api.muzeai.top/v1",
+      "model": "gpt-6.1-sol",
+      "effort": "high",
+      "endpoint": "responses",
+      "max_output_tokens": 1600,
+      "request_bytes": 44412,
+      "elapsed_s": 9.665,
+      "http_status": 200,
+      "response_bytes": 2047,
+      "status": "completed",
+      "returned_model": "gpt-6.1-sol",
+      "usage": {
+        "attribution": {
+          "items": {
+            "msg_09deabb15c0543eb016af46a6c217887d2951589d2af50818f": {
+              "cache_write_tokens": 0,
+              "cached_tokens": 0,
+              "input_tokens": 1511,
+              "output_tokens": 0
+            },
+            "msg_09deabb15c0543eb016af46a6d777487d29b58f438698b8888": {
+              "cache_write_tokens": 0,
+              "cached_tokens": 0,
+              "content": [
+                {
+                  "cache_write_tokens": 0,
+                  "cached_tokens": 0,
+                  "input_tokens": 2,
+                  "output_tokens": 23
+                }
+              ],
+              "input_tokens": 2,
+              "output_tokens": 23
+            }
+          }
+        },
+        "input_tokens": 1513,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        },
+        "output_tokens": 23,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 1536
+      },
+      "incomplete_details": null,
+      "text": "{\"code\":\"472913\",\"blue_triangles\":3,\"red_circles\":2}"
+    },
+    "image": {
+      "label": "probe-image-responses",
+      "time": "2026-11-11T21:15:28.942301+08:00",
+      "base_url": "https://api.muzeai.top/v1",
+      "model": "gpt-6.1-sol",
+      "effort": "high",
+      "endpoint": "responses",
+      "max_output_tokens": 1600,
+      "request_bytes": 22142,
+      "elapsed_s": 5.996,
+      "http_status": 200,
+      "response_bytes": 2215,
+      "status": "completed",
+      "returned_model": "gpt-6.1-sol",
+      "usage": {
+        "input_tokens": 871,
+        "input_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0
+        },
+        "output_tokens": 23,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 894,
+        "attribution": {
+          "items": {
+            "msg_043acf335b898752016af46a75120087d29babb04aaa7674ab": {
+              "input_tokens": 869,
+              "cached_tokens": 0,
+              "cache_write_tokens": 0,
+              "output_tokens": 0,
+              "content": [
+                {
+                  "input_tokens": 810,
+                  "cached_tokens": 0,
+                  "cache_write_tokens": 0,
+                  "output_tokens": 0
+                },
+                {
+                  "input_tokens": 59,
+                  "cached_tokens": 0,
+                  "cache_write_tokens": 0,
+                  "output_tokens": 0
+                }
+              ]
+            },
+            "msg_043acf335b898752016af46a764d0087d2ac12c575e6ca0f35": {
+              "input_tokens": 2,
+              "cached_tokens": 0,
+              "cache_write_tokens": 0,
+              "output_tokens": 23,
+              "content": [
+                {
+                  "input_tokens": 2,
+                  "cached_tokens": 0,
+                  "cache_write_tokens": 0,
+                  "output_tokens": 23
+                }
+              ]
+            }
+          }
+        }
+      },
+      "incomplete_details": null,
+      "text": "{\"code\":\"472913\",\"blue_triangles\":3,\"red_circles\":2}"
+    }
+  }
+}
