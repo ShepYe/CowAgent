@@ -711,44 +711,13 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
 
   const isEmpty = !data || totalPages === 0
 
-  if (isEmpty) {
-    return (
-      <div className="flex-1 flex flex-col min-h-0">
-        {/* Keep the header (and the Agent scope picker) so switching away from an
-            empty Agent's base is still possible. */}
-        <div className="flex items-center justify-between px-6 pt-5 pb-3 flex-shrink-0">
-          <div>
-            <h2 className="text-xl font-bold text-content">{t('knowledge_title')}</h2>
-          </div>
-          <AgentScopeSelect value={viewingAgentId} onChange={(id) => void setScope(id)} />
-        </div>
-        <div className="flex-1 flex flex-col items-center justify-center px-6 text-center border-t border-default">
-          <div className="w-14 h-14 rounded-2xl bg-accent-soft text-accent flex items-center justify-center mb-5">
-            <Files size={26} />
-          </div>
-        <h2 className="text-lg font-semibold text-content mb-2">
-          {data?.enabled === false ? t('knowledge_disabled') : t('knowledge_empty')}
-        </h2>
-        <p className="text-sm text-content-tertiary max-w-md mb-6">{t('knowledge_empty_guide')}</p>
-          <button
-            onClick={() => navigate('/')}
-            className="inline-flex items-center gap-2 px-4 py-2 rounded-btn bg-accent text-accent-contrast hover:bg-accent-hover text-sm font-medium cursor-pointer transition-colors"
-          >
-            <MessageSquarePlus size={15} />
-            {t('knowledge_go_chat')}
-          </button>
-        </div>
-      </div>
-    )
-  }
-
   return (
     <div className="flex-1 flex flex-col min-h-0">
       {/* Header */}
       <div className="flex items-center justify-between px-6 pt-5 pb-3 flex-shrink-0">
         <div>
           <h2 className="text-xl font-bold text-content">{t('knowledge_title')}</h2>
-          <p className="text-xs text-content-tertiary mt-1">{statsLabel}</p>
+          {!isEmpty && <p className="text-xs text-content-tertiary mt-1">{statsLabel}</p>}
         </div>
         <div className="flex items-center gap-2">
           {status && (
@@ -801,7 +770,24 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
         />
       </div>
 
-      {tab === 'personal' ? <PersonalTasksPanel /> : tab === 'docs' ? (
+      {tab === 'personal' ? <PersonalTasksPanel /> : isEmpty ? (
+        <div className="flex-1 flex flex-col items-center justify-center px-6 text-center border-t border-default">
+          <div className="w-14 h-14 rounded-2xl bg-accent-soft text-accent flex items-center justify-center mb-5">
+            <Files size={26} />
+          </div>
+          <h2 className="text-lg font-semibold text-content mb-2">
+            {data?.enabled === false ? t('knowledge_disabled') : t('knowledge_empty')}
+          </h2>
+          <p className="text-sm text-content-tertiary max-w-md mb-6">{t('knowledge_empty_guide')}</p>
+          <button
+            onClick={() => navigate('/')}
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-btn bg-accent text-accent-contrast hover:bg-accent-hover text-sm font-medium cursor-pointer transition-colors"
+          >
+            <MessageSquarePlus size={15} />
+            {t('knowledge_go_chat')}
+          </button>
+        </div>
+      ) : tab === 'docs' ? (
         <div
           className="flex-1 flex min-h-0 border-t border-default relative"
           onDragEnter={(e) => {
