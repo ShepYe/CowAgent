@@ -34,7 +34,7 @@ class _FakeClient:
         }
 
 
-def _make_bot(monkeypatch, api_type=None, bot_type="chatGPT", model="gpt-5.5"):
+def _make_bot(monkeypatch, api_type=None, bot_type="chatGPT", model="gpt-5.5", provider_api_type=None):
     cfg = {
         "bot_type": bot_type,
         "model": model,
@@ -45,6 +45,8 @@ def _make_bot(monkeypatch, api_type=None, bot_type="chatGPT", model="gpt-5.5"):
     }
     if api_type is not None:
         cfg["open_ai_api_type"] = api_type
+    if provider_api_type is not None:
+        cfg["custom_providers"][0]["api_type"] = provider_api_type
     monkeypatch.setattr(config_module, "config", Config(cfg))
 
     from models.chatgpt.chat_gpt_bot import ChatGPTBot
@@ -124,6 +126,45 @@ def test_custom_provider_ignores_openai_api_type(monkeypatch):
     assert client.calls[0][0] == "chat"
 
 
+@pytest.mark.parametrize("provider_mode,global_mode,model,expected", [
+    ("responses", "chat", "my-reasoner", "responses"),
+    ("chat", "responses", "gpt-7-sol", "chat"),
+    (None, "chat", "gpt-7-sol", "responses"),
+    ("invalid", "responses", "my-reasoner", "chat"),
+])
+def test_custom_provider_uses_own_optional_api_type(monkeypatch, provider_mode, global_mode, model, expected):
+    bot, client = _make_bot(monkeypatch, api_type=global_mode, bot_type="custom:c1",
+                            model=model, provider_api_type=provider_mode)
+    _call_tools(bot, model=model)
+    assert client.calls[0][0] == expected
+
+
+def test_custom_api_type_looks_up_instance_provider_instead_of_global_provider(monkeypatch):
+    from models.chatgpt.chat_gpt_bot import ChatGPTBot
+
+    _make_bot(monkeypatch, api_type="chat", bot_type="custom:c1", provider_api_type="chat")
+    config_module.config["custom_providers"].append({
+        "id": "c2", "api_key": "k2", "api_base": "https://second.example.com/v1",
+        "model": "my-reasoner", "api_type": "responses",
+    })
+    bot = ChatGPTBot("custom:c2")
+    client = _FakeClient()
+    bot._http_client = client
+    _call_tools(bot, model="my-reasoner")
+    kind, params = client.calls[0]
+    assert kind == "responses"
+    assert params["api_base"] == "https://second.example.com/v1"
+    assert params["api_key"] == "k2"
+
+
+@pytest.mark.parametrize("bot_type", ["custom", "custom:missing"])
+def test_custom_legacy_or_missing_provider_defaults_to_auto(monkeypatch, bot_type):
+    bot, client = _make_bot(monkeypatch, api_type="responses", bot_type=bot_type,
+                            provider_api_type="responses")
+    _call_tools(bot)
+    assert client.calls[0][0] == "chat"
+
+
 def test_reply_text_uses_responses_when_configured(monkeypatch):
     from models.session_manager import Session
 
@@ -169,3 +210,57 @@ def test_normalize_effort_only_clamps_responses_only_models():
     assert responses_adapter.normalize_effort("none", "gpt-6-astra") == "low"
     assert responses_adapter.normalize_effort("none", "gpt-6.1-sol") == "low"
     assert responses_adapter.normalize_effort("minimal") == "low"
+
+
+@pytest.mark.parametrize("model", ["gpt-6.2-sol", "gpt-7-sol", "my-reasoner"])
+@pytest.mark.parametrize("api_type", ["chat", "responses"])
+def test_enabled_thinking_forwards_explicit_effort_without_name_inference(monkeypatch, model, api_type):
+    bot, client = _make_bot(monkeypatch, api_type=api_type, model=model)
+    _call_tools(bot, model=model, thinking={"type": "enabled"}, reasoning_effort="VendorFutureTier")
+    kind, params = client.calls[0]
+    assert kind == api_type
+    if kind == "responses":
+        assert params["reasoning"] == {"effort": "VendorFutureTier"}
+    else:
+        assert params.get("reasoning_effort") == "VendorFutureTier"
+
+
+@pytest.mark.parametrize("model", ["gpt-5.5", "o3"])
+def test_chat_known_reasoning_tools_keep_none_constraint(monkeypatch, model):
+    bot, client = _make_bot(monkeypatch, api_type="chat", model=model)
+    _call_tools(bot, model=model, thinking={"type": "enabled"}, reasoning_effort="high")
+    assert client.calls[0][1]["reasoning_effort"] == "none"
+
+
+@pytest.mark.parametrize("model", ["gpt-6.2-sol", "gpt-7-sol", "my-reasoner"])
+def test_disabled_future_thinking_omits_reasoning(monkeypatch, model):
+    bot, client = _make_bot(monkeypatch, api_type="responses", model=model)
+    _call_tools(bot, model=model, thinking={"type": "disabled"})
+    assert "reasoning" not in client.calls[0][1]
+
+
+@pytest.mark.parametrize("model", ["gpt-5.5", "gpt-6.2-sol", "gpt-7-sol", "my-reasoner"])
+def test_all_responses_models_receive_stable_private_session_cache_keys(monkeypatch, model):
+    from common.runtime_identity import identity_scope
+
+    bot, client = _make_bot(monkeypatch, api_type="responses", model=model)
+    with identity_scope(user_id="u1", agent_id="a1", session_id="private-session", run_id="run1"):
+        _call_tools(bot, model=model)
+    with identity_scope(user_id="u1", agent_id="a1", session_id="private-session", run_id="run2"):
+        _call_tools(bot, model=model)
+    first = client.calls[0][1].get("prompt_cache_key")
+    assert first and first.startswith("cow_")
+    assert "private-session" not in first
+    assert client.calls[1][1]["prompt_cache_key"] == first
+
+
+def test_responses_cache_omitted_without_session_and_chat_never_gets_it(monkeypatch):
+    from common.runtime_identity import identity_scope
+
+    bot, client = _make_bot(monkeypatch, api_type="responses", model="my-reasoner")
+    with identity_scope(session_id=None):
+        _call_tools(bot, model="my-reasoner")
+    assert "prompt_cache_key" not in client.calls[0][1]
+    bot, client = _make_bot(monkeypatch, api_type="chat", model="gpt-7-sol")
+    _call_tools(bot, model="gpt-7-sol", session_id="private-session")
+    assert "prompt_cache_key" not in client.calls[0][1]

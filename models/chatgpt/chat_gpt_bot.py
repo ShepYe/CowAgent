@@ -16,7 +16,9 @@ from common import const
 from common.i18n import t as _t
 from models.bot import Bot
 from models.openai_compatible_bot import OpenAICompatibleBot
-from models.custom_provider import resolve_custom_credentials, resolve_custom_headers, parse_custom_bot_type
+from models.custom_provider import (
+    resolve_custom_credentials, resolve_custom_headers, resolve_custom_api_type, parse_custom_bot_type,
+)
 from models.chatgpt.chat_gpt_session import ChatGPTSession
 from models.openai.open_ai_image import OpenAIImage
 from models.session_manager import SessionManager
@@ -107,11 +109,10 @@ class ChatGPTBot(Bot, OpenAIImage, OpenAICompatibleBot):
         }
 
     def _openai_api_type(self) -> str:
-        """``open_ai_api_type`` applies to the OpenAI endpoint only; custom
-        providers keep the default routing."""
+        """Each custom provider owns its protocol preference independently of OpenAI."""
         is_custom, _ = parse_custom_bot_type(self._bot_type)
         if is_custom:
-            return responses_adapter.API_TYPE_AUTO
+            return resolve_custom_api_type(self._bot_type)
         return responses_adapter.resolve_api_type(conf().get("open_ai_api_type"))
 
     def _use_responses_for_plain_calls(self) -> bool:

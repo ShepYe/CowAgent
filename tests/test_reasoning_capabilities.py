@@ -151,10 +151,64 @@ def test_openai_is_hidden_until_responses_api_runtime_support_exists():
     assert cap == {"supported": False, "options": []}
 
 
-def test_custom_provider_is_hidden_by_default():
+def test_custom_provider_exposes_protocol_effort_without_model_allowlist():
     cap = get_reasoning_capability("custom:local", "provider-native-model")
 
-    assert cap == {"supported": False, "options": []}
+    assert cap["supported"] is True
+    assert "thinking_only" not in cap
+    assert "high" in _values(cap)
+
+
+@pytest.mark.parametrize("provider", ["openai", "chatGPT", "custom", "custom:relay"])
+@pytest.mark.parametrize("model", ["gpt-6.1-sol", "gpt-6.1-sol-2026-11-10", "gpt-6-astra"])
+def test_openai_responses_models_expose_native_effort(provider, model):
+    cap = get_reasoning_capability(provider, model)
+
+    assert cap["supported"] is True
+    assert cap["thinking_only"] is True
+    assert cap["default"] == "medium"
+    assert _values(cap) == ["low", "medium", "high", "xhigh", "max"]
+    assert resolve_reasoning_effort(provider, model, {f"{provider}:{model}": "xhigh"}, "high") == "xhigh"
+
+
+def test_custom_openai_effort_keeps_each_gateway_setting():
+    by_model = {"custom:first:gpt-6.1-sol": "high", "custom:second:gpt-6.1-sol": "max"}
+
+    assert resolve_reasoning_effort("custom:first", "gpt-6.1-sol", by_model, "low") == "high"
+    assert resolve_reasoning_effort("custom:second", "gpt-6.1-sol", by_model, "low") == "max"
+    assert resolve_reasoning_effort("custom:third", "gpt-6.1-sol", by_model, "low") == "low"
+
+
+@pytest.mark.parametrize("provider", ["openai", "chatGPT", "custom:relay"])
+@pytest.mark.parametrize("model", ["gpt-6.2-sol", "gpt-7-sol", "gpt-10.3-astra"])
+def test_future_gpt_models_preserve_configured_effort(provider, model):
+    cap = get_reasoning_capability(provider, model)
+
+    assert cap["supported"] is True
+    assert "thinking_only" not in cap
+    assert resolve_reasoning_effort(provider, model, {f"{provider}:{model}": "xhigh"}, "high") == "xhigh"
+    assert resolve_reasoning_effort(provider, model, {}, "high") == "high"
+
+
+def test_unknown_alias_preserves_explicit_future_effort_value():
+    by_model = {"custom:relay:next-model": "FutureNativeEffort"}
+
+    assert resolve_reasoning_effort("custom:relay", "next-model", by_model, "high") == "FutureNativeEffort"
+
+
+def test_explicit_openai_alias_effort_survives_missing_catalog_metadata():
+    by_model = {"openai:next-model": "xhigh"}
+
+    assert resolve_reasoning_effort("openai", "next-model", by_model, "high") == "xhigh"
+
+
+@pytest.mark.parametrize("value", [None, {}, ["high"], 123])
+def test_generic_effort_does_not_serialize_non_string_config_values(value):
+    assert normalize_reasoning_effort("custom:relay", "next-model", value) == "medium"
+
+
+def test_custom_provider_without_selected_model_stays_hidden():
+    assert get_reasoning_capability("custom:relay", "") == {"supported": False, "options": []}
 
 
 def test_gemini_4_exposes_thinking_levels():

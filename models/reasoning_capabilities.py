@@ -5,6 +5,8 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Optional
 
+from models.openai import responses_adapter
+
 
 DEEPSEEK_VALUES = ["low", "high", "xhigh", "max"]
 # Thinking-capable DeepSeek models: the V4 series plus the version-less V4.1
@@ -23,6 +25,8 @@ KIMI_K3_VALUES = ["low", "high", "max"]
 # Gemini 4 always thinks; depth is set via generationConfig.thinkingConfig.thinkingLevel.
 GEMINI4_VALUES = ["low", "medium", "high"]
 GEMINI4_MODELS = ("gemini-4",)
+OPENAI_THINKING_VALUES = ["low", "medium", "high", "xhigh", "max"]
+OPENAI_PROTOCOL_VALUES = ["none", "minimal", *OPENAI_THINKING_VALUES]
 CLAUDE_XHIGH_MODELS = (
     "claude-fable-5-1",
     "claude-fable-5",
@@ -100,6 +104,16 @@ def get_reasoning_capability(provider_id: str, model_name: str = "") -> dict:
     """Return provider-native reasoning metadata for a provider/model pair."""
     base_pid = _base_provider_id(provider_id)
     model = (model_name or "").strip().lower()
+
+    if base_pid in ("openai", "custom") and model:
+        if responses_adapter.is_thinking_only_model(model):
+            return _capability(OPENAI_THINKING_VALUES, default="medium", thinking_only=True)
+        if base_pid == "custom" or responses_adapter.is_responses_only_model(model):
+            # Protocol support is independent of the model catalog. The upstream
+            # validates unknown models' native values; do not erase saved intent.
+            capability = _capability(OPENAI_PROTOCOL_VALUES, default="medium")
+            capability["passthrough"] = True
+            return capability
 
     if base_pid == "deepseek" and model.startswith(DEEPSEEK_THINKING_MODELS):
         return _capability(DEEPSEEK_VALUES, default="high")
@@ -204,6 +218,8 @@ def _legacy_remap(base_pid: str, model: str, effort: str) -> str:
 def _validate_effort(value: object, capability: dict) -> Optional[str]:
     """Pure validation: return ``value`` if it is in the capability's allowed
     set, otherwise fall back to the capability's default. No remapping."""
+    if capability.get("passthrough"):
+        return value.strip() if isinstance(value, str) and value.strip() else capability.get("default")
     effort = str(value or "").strip()
     allowed = [item["value"] for item in capability.get("options", [])]
     if effort in allowed:
@@ -220,6 +236,8 @@ def normalize_reasoning_effort(provider_id: str, model_name: str, value: object)
     capability = get_reasoning_capability(provider_id, model_name)
     if not capability.get("supported"):
         return None
+    if capability.get("passthrough"):
+        return _validate_effort(value, capability)
 
     base_pid = _base_provider_id(provider_id)
     model = (model_name or "").strip().lower()
@@ -248,8 +266,6 @@ def resolve_reasoning_effort(
     base = _base_provider_id(raw)
     model = (model_name or "").strip().lower()
     capability = get_reasoning_capability(base, model)
-    if not capability.get("supported"):
-        return None
 
     # Guard against a malformed persisted value (e.g. a hand-edited config.json
     # or env override that turned the map into a non-dict) so we degrade to the
@@ -259,6 +275,14 @@ def resolve_reasoning_effort(
 
     for key in (f"{raw}:{model}", f"{base}:{model}", model):
         if key in by_model:
+            if not capability.get("supported"):
+                # Explicit model settings can opt an OpenAI-compatible alias in
+                # before its metadata is known. Never infer support for native
+                # providers or enable unknown aliases from a global default.
+                value = by_model[key]
+                if base in ("openai", "custom") and isinstance(value, str) and value.strip():
+                    return value.strip()
+                return None
             return _validate_effort(by_model[key], capability)
 
     return normalize_reasoning_effort(base, model, legacy_value)

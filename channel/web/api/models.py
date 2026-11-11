@@ -2082,6 +2082,7 @@ class ModelsHandler:
               "api_base": "https://...",     # required when creating
               "api_key": "sk-...",           # optional on edit (keep existing)
               "model": "model-name",         # optional default model
+              "api_type": "auto",           # optional: auto / chat / responses
               "make_active": true            # optional, also activate it
             }
         """
@@ -2098,6 +2099,9 @@ class ModelsHandler:
         api_key = api_key_raw.strip() if isinstance(api_key_raw, str) else ""
         model = (data.get("model") or "").strip()
         make_active = bool(data.get("make_active"))
+        from models.openai.responses_adapter import resolve_api_type
+
+        api_type = resolve_api_type(data.get("api_type"))
 
         local_config = copy.deepcopy(conf())
         providers = self._normalize_custom_providers(local_config.get("custom_providers"))
@@ -2111,6 +2115,8 @@ class ModelsHandler:
             entry = {"id": provider_id, "name": name, "api_key": api_key, "api_base": api_base}
             if model:
                 entry["model"] = model
+            if "api_type" in data:
+                entry["api_type"] = api_type
             providers.append(entry)
             created = True
         else:
@@ -2134,6 +2140,8 @@ class ModelsHandler:
                     existing["model"] = model
                 else:
                     existing.pop("model", None)
+            if "api_type" in data:
+                existing["api_type"] = api_type
             created = False
 
         # Decide bot_type — only switch when explicitly requested.

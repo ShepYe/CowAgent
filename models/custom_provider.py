@@ -18,6 +18,7 @@ Config model
           "api_key": "sk-...",             # required
           "api_base": "https://...",       # required, must be OpenAI-compatible
           "model": "model-name",           # optional default model
+          "api_type": "auto",              # optional: auto / chat / responses
           "headers": {"X-Foo": "bar"}      # optional extra HTTP headers
       }
 
@@ -167,3 +168,16 @@ def resolve_custom_headers(bot_type=None):
     if not is_custom or not provider_id:
         return {}
     return get_provider_headers(_find_provider_by_id(get_custom_providers(), provider_id))
+
+
+def resolve_custom_api_type(bot_type=None):
+    """Resolve only this provider's protocol preference; legacy defaults to auto."""
+    from models.openai.responses_adapter import API_TYPE_AUTO, resolve_api_type
+
+    if bot_type is None:
+        bot_type = conf().get("bot_type", "")
+    is_custom, provider_id = parse_custom_bot_type(bot_type)
+    if not is_custom or not provider_id:
+        return API_TYPE_AUTO
+    provider = _find_provider_by_id(get_custom_providers(), provider_id)
+    return resolve_api_type(provider.get("api_type") if provider else None)

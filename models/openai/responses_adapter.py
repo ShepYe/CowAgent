@@ -22,14 +22,15 @@ dicts consumed/produced by ``OpenAIHTTPClient``.
 """
 
 import json
+import re
 from typing import Any, Dict, Generator, List, Optional
 
 from common.log import logger
 
 
-# Models whose tool calling requires the Responses API. Matched by prefix so
-# dated snapshots (gpt-6-astra-2026-..) and future gpt-6 variants are covered.
-_RESPONSES_ONLY_PREFIXES = ("gpt-6",)
+# Client routing default, not a claim about future model capabilities.
+_GPT_VERSION = re.compile(r"^gpt-([0-9]+)(?:\.[0-9]+)*(?:-|$)")
+_THINKING_ONLY_MODEL = re.compile(r"(?:gpt-6-astra|gpt-6\.1-sol)(?:-[0-9]{4}-[0-9]{2}-[0-9]{2})?")
 
 # gpt-6-astra does not support reasoning effort "none"/"minimal"; clamp to the
 # lowest it accepts so a config carried over from gpt-5.x does not 400.
@@ -37,7 +38,7 @@ _MIN_EFFORT_FALLBACK = "low"
 _UNSUPPORTED_EFFORTS = {"none", "minimal"}
 
 # Values of the ``open_ai_api_type`` config key:
-#   auto      - Responses only for models that require it (gpt-6*), else Chat Completions
+#   auto      - default to Responses for GPT major version >= 6, else Chat Completions
 #   chat      - always Chat Completions
 #   responses - always Responses (for endpoints that no longer serve /chat/completions)
 API_TYPE_AUTO = "auto"
@@ -47,11 +48,19 @@ _API_TYPES = {API_TYPE_AUTO, API_TYPE_CHAT, API_TYPE_RESPONSES}
 
 
 def is_responses_only_model(model_name: str) -> bool:
-    """Whether the model must use the Responses API for tool calling."""
+    """Legacy name for the client's overridable Responses routing default."""
     if not model_name or not isinstance(model_name, str):
         return False
     name = model_name.strip().lower()
-    return name.startswith(_RESPONSES_ONLY_PREFIXES)
+    version = _GPT_VERSION.match(name)
+    return bool(version and int(version.group(1)) >= 6)
+
+
+def is_thinking_only_model(model_name: str) -> bool:
+    """Only confirmed Astra/Sol models and their dated snapshots lack none/minimal."""
+    if not model_name or not isinstance(model_name, str):
+        return False
+    return _THINKING_ONLY_MODEL.fullmatch(model_name.strip().lower()) is not None
 
 
 def resolve_api_type(api_type: Optional[str]) -> str:
@@ -73,13 +82,15 @@ def use_responses_api(model_name: str, api_type: Optional[str] = None) -> bool:
 def normalize_effort(effort: Optional[str], model: Optional[str] = None) -> Optional[str]:
     """Map a reasoning effort to one the target model accepts on Responses.
 
-    Only Responses-only models (gpt-6*) lack the "none"/"minimal" tiers; other
-    models (e.g. gpt-5.x) receive the value unchanged.
+    Clamp only confirmed thinking-only models. Calls without a model retain
+    the legacy fallback; unknown and future models keep the requested tier.
     """
     if not effort:
         return None
+    if model is not None and not is_thinking_only_model(model):
+        return effort
     value = str(effort).strip().lower()
-    if value in _UNSUPPORTED_EFFORTS and (model is None or is_responses_only_model(model)):
+    if value in _UNSUPPORTED_EFFORTS and (model is None or is_thinking_only_model(model)):
         return _MIN_EFFORT_FALLBACK
     return value
 
@@ -262,11 +273,19 @@ def build_responses_payload(
 def _cc_usage(usage: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(usage, dict):
         return None
-    return {
+    converted = {
         "prompt_tokens": usage.get("input_tokens") or 0,
         "completion_tokens": usage.get("output_tokens") or 0,
         "total_tokens": usage.get("total_tokens") or 0,
     }
+    for source, target in (
+        ("input_tokens_details", "prompt_tokens_details"),
+        ("output_tokens_details", "completion_tokens_details"),
+    ):
+        details = usage.get(source)
+        if isinstance(details, dict):
+            converted[target] = dict(details)
+    return converted
 
 
 def _status_to_finish_reason(response: Dict[str, Any], has_tool_calls: bool) -> str:

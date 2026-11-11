@@ -7,6 +7,7 @@ Provides a common implementation for bots that are compatible with OpenAI's API 
 This includes: OpenAI, LinkAI, Azure OpenAI, and many third-party providers.
 """
 
+import hashlib
 import json
 import requests
 from typing import Optional
@@ -157,6 +158,11 @@ class OpenAICompatibleBot:
             # Add max_tokens if specified
             if kwargs.get("max_tokens"):
                 request_params["max_tokens"] = kwargs["max_tokens"]
+
+            thinking = kwargs.get("thinking")
+            if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+                if "reasoning_effort" in kwargs:
+                    request_params["reasoning_effort"] = kwargs["reasoning_effort"]
             
             # Add tools if provided
             if tools:
@@ -200,15 +206,15 @@ class OpenAICompatibleBot:
     def _responses_reasoning_effort(cls, model_name, kwargs) -> Optional[str]:
         """Pick the reasoning effort for a Responses request.
 
-        Responses-only models (gpt-6*) have no "none" tier, so they only get an
-        explicit effort. For GPT-5.x / o-series the effort follows the thinking
+        Confirmed thinking-only models only get an explicit effort.
+        For GPT-5.x / o-series the effort follows the thinking
         toggle: disabled -> "none" (same as the Chat Completions tool path),
         enabled -> the configured effort, or the model default when unset.
         """
         from models.openai import responses_adapter
 
         effort = kwargs.get("reasoning_effort")
-        if responses_adapter.is_responses_only_model(model_name):
+        if responses_adapter.is_thinking_only_model(model_name):
             return effort
         thinking = kwargs.get("thinking")
         if isinstance(thinking, dict) and thinking.get("type") == "enabled":
@@ -216,6 +222,21 @@ class OpenAICompatibleBot:
         if cls._is_gpt5_reasoning_model(model_name):
             return "none"
         return None
+
+    @staticmethod
+    def _responses_prompt_cache_key(model_name, api_config, kwargs) -> Optional[str]:
+        """Keep Responses cache routing stable across turns without exposing chat IDs."""
+        from common.runtime_identity import current_identity
+
+        identity = current_identity()
+        session_id = kwargs.get("session_id") or identity.session_id
+        if not session_id:
+            return None
+        scope = json.dumps([
+            api_config.get("api_base") or "", model_name,
+            identity.user_id, identity.agent_id, str(session_id),
+        ], ensure_ascii=False)
+        return "cow_" + hashlib.sha256(scope.encode("utf-8")).hexdigest()[:48]
 
     def _responses_as_chat_completion(self, *, model, messages, api_key=None,
                                       api_base=None, timeout=None, max_tokens=None) -> dict:
@@ -261,6 +282,9 @@ class OpenAICompatibleBot:
             reasoning_effort=self._responses_reasoning_effort(model_name, kwargs),
             response_format=kwargs.get("response_format"),
         )
+        cache_key = self._responses_prompt_cache_key(model_name, api_config, kwargs)
+        if cache_key:
+            payload["prompt_cache_key"] = cache_key
         api_key = api_config.get("api_key")
         api_base = api_config.get("api_base")
         timeout = kwargs.get("request_timeout") or kwargs.get("timeout")

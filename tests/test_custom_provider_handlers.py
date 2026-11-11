@@ -163,6 +163,22 @@ class TestSetCustomProvider(unittest.TestCase):
                     api_base="https://a/v1", model="")
         self.assertNotIn("model", config_module.conf().get("custom_providers")[0])
 
+    def test_optional_api_type_is_saved_and_survives_unrelated_edits(self):
+        from models.custom_provider import resolve_custom_api_type
+
+        res = self.h.call(action="set_custom_provider", name="relay",
+                          api_base="https://relay.invalid/v1", api_type="responses")
+        pid = res["id"]
+        self.assertEqual(resolve_custom_api_type(f"custom:{pid}"), "responses")
+        self.assertEqual(self.h._file_cfg["custom_providers"][0]["api_type"], "responses")
+
+        self.h.call(action="set_custom_provider", id=pid, name="renamed")
+        self.assertEqual(resolve_custom_api_type(f"custom:{pid}"), "responses")
+        self.h.call(action="set_custom_provider", id=pid, name="renamed", api_type="chat")
+        self.assertEqual(resolve_custom_api_type(f"custom:{pid}"), "chat")
+        self.h.call(action="set_custom_provider", id=pid, name="renamed", api_type="invalid")
+        self.assertEqual(resolve_custom_api_type(f"custom:{pid}"), "auto")
+
 
 class TestDeleteCustomProvider(unittest.TestCase):
     def setUp(self):
