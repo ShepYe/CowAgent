@@ -95,9 +95,18 @@ class SourceService:
         with self.transaction() as db:
             previous = db.execute("SELECT * FROM receipts WHERE id=?", (request_id,)).fetchone()
             if previous:
-                if previous["fingerprint"] != fingerprint:
+                receipt = json.loads(previous["record"])
+                # Reading may allocate the document before ingest echoes its
+                # ID. Omitting that same ID later is also a lookup, not a new
+                # association. Keep the original fingerprint/receipt unchanged.
+                same_document = not document_id or document_id == receipt["document_id"]
+                equivalent = {
+                    _hash(_json([digest, filename, origin, target]).encode())
+                    for target in (None, receipt["document_id"])
+                } if same_document else set()
+                if previous["fingerprint"] != fingerprint and previous["fingerprint"] not in equivalent:
                     raise SourceError("idempotency_conflict", "请求标识已用于不同资料")
-                return json.loads(previous["record"])
+                return receipt
             if document_id:
                 if not db.execute("SELECT 1 FROM documents WHERE id=?", (document_id,)).fetchone():
                     raise SourceError("invalid_request", "逻辑资料不存在")

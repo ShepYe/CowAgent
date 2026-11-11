@@ -21,7 +21,8 @@ class KnowledgeIngest(BaseTool):
     params = {"type": "object", "properties": {
         "task_id": {"type": "string"}, "attachment_id": {"type": "string"},
         "path": {"type": "string"}, "purpose": {"type": "string", "enum": ["long_term", "transient", "waiting"]},
-        "document_id": {"type": "string"}, "expected_current_revision": {"type": ["string", "null"]},
+        "document_id": {"type": "string", "description": "沿用 read 返回的资料 ID；不能改绑已有附件。"},
+        "expected_current_revision": {"type": ["string", "null"], "description": "使用 read 返回的 expected_current_revision（当前已发布版本），不是内容 revision_id；首次发布为空。"},
         "reason": {"type": "string"}, "summary": {"type": "string"}},
         "required": ["task_id", "purpose", "reason"]}
 
@@ -86,6 +87,14 @@ class KnowledgeIngest(BaseTool):
                     elif args.get("document_id") and args["document_id"] != source["document_id"]:
                         raise SourceError("version_conflict", "附件已关联另一资料，不能改写已登记来源")
                     doc = service.get(source["document_id"])
+                    expected = args.get("expected_current_revision")
+                    # Older read results exposed only the content revision.
+                    # Accept that echo solely for a pristine, unpublished doc;
+                    # never relax checks after publication or a state change.
+                    if (doc["state"] == 0 and doc["purpose"] == "waiting" and
+                            doc["validity"] == "active" and doc["current"] is None and
+                            expected == source["revision_id"]):
+                        expected = None
                     existing = service.current_publication(doc["id"], source["revision_id"])
                     decision = dict(attachment_id=attachment_id, purpose=purpose, reason=args["reason"],
                                     source=source, workspace=str(service.workspace), ready=False)
@@ -96,7 +105,7 @@ class KnowledgeIngest(BaseTool):
                         if doc["purpose"] != purpose:
                             service.change(doc["id"], purpose=purpose, expected_state=doc["state"], reason=args["reason"])
                         decision["state_revision"] = service.get(doc["id"])["state"]
-                        decision["expected_current_revision"] = args.get("expected_current_revision")
+                        decision["expected_current_revision"] = expected
                         decision["summary"] = args.get("summary")
                         if purpose == "transient":
                             decision.update(result_ref=dict(source, outcome="transient", purpose=purpose,

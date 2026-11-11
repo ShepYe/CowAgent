@@ -115,7 +115,7 @@ class Read(BaseTool):
     """Tool for reading file contents"""
     
     name: str = "read"
-    description: str = f"Read or inspect file contents. For text/PDF/Word/Excel/PPT files, returns content (truncated to {DEFAULT_MAX_LINES} lines or {DEFAULT_MAX_BYTES // 1024}KB). Each line is prefixed with its line number as `12|content` - these prefixes are display aids for locating lines and are NOT part of the file, so strip them whenever you reuse the content (in edit's oldText/newText, when writing it elsewhere, or when quoting it to the user). For images/videos/audio, returns metadata only (file info, size, type). Use offset/limit for large text files."
+    description: str = f"Read or inspect file contents. For text/PDF/Word/Excel/PPT files, returns content (truncated to {DEFAULT_MAX_LINES} lines or {DEFAULT_MAX_BYTES // 1024}KB). Each line is prefixed with its line number as `12|content` - these prefixes are display aids for locating lines and are NOT part of the file, so strip them whenever you reuse the content (in edit's oldText/newText, when writing it elsewhere, or when quoting it to the user). For images/videos/audio, returns metadata only (file info, size, type). Use offset/limit for large text files. 个人附件返回的 revision_id 标识本次读取的内容版本；expected_current_revision 标识资料当前发布版本（可能为空），传给 knowledge_ingest 时使用该字段。PDF 的 offset/limit 在 pages 筛选后的显示片段内续读，续读时保持 pages 不变。"
     
     params: dict = {
         "type": "object",
@@ -203,7 +203,7 @@ class Read(BaseTool):
         if self._is_credential_path(absolute_path):
             return ToolResult.fail(DENIED_MESSAGE)
 
-        attachment_result = self._read_task_attachment(absolute_path, offset, limit)
+        attachment_result = self._read_task_attachment(absolute_path, offset, limit, pages)
         if attachment_result is not None:
             return attachment_result
         
@@ -268,7 +268,7 @@ class Read(BaseTool):
         # Read text file (with truncation for large files)
         return self._read_text(absolute_path, path, offset, limit)
     
-    def _read_task_attachment(self, absolute_path, offset, limit):
+    def _read_task_attachment(self, absolute_path, offset, limit, pages=None):
         """Read authorized hash blobs using their registered original filename.
 
         Extraction remains complete; only the returned source units are paged.
@@ -297,10 +297,22 @@ class Read(BaseTool):
             receipt = service.receive(attachment["path"], filename=attachment["filename"],
                 request_id=f"{task_id}:{attachment['attachment_id']}", origin=task["origin"])
             parsed = service.parse(receipt["revision_id"])
+            page_range = None
+            if Path(attachment["filename"]).suffix.lower() in self.pdf_extensions:
+                from pypdf import PdfReader
+                # Parsed units omit blank pages, including trailing ones.
+                # Read only the page count from the authorized original;
+                # keep the persisted extraction and parse identity unchanged.
+                total_pages = len(PdfReader(attachment["path"]).pages)
+                page_range = _parse_page_range(pages, total_pages)
             # Preserve full locations while splitting very large physical pages
             # into display fragments; text offsets make every fragment resumable.
             units = []
             for ordinal, unit in enumerate(parsed["units"]):
+                if page_range is not None and not (
+                    page_range[0] <= unit["location"]["physical_page"] <= page_range[1]
+                ):
+                    continue
                 for begin in range(0, len(unit["text"]), 2000):
                     units.append(dict(unit, text=unit["text"][begin:begin+2000], ordinal=ordinal,
                                       text_start=begin, text_end=min(begin+2000, len(unit["text"]))))
@@ -309,19 +321,30 @@ class Read(BaseTool):
             if type(offset) is not int or type(limit) is not int or limit <= 0:
                 return ToolResult.fail({"code": "invalid_request", "message": "offset/limit 须为整数且 limit 大于零"})
             start = max(0, len(units) + offset) if offset < 0 else max(0, offset-1)
-            selected, used = [], 0
+            selected = []
+            result = dict(document_id=receipt["document_id"], revision_id=receipt["revision_id"],
+                expected_current_revision=service.get(receipt["document_id"])["current"],
+                parse_id=parsed["parse_id"], attachment_id=attachment["attachment_id"], filename=attachment["filename"],
+                units=selected, total_units=len(units), offset=start+1, has_more=True,
+                next_offset=len(units)+1, published=False, searchable=False, display_fragments=True)
+            if page_range is not None:
+                first_page, last_page = page_range
+                result.update(total_pages=total_pages, pages_read=f"{first_page}-{last_page}",
+                              next_pages=f"{last_page+1}-" if last_page < total_pages else None)
+            # Include metadata and JSON separators in the budget. Leave room
+            # below the Agent's 50000-character cutoff so continuation survives.
+            budget = min(DEFAULT_MAX_BYTES, 45000)
+            used = len(json.dumps(result, ensure_ascii=False, default=str).encode("utf-8")) + 32
             for unit in units[start:start+min(limit, 200)]:
-                size = len(json.dumps(unit, ensure_ascii=False, default=str).encode("utf-8"))
-                if selected and used + size > DEFAULT_MAX_BYTES:
+                size = len(json.dumps(unit, ensure_ascii=False, default=str).encode("utf-8")) + 2
+                if selected and used + size > budget:
                     break
                 selected.append(unit)
                 used += size
             next_index = start + len(selected)
-            return ToolResult.success(dict(document_id=receipt["document_id"], revision_id=receipt["revision_id"],
-                parse_id=parsed["parse_id"], attachment_id=attachment["attachment_id"], filename=attachment["filename"],
-                units=selected, total_units=len(units), offset=start+1, has_more=next_index < len(units),
-                next_offset=next_index+1 if next_index < len(units) else None,
-                published=False, searchable=False, display_fragments=True))
+            result.update(has_more=next_index < len(units),
+                          next_offset=next_index+1 if next_index < len(units) else None)
+            return ToolResult.success(result)
         except Exception as exc:
             return ToolResult.fail({"code": getattr(exc, "code", "invalid_request"), "message": str(exc)})
 

@@ -44,6 +44,16 @@ def _parse_channel_type(raw) -> list:
     return []
 
 
+def _startup_channel_log_entries(channel_names: list) -> list:
+    """仅记录渠道身份和类型，避免实例 repr 泄露凭据。"""
+    from channel.channel_instances import ChannelInstance
+
+    return [
+        (entry.instance_id, entry.channel_type) if isinstance(entry, ChannelInstance) else entry
+        for entry in channel_names
+    ]
+
+
 def _has_web_entry(channel_names: list) -> bool:
     """True if the web console is already in the startup list (string or instance)."""
     from channel.channel_instances import ChannelInstance
@@ -848,7 +858,7 @@ def run():
         else:
             _warmup_scheduler()
 
-        logger.info(f"[App] Starting channels: {channel_names}")
+        logger.info(f"[App] Starting channels: {_startup_channel_log_entries(channel_names)}")
 
         channel_mgr = ChannelManager()
         set_channel_manager(channel_mgr)
