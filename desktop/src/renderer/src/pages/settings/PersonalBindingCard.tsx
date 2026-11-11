@@ -14,7 +14,8 @@ const tips: Record<keyof PersonalBinding, string> = {
 }
 const emptyBinding: PersonalBinding = { channel_instance_id: '', app_id: '', tenant_id: '', sender_open_id: '' }
 const button = 'px-3 py-2 rounded-btn border border-default text-sm disabled:opacity-50'
-const savedMessage = '本人绑定已保存，请回渠道重新连接'
+const savedMessage = '本人绑定已保存，可以在飞书发送消息验证'
+const manualSavedMessage = '本人绑定已保存，请回渠道重新连接'
 
 export default function PersonalBindingCard() {
   const [binding, setBinding] = useState<PersonalBinding>(emptyBinding)
@@ -103,7 +104,7 @@ export default function PersonalBindingCard() {
     setBusy(true); notice('')
     try {
       const res = await apiClient.personalBinding(binding)
-      notice(res.status === 'success' ? savedMessage : res.message || '保存失败', res.status !== 'success')
+      notice(res.status === 'success' ? manualSavedMessage : res.message || '保存失败', res.status !== 'success')
     } catch (e) { notice(e instanceof Error ? e.message : '保存失败', true) }
     finally { setBusy(false) }
   }
@@ -134,7 +135,7 @@ export default function PersonalBindingCard() {
     {pairing.state === 'expired' && <div role="status" className="text-sm text-warning">绑定码已过期，请重新开始绑定</div>}
     {pairing.state === 'idle' && binding.sender_open_id && <div className="text-sm text-content-secondary">已绑定本人飞书</div>}
     {message && <div role={error ? 'alert' : 'status'} className={`text-sm ${error ? 'text-danger' : 'text-content-secondary'}`}>{message}</div>}
-    {(pairing.state === 'confirmed' || message === savedMessage) && <Link className="inline-block text-sm text-accent hover:underline" to="/channels">回渠道重新连接</Link>}
+    {(pairing.state === 'confirmed' || message === manualSavedMessage) && <Link className="inline-block text-sm text-accent hover:underline" to="/channels">{message === manualSavedMessage ? '回渠道重新连接' : '返回渠道'}</Link>}
     <details className="border-t border-default pt-3">
       <summary className="text-sm text-content-secondary cursor-pointer">高级：手工绑定（备用）</summary>
       <div className="space-y-3 mt-3">

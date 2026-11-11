@@ -546,6 +546,22 @@ class FeiShuChanel(ChatChannel):
             asyncio.set_event_loop(loop)
             ws_client_mod = _new_lark_ws_client_module(loop)
 
+            # start() blocks while connected, and the SDK can reconnect inside
+            # it. Observe the handshake itself so recovered connections retire
+            # errors exposed by the channel cards and the pairing guide.
+            channel = self
+
+            class ObservedClient(ws_client_mod.Client):
+                async def _connect(self):
+                    try:
+                        await super()._connect()
+                    except Exception as exc:
+                        if channel._ws_client is self and not channel._ws_stop_event.is_set():
+                            channel.report_startup_error(str(exc))
+                        raise
+                    if channel._ws_client is self and not channel._ws_stop_event.is_set():
+                        channel.report_startup_success()
+
             # Retry until stop() instead of giving up: a failed handshake
             # raises ClientException, which lark_oapi/ws/client.py re-raises
             # without going through auto_reconnect, so the SDK will not
@@ -561,7 +577,7 @@ class FeiShuChanel(ChatChannel):
             error_reported = False
             while True:
                 try:
-                    ws_client = ws_client_mod.Client(
+                    ws_client = ObservedClient(
                         self.feishu_app_id,
                         self.feishu_app_secret,
                         event_handler=event_handler,

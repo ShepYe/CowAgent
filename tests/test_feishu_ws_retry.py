@@ -1,6 +1,7 @@
 """Retry loop of the Feishu websocket thread (_startup_websocket)."""
 
 import ssl
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -116,3 +117,50 @@ def test_stop_during_backoff_exits_loop(monkeypatch):
     assert verified == [True]
     assert stop.timeouts == [5]
     assert reported == ["boom"]
+
+
+@pytest.mark.parametrize("binding_required", [False, True])
+@pytest.mark.parametrize("sdk_retry", [False, True])
+def test_recovered_handshake_updates_live_channel_state(monkeypatch, binding_required, sdk_retry):
+    """Both SDK reconnects and our outer retries must retire a stale error."""
+    channel = FeiShuChanel.new_instance()
+    channel._personal_binding_required = binding_required
+    attempts = []
+    errors_before_recovery = []
+
+    def client_module(loop):
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def _connect(self):
+                attempts.append(1)
+                if len(attempts) == 1:
+                    raise ConnectionError("fixture handshake failed")
+
+            def start(self):
+                try:
+                    loop.run_until_complete(self._connect())
+                except ConnectionError:
+                    if not sdk_retry:
+                        raise
+                    errors_before_recovery.append(channel._startup_error)
+                    loop.run_until_complete(self._connect())
+
+        return SimpleNamespace(Client=FakeClient)
+
+    def backoff(timeout):
+        errors_before_recovery.append(channel._startup_error)
+        return False
+
+    monkeypatch.setattr(feishu_channel, "_ensure_lark_imported", lambda: None)
+    monkeypatch.setattr(feishu_channel, "lark", MagicMock())
+    monkeypatch.setattr(feishu_channel, "_new_lark_ws_client_module", client_module)
+    monkeypatch.setattr(channel._ws_stop_event, "wait", backoff)
+    channel._startup_websocket()
+
+    assert len(attempts) == 2
+    assert errors_before_recovery == ["fixture handshake failed"]
+    assert channel._startup_error is None
+    assert channel._startup_event.is_set()
+    assert channel._personal_binding_required is binding_required
