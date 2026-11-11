@@ -35,6 +35,7 @@ def _error(exc, task=None):
         'pairing_unavailable': '绑定码已失效或机器人配置已改变，请重新开始绑定',
         'channel_unavailable': '请先在渠道页配置并连接飞书机器人',
         'websocket_required': '引导绑定需要飞书长连接模式',
+        'config_unavailable': '原任务配置已不可用，请按当前配置重新处理',
     }.get(code, '请求无法完成'), task=task)
 
 
@@ -135,6 +136,8 @@ class PersonalTaskHandler:
                 task = store.cancel(OWNER, task_id, attempt)
             elif action == 'retry':
                 task = store.retry(OWNER, task_id, attempt)
+            elif action == 'resubmit':
+                task = _resubmit(store, task_id, attempt, body.get('request_id'))
             elif action == 'update_input':
                 task = store.update_input(OWNER, task_id, attempt, body.get('input'))
             elif action in {'withdraw', 'correct', 'change_purpose', 'republish'}:
@@ -171,6 +174,59 @@ class PersonalTaskHandler:
             if getattr(exc, 'code', '') == 'version_conflict':
                 latest = store.get(OWNER, task_id)
             return _error(exc, latest)
+
+
+def _resubmit(store, task_id, attempt, request_id):
+    """Explicit new admission; the failed task never switches configuration."""
+    if not isinstance(request_id, str) or not request_id or len(request_id) > 200:
+        raise TaskError('invalid_request')
+    from models.config_revision import capture_config_revision
+    revision = capture_config_revision()
+    # Keep dispatch/recovery from seeing the child before all attachments are
+    # copied. Verified blobs already exist; no new user-controlled path is read.
+    with store.lock, store._transaction() as db:
+        parent = store._read(db, OWNER, task_id)
+        if parent['attempt'] != attempt:
+            raise TaskError('version_conflict')
+        if (parent['status'] != 'failed' or (parent.get('error') or {}).get('code') != 'config_unavailable' or
+                not parent['attachments'] or parent['result_refs'] or parent.get('source_candidates') or
+                'source_action' in parent['payload']):
+            raise TaskError('invalid_request')
+        # TaskStore.attachment opens another transaction; validate equivalent
+        # checks here while holding the admission transaction instead.
+        attachments = []
+        for item in parent['attachments']:
+            path = Path(item['path']).resolve()
+            if (path.parent != (store.root / 'originals').resolve() or
+                    hashlib.sha256(path.read_bytes()).hexdigest() != item['sha256']):
+                raise TaskError('storage_failed')
+            attachments.append(dict(item))
+        import copy
+        payload = copy.deepcopy(parent['payload'])
+        if parent.get('clarification'):
+            payload['text'] = payload.get('text', '') + '\n' + parent['clarification']
+        origin = dict(parent['origin'], parent_task_id=task_id)
+        # Prefix the client id with the parent/attempt so it cannot collide
+        # with uploads or another failed task's submission.
+        key = f'resubmit:{task_id}:{attempt}:{request_id}'
+        fingerprint = hashlib.sha256(json.dumps({'payload': payload, 'origin': origin},
+            ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        old = db.execute('SELECT fingerprint,record FROM tasks WHERE owner=? AND request_id=?', (OWNER, key)).fetchone()
+        if old:
+            if old[0] != fingerprint:
+                raise TaskError('idempotency_conflict')
+            return json.loads(old[1])
+        from common.personal_tasks import now
+        from uuid import uuid4
+        task = dict(schema_version=1, receipt_id=uuid4().hex, task_id=uuid4().hex, request_id=key,
+            owner_id=OWNER, origin=origin, payload=payload, status='queued', stage='receive', attempt=1,
+            config_revision=revision, attachments=attachments, result_refs=[], outcome=None, error=None,
+            notification='pending', created_at=now(), updated_at=now())
+        if parent.get('download_complete'):
+            task['download_complete'] = True
+        db.execute('INSERT INTO tasks VALUES(?,?,?,?,?)', (task['task_id'], OWNER, key, fingerprint,
+            json.dumps(task, ensure_ascii=False, sort_keys=True, separators=(',', ':'))))
+        return store._save(db, task)
 
 
 def _republish(store, parent, ref, state, reason, request_id, service):

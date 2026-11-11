@@ -1390,9 +1390,9 @@ class ApiClient {
     return this.postFormData('/api/personal/tasks', form)
   }
 
-  async personalAction(task: PersonalTask, action: string, input?: string, source?: PersonalSourceAction): Promise<PersonalResponse> {
+  async personalAction(task: PersonalTask, action: string, input?: string, source?: PersonalSourceAction, requestId?: string): Promise<PersonalResponse> {
     return this.request(`/api/personal/tasks/${encodeURIComponent(task.task_id)}`, {
-      method: 'POST', body: JSON.stringify({ action, attempt: task.attempt, input, ...source }),
+      method: 'POST', body: JSON.stringify({ action, attempt: task.attempt, input, ...source, ...(requestId ? { request_id: requestId } : {}) }),
     })
   }
 
@@ -1695,7 +1695,7 @@ export interface PersonalTask {
   config_revision: string
   notification: string
   error?: { code: string; message?: string; retryable?: boolean }
-  payload?: { text?: string; filename?: string }
+  payload?: { text?: string; filename?: string; source_action?: Record<string, unknown> }
   attachments: { attachment_id: string; filename: string; sha256: string }[]
   result_refs: Record<string, unknown>[]
 }

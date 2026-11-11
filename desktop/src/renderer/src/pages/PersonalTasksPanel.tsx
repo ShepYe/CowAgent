@@ -6,17 +6,20 @@ import apiClient, { type PersonalTask, type PersonalSourceAction, type PersonalR
 const statuses: Record<string, string> = { queued: '已接收', running: '处理中', waiting_input: '等待补充', succeeded: '已完成', failed: '失败', cancelled: '已取消', needs_reconcile: '待核对' }
 const stages: Record<string, string> = { receive: '接收', download: '保存原件', decide: '判断用途', parse: '解析', publish: '发布', pending_index: '已保存，待索引', done: '完成' }
 const outcomes: Record<string, string> = { published: '可检索', transient: '临时使用', duplicate: '重复资料' }
+const canResubmit = (task: PersonalTask) => task.status === 'failed' && task.error?.code === 'config_unavailable' && task.attachments.length > 0 && !task.result_refs.length && !task.payload?.source_action
 
 export default function PersonalTasksPanel() {
   const [tasks, setTasks] = useState<PersonalTask[]>([])
   const [reference, setReference] = useState<{ taskId: string; publishId: string } | null>(null)
   const [referenceVersion, setReferenceVersion] = useState(0)
   const [message, setMessage] = useState('')
+  const [success, setSuccess] = useState('')
   const [busy, setBusy] = useState('')
   const [text, setText] = useState('')
   const [file, setFile] = useState<File | null>(null)
   const [inputs, setInputs] = useState<Record<string, string>>({})
   const requestId = useRef(crypto.randomUUID())
+  const resubmitRequestIds = useRef(new Map<string, string>())
   const fileInput = useRef<HTMLInputElement>(null)
   const load = useCallback(async () => {
     try {
@@ -33,7 +36,7 @@ export default function PersonalTasksPanel() {
   const submit = async () => {
     if (!file || busy) return
     if (file.size > 100 * 1024 * 1024) { setMessage('文件超过 100 MiB 上限'); return }
-    setBusy('submit'); setMessage('')
+    setBusy('submit'); setMessage(''); setSuccess('')
     try {
       const res = await apiClient.submitPersonal(file, text, requestId.current)
       if (res.status !== 'success') throw new Error(res.message || '提交失败')
@@ -44,11 +47,19 @@ export default function PersonalTasksPanel() {
     finally { setBusy('') }
   }
   const action = async (task: PersonalTask, name: string, source?: PersonalSourceAction) => {
+    if (busy || (name === 'resubmit' && !canResubmit(task))) return
     if (name === 'withdraw' && !(await askConfirm({ titleKey: 'personal_withdraw', msgKey: 'personal_withdraw_confirm', okKey: 'personal_withdraw' }))) return
-    setBusy(task.task_id); setMessage('')
+    setBusy(task.task_id); setMessage(''); setSuccess('')
     try {
-      const res = await apiClient.personalAction(task, name, inputs[task.task_id], source)
+      let resubmitRequestId: string | undefined
+      if (name === 'resubmit') {
+        const key = `${task.task_id}:${task.attempt}`
+        resubmitRequestId = resubmitRequestIds.current.get(key) ?? crypto.randomUUID()
+        resubmitRequestIds.current.set(key, resubmitRequestId)
+      }
+      const res = await apiClient.personalAction(task, name, inputs[task.task_id], source, resubmitRequestId)
       if (res.status !== 'success') throw new Error(res.message || '操作失败')
+      setSuccess(name === 'resubmit' ? '已创建新任务，使用当前配置处理原附件，旧任务记录已保留。' : '操作成功')
       setReferenceVersion(v => v + 1)
     } catch (e) { setMessage(e instanceof Error ? e.message : '操作失败') }
     finally { await load(); setBusy('') }
@@ -64,16 +75,17 @@ export default function PersonalTasksPanel() {
     </div>
     {reference && <ReferenceBrowser taskId={reference.taskId} publishId={reference.publishId} version={`${referenceVersion}:${JSON.stringify(tasks.find(t => t.task_id === reference.taskId)?.result_refs.map(r => r.source_state))}`} onClose={() => setReference(null)} />}
     {message && <div role="alert" className="text-danger text-sm">{message}</div>}
+    {success && <div role="status" className="text-sm">{success}</div>}
     {!tasks.length && <div className="text-content-tertiary text-sm">暂无资料任务</div>}
     {tasks.map(task => <article key={task.task_id} className="rounded-lg border border-default p-4 space-y-2">
       <div className="flex justify-between gap-3"><strong>{task.attachments.map(a => a.filename).join('、') || task.payload?.filename || task.task_id}</strong><span>{statuses[task.status] || task.status} · {stages[task.stage] || task.stage}{task.outcome ? ` · ${task.outcome === 'published' && !task.result_refs.some(ref => ref.current_searchable) ? '历史发布（当前不可检索）' : outcomes[task.outcome] || task.outcome}` : ''}</span></div>
       <div className="text-xs text-content-tertiary" title={`任务 ${task.task_id}\n配置 ${task.config_revision}\n通知 ${task.notification}`}>第 {task.attempt} 次 · {new Date(task.updated_at).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })} <span>?</span></div>
-      {task.error && <div role="alert" className="text-danger text-sm">{task.error.code} · {task.error.message}</div>}
+      {task.error && <div role="alert" className="text-danger text-sm">{task.error.code === 'config_unavailable' ? '任务原配置不可用，无法继续使用原配置处理。' : `${task.error.code}${task.error.message ? ` · ${task.error.message}` : ''}`}</div>}
       {task.response && <Markdown content={task.response} />}
 
       {task.status === 'waiting_input' && <div className="flex gap-2"><label className="flex-1">{task.question}<input aria-label="补充用途" className="w-full bg-inset border border-default rounded-btn px-3 py-2" value={inputs[task.task_id] || ''} onChange={e => setInputs({ ...inputs, [task.task_id]: e.target.value })} /></label><button className={button} disabled={!!busy || !inputs[task.task_id]?.trim()} onClick={() => void action(task, 'update_input')}>补充用途</button></div>}
       <div className="flex gap-2 flex-wrap">
-        {task.status === 'failed' && task.error?.retryable && <button className={button} disabled={!!busy} onClick={() => void action(task, 'retry')}>重试</button>}
+        {canResubmit(task) ? <button className={button} disabled={!!busy} title="复用原附件，按当前配置创建新任务；旧任务及其记录会保留。请求失败后可再次点击。" onClick={() => void action(task, 'resubmit')}>按当前配置重新处理</button> : task.status === 'failed' && task.error?.code !== 'config_unavailable' && task.error?.retryable && <button className={button} disabled={!!busy} onClick={() => void action(task, 'retry')}>重试</button>}
         {['queued', 'running', 'waiting_input'].includes(task.status) && <button className={button} disabled={!!busy} onClick={() => void action(task, 'cancel')}>{busy === task.task_id ? '处理中…' : '取消'}</button>}
 
         {task.attachments.map(a => <a className={button} key={a.attachment_id} href={apiClient.personalOriginal(task.task_id, a.attachment_id)} target="_blank" rel="noreferrer" title={a.filename}>打开原件</a>)}

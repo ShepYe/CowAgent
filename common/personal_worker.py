@@ -116,6 +116,9 @@ def _run(task_id):
         task = store.get(OWNER, task_id)
         if task["status"] == "running":
             code = getattr(exc, "code", "processing_failed")
+            from common.log import logger
+            logger.warning('[PersonalTask] task=%s attempt=%s stage=%s failed code=%s',
+                           task_id, task['attempt'], task['stage'], code)
             store.fail(OWNER, task_id, task["attempt"], code, task["stage"])
             _notify(store, store.get(OWNER, task_id), f"处理未完成：{code}。任务 {task_id} 可在桌面查看或重试。")
     finally:
