@@ -1197,6 +1197,8 @@ export interface KnowledgeCatalogPage {
   page_version: string
   publish_id?: string
   title: string
+  /** 内容版本摘要；旧服务可能缺失。 */
+  summary?: string
   category: string
   category_mode: 'auto' | 'manual'
   category_revision: number
@@ -1240,6 +1242,7 @@ export interface KnowledgeVersion {
   page_version: string
   publish_id: string
   title: string
+  summary?: string
   category: string
   content: string
   created_at: string

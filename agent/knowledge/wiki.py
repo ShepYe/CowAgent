@@ -3,6 +3,7 @@ import hashlib
 import json
 import posixpath
 import re
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -11,6 +12,27 @@ from urllib.parse import unquote, urlsplit
 from common.atomic_write import write_text_atomic
 from agent.knowledge.parser import SourceError
 from agent.knowledge.personal_assistant import SourceService, _hash, _json
+
+
+def validate_page_summaries(pages):
+    """新输入统一校验；历史候选直接发布，不经过此入口。"""
+    if not isinstance(pages, list) or not pages or len(pages) > 100:
+        raise SourceError('invalid_request', '须提交非空知识页数组（最多100页）')
+    summaries = []
+    for page in pages:
+        summary = page.get('summary') if isinstance(page, dict) else None
+        if (not isinstance(summary, str)
+                or any(unicodedata.category(c) in {'Cc', 'Cs', 'Zl', 'Zp'} for c in summary)
+                or not 1 <= len(summary.strip()) <= 160):
+            raise SourceError('invalid_request', '每页 summary 须为1～160个Unicode码点的单行纯文本，禁止换行及控制字符；请补齐后重新提交')
+        summaries.append(summary.strip())
+    return summaries
+
+
+def _index_text(text):
+    """将纯文本安全地呈现在 Markdown 目录中。"""
+    import html
+    return re.sub(r'([\\`*_{}\[\]()#!|~])', r'\\\1', html.escape(text, quote=False))
 
 
 def ensure_schema(db):
@@ -196,11 +218,18 @@ def _project_indexes(db, service):
             content = _strip_registered_index_entries(content, registered_paths)
         content = content.rstrip()
         lines = []
+        category = None
         for record in sorted(records, key=lambda r: (r['category'], r['title'], r['page_id'])):
-            title = record['title'].replace('[', '\\[').replace(']', '\\]')
+            title = _index_text(record['title'])
             path_ref = record['path'].removeprefix('knowledge/')
             if name == 'index.md':
-                lines.append(f"- [{title}](./{path_ref}) — {record['category']}")
+                if category != record['category']:
+                    category = record['category']
+                    lines.append(f"## {_index_text(category)}")
+                line = f"- [{title}](./{path_ref})"
+                if record.get('summary'):
+                    line += ' — ' + _index_text(record['summary'])
+                lines.append(line)
             else:
                 lines.append(f"## [{record.get('created_at', '')[:10]}] ingest | [{title}](./{path_ref})")
         generated = start + '\n' + '\n'.join(lines) + '\n' + end
@@ -241,7 +270,7 @@ def _ref(record, source_ordinal=0, db=None):
     sources = [dict(_public_source(s), source_ordinal=i) for i, s in enumerate(record['sources'])]
     main = sources[source_ordinal]
     return dict(**{k: main[k] for k in ('document_id', 'revision_id', 'parse_id', 'ordinal', 'location', 'filename', 'source_state_snapshot')},
-                title=record['title'], category=record['category'], category_mode=record.get('category_mode', 'auto'),
+                title=record['title'], summary=record.get('summary', ''), category=record['category'], category_mode=record.get('category_mode', 'auto'),
                 category_revision=record.get('category_revision', 0), page_id=record['page_id'],
                 page_version=record['page_version'], publish_id=record['page_version'], path=record['path'],
                 sources=sources, related_page_ids=record['related_page_ids'], depends_on=record['depends_on'],
@@ -261,8 +290,7 @@ class WikiService:
             refresh(db, self.source)
 
     def prepare(self, pages, task_id=None):
-        if not isinstance(pages, list) or not pages or len(pages) > 100:
-            raise SourceError('invalid_request', '须提交非空知识页数组（最多100页）')
+        summaries = validate_page_summaries(pages)
         if task_id is not None and (not isinstance(task_id, str) or not task_id):
             raise SourceError('invalid_request', '任务身份无效')
         try:
@@ -277,7 +305,7 @@ class WikiService:
                 if old:
                     return json.loads(old[0])
             batch_id, records, ids = uuid4().hex, [], set()
-            for page in pages:
+            for page, summary in zip(pages, summaries):
                 if not isinstance(page, dict):
                     raise SourceError('invalid_request', '知识页必须为对象')
                 page_id = page.get('page_id') or uuid4().hex
@@ -323,7 +351,7 @@ class WikiService:
                     deps[dep['page_id']] = dep['page_version']
                 version = uuid4().hex
                 slug = re.sub(r'[^\w-]+', '-', title.strip().lower()).strip('-')[:60] or 'page'
-                record = dict(page_id=page_id, page_version=version, expected_version=expected, title=title.strip(), category=category,
+                record = dict(page_id=page_id, page_version=version, expected_version=expected, title=title.strip(), summary=summary, category=category,
                               path=f'knowledge/wiki/{category}/{slug}-{version}.md', blocks=normalized,
                               sources=[s for _, s in source_map.values()], related_page_ids=list(dict.fromkeys(related)),
                               depends_on=[dict(page_id=p, page_version=v) for p, v in sorted(deps.items())], task_id=task_id,

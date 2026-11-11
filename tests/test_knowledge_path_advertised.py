@@ -6,12 +6,11 @@ every ``read`` at the workspace, where none of the pages are, so the Agent is
 handed an index of pages it cannot open (#3175 follow-up).
 """
 
-import os
 from pathlib import Path
 
 import pytest
 
-from agent.prompt.builder import _knowledge_base_path
+from agent.prompt.builder import _knowledge_base_path, _build_knowledge_section
 from agent.tools.memory.memory_search import MemorySearchTool
 
 
@@ -34,6 +33,21 @@ def shared(tmp_path, monkeypatch):
 
 
 class TestPromptPath:
+    @pytest.mark.parametrize("language", ["zh", "en"])
+    @pytest.mark.parametrize("project_mode", [False, True])
+    def test_large_shared_index_read_hint_anchors_to_actual_root(self, shared, language, project_mode):
+        shared_root, workspace = shared
+        content = "# Index\n## 工程\n" + "\n".join(
+            f"- [完整标题{i}](engineering/page{i}.md) — " + "摘要" * 80 for i in range(60))
+        (shared_root / "index.md").write_text(content, encoding="utf-8")
+        project = str(workspace.parent / "other-project") if project_mode else None
+        prompt = "\n".join(_build_knowledge_section(str(workspace), language, project))
+        assert f"`{shared_root}/index.md`" in prompt
+        assert "offset/limit" in prompt
+        assert "memory_search" in prompt
+        assert "[完整标题59](engineering/page59.md)" in prompt
+        assert "摘要" * 20 + "… [缩略/truncated]" in prompt
+
     def test_an_agent_on_the_shared_copy_is_told_where_it_really_is(self, shared):
         shared_root, workspace = shared
         assert _knowledge_base_path(str(workspace)) == str(shared_root)

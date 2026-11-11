@@ -56,7 +56,8 @@ def catalog_api(tmp_path, monkeypatch):
 
 
 def publish_topic(root, *, page_id='budget', title='链路预算', category='技术/射频',
-                  content='可靠预算为42 dB。', previous=None, sources=None, depends_on=None):
+                  content='可靠预算为42 dB。', previous=None, sources=None, depends_on=None,
+                  summary='说明链路预算及其适用范围。'):
     service = SourceService(root)
     if sources is None:
         original = root / '资料.txt'
@@ -67,7 +68,7 @@ def publish_topic(root, *, page_id='budget', title='链路预算', category='技
         parsed = service.parse(source['revision_id'])
         sources = [dict(document_id=source['document_id'], revision_id=source['revision_id'],
                         parse_id=parsed['parse_id'], ordinal=0)]
-    page = dict(page_id=page_id, title=title, category=category,
+    page = dict(page_id=page_id, summary=summary, title=title, category=category,
                 blocks=[dict(content=content, sources=sources)], related_page_ids=[], depends_on=depends_on or [])
     if previous:
         page['expected_version'] = previous['page_version']
@@ -585,3 +586,79 @@ def test_full_backup_history_and_manual_lock_work_with_old_root_offline(catalog_
     for revision, old in originals_before.items():
         assert file_hash(restored_service.registered_revision(old['document_id'], revision)['original']) == hashes_before[revision]
         assert file_hash(offline / Path(old['original']).relative_to(root)) == hashes_before[revision]
+
+
+
+def test_summary_consistent_in_api_catalog_receipts_history_and_version(catalog_api):
+    api = catalog_api
+    root = api.roots['alpha']
+    first = publish_topic(root, summary='历史摘要专用词')
+    second = publish_topic(root, previous=first, sources=first['sources'], summary='当前摘要专用词')
+    changed = api.action('set_page_category', second, category='摘要分类')['payload']
+    assert changed['summary'] == '当前摘要专用词'
+    assert changed['page_version'] == second['page_version']
+    pages = api.request('KnowledgeCatalogHandler')['pages']
+    assert len(pages) == 1 and pages[0]['summary'] == '当前摘要专用词'
+    assert api.request('KnowledgeVersionHandler', publish_id=first['publish_id'])['version']['summary'] == '历史摘要专用词'
+    events = api.request('KnowledgeHistoryHandler')['events']
+    assert {e['summary'] for e in events} == {'当前摘要专用词', '历史摘要专用词'}
+    assert next(e for e in events if e['event_type'] == 'category_changed')['summary'] == '当前摘要专用词'
+    assert WikiService(root).read_reference(second['publish_id'])['summary'] == '当前摘要专用词'
+
+
+def test_legacy_index_summary_reaches_web_search_without_history_aliasing(catalog_api):
+    import subprocess
+    from urllib.parse import quote
+
+    api = catalog_api
+    root = api.roots['alpha']
+    knowledge = root / 'knowledge'
+    for relative in ('notes/中文.md', 'other/中文.md', 'root.md'):
+        path = knowledge / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('# 同名知识\n普通正文。', encoding='utf-8')
+    old = publish_topic(root, summary='历史独有词')
+    current = publish_topic(root, previous=old, sources=old['sources'], summary='当前摘要词')
+    index = knowledge / 'index.md'
+    with index.open('a', encoding='utf-8') as handle:
+        handle.write(f'\n- [同名知识]({quote("notes/中文.md")}) — 仅摘要出现旧页预算\n'
+                     '- [同名知识](root.md) — 根目录摘要\n'
+                     '- [同名知识](../other/中文.md) — 越界摘要\n'
+                     '- [索引](index.md) — 不应附加管理页摘要\n'
+                     f'- [旧页]({old["path"].removeprefix("knowledge/")}) — 历史独有词\n')
+
+    result = api.request('KnowledgeListHandler')
+    assert result['status'] == 'success', result
+    rows = {row['name']: row for row in result['root_files']}
+    assert rows['root.md']['summary'] == '根目录摘要'
+    assert rows['index.md']['summary'] == ''
+    by_category = {group['dir']: group for group in result['tree']}
+    assert by_category['notes']['files'][0]['summary'] == '仅摘要出现旧页预算'
+    assert by_category['other']['files'][0]['summary'] == ''
+    assert '历史独有词' not in json.dumps(result, ensure_ascii=False)
+    assert current['summary'] in json.dumps(result, ensure_ascii=False)
+    assert '越界摘要' not in json.dumps(result, ensure_ascii=False)
+    assert '仅摘要出现旧页预算' not in json.dumps(api.request('KnowledgeListHandler', agent='beta'), ensure_ascii=False)
+
+    # Exercise the actual Web predicates using the real handler response.
+    script = r'''
+const fs = require('node:fs'), vm = require('node:vm'), assert = require('node:assert/strict');
+const data = JSON.parse(fs.readFileSync(0, 'utf8'));
+const sandbox = { localStorage: { getItem: () => '' }, createDocEditor: () => ({}) };
+vm.createContext(sandbox);
+vm.runInContext(fs.readFileSync('channel/web/static/js/views/knowledge.js', 'utf8'), sandbox);
+assert.equal(sandbox._hasFilterMatch(data.tree, '旧页预算'), true);
+const matches = [];
+function walk(groups, parent = '') {
+  for (const group of groups) {
+    const path = parent ? parent + '/' + group.dir : group.dir;
+    for (const row of group.files) if (sandbox._knowledgeFileMatches(row, '旧页预算')) matches.push(path + '/' + row.name);
+    walk(group.children || [], path);
+  }
+}
+walk(data.tree);
+assert.deepEqual(matches, ['notes/中文.md']);
+assert.equal(sandbox._hasFilterMatch(data.tree, '历史独有词'), false);
+'''
+    subprocess.run(['node', '-e', script], input=json.dumps(result, ensure_ascii=False),
+                   text=True, encoding='utf-8', check=True, capture_output=True)

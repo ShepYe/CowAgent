@@ -1,4 +1,5 @@
 import React, { useState } from 'react'
+import { createPortal } from 'react-dom'
 import { ChevronDown, ChevronRight, FileText, Lock, Search } from 'lucide-react'
 import type { KnowledgeCatalogPage } from '../types'
 import { groupCatalog } from '../lib/knowledgeNavigation'
@@ -21,6 +22,13 @@ function CatalogGroup({ category, rows, activePath, onOpen, compact }: {
   onOpen: (path: string, title: string) => void; compact: boolean
 }) {
   const [expanded, setExpanded] = useState(true)
+  const [preview, setPreview] = useState<{ text: string; left: number; top: number } | null>(null)
+  const showSummary = (element: HTMLElement, page: KnowledgeCatalogPage) => {
+    if (!compact || !page.summary) return
+    const rect = element.getBoundingClientRect()
+    setPreview({ text: page.summary, left: Math.max(8, Math.min(rect.left, window.innerWidth - 328)),
+      top: Math.max(8, Math.min(rect.bottom + 4, window.innerHeight - 240)) })
+  }
   return <section>
     <button type="button" aria-expanded={expanded} onClick={() => setExpanded(v => !v)}
       className="flex w-full items-center gap-2 rounded-btn px-2 py-2 text-left text-sm font-medium text-content-secondary hover:bg-surface-2">
@@ -29,14 +37,25 @@ function CatalogGroup({ category, rows, activePath, onOpen, compact }: {
       <span className="text-xs text-content-tertiary">{rows.length}</span>
     </button>
     {expanded && <div className={compact ? 'ml-2 border-l border-default pl-1' : 'divide-y divide-default rounded-lg border border-default'}>
-      {rows.map(page => <button key={page.page_id} type="button" onClick={() => onOpen(page.path, page.title)}
+      {rows.map(page => <button key={page.page_id} type="button" onClick={() => { setPreview(null); onOpen(page.path, page.title) }}
+        aria-label={compact && page.summary ? `${page.title}：${page.summary}` : undefined}
+        onMouseEnter={e => showSummary(e.currentTarget, page)} onMouseLeave={() => setPreview(null)}
+        onFocus={e => showSummary(e.currentTarget, page)} onBlur={() => setPreview(null)}
+        onKeyDown={e => { if (e.key === 'Escape') setPreview(null) }}
         className={`flex w-full items-center gap-2 rounded-btn px-3 ${compact ? 'py-2' : 'py-3'} text-left text-sm ${activePath === page.path ? 'bg-accent-soft text-accent' : 'text-content hover:bg-surface-2'}`}>
         <FileText size={14} className="shrink-0 text-content-tertiary" />
-        <span className="min-w-0 flex-1 truncate">{page.title}</span>
+        <span className="min-w-0 flex-1">
+          <span className="block truncate">{page.title}</span>
+          {!compact && page.summary && <span className="mt-1 line-clamp-2 break-words text-xs leading-relaxed text-content-secondary">{page.summary}</span>}
+        </span>
         {page.category_mode === 'manual' && <span title="手动分类，后续整理保持此分类" aria-label="手动分类"><Lock size={12} /></span>}
         {!compact && <ChevronRight size={14} className="text-content-tertiary" />}
       </button>)}
     </div>}
+    {expanded && preview && createPortal(<div role="tooltip"
+      style={{ position: 'fixed', left: preview.left, top: preview.top, width: 'min(320px, calc(100vw - 16px))', pointerEvents: 'none', zIndex: 9999 }}
+      className="whitespace-normal break-words rounded-lg border border-default bg-elevated p-3 text-xs leading-relaxed text-content shadow-lg"
+    >{preview.text}</div>, document.body)}
   </section>
 }
 
@@ -52,7 +71,7 @@ export default function KnowledgeCatalog({ pages, onOpen, legacyContent, onInter
     </div>
     <div className="relative mb-5">
       <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-content-tertiary" />
-      <input aria-label="搜索当前知识目录" value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索标题或分类"
+      <input aria-label="搜索当前知识目录" value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索标题、分类或摘要"
         className="w-full rounded-btn border border-strong bg-inset py-2 pl-9 pr-3 text-sm text-content focus:border-accent focus:outline-none" />
     </div>
     <KnowledgeCatalogGroups pages={pages} search={search} onOpen={onOpen} />

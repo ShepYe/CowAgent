@@ -563,12 +563,45 @@ def _build_memory_section(
 
 
 # index.md grows by a line per knowledge page and is re-sent on every turn.
-# Past _INDEX_FULL_CHARS only the entry titles are injected, and past
+# Past _INDEX_FULL_CHARS summaries become marked previews, and past
 # _INDEX_MAX_CHARS the list is cut; the pages stay reachable through read and
 # memory_search, and the prompt says so.
 _INDEX_FULL_CHARS = 8000
 _INDEX_MAX_CHARS = 20000
-_INDEX_ENTRY_RE = re.compile(r"^\s*[-*]\s+\[[^\]]*\]\([^)]*\)")
+_INDEX_PREVIEW_CHARS = 40
+_INDEX_ENTRY_START_RE = re.compile(r"^\s*[-*]\s+\[")
+
+
+def _index_entry_end(line: str) -> Optional[int]:
+    """定位完整 Markdown 链接，保留转义和任意深度括号路径。"""
+    start = _INDEX_ENTRY_START_RE.match(line)
+    if not start:
+        return None
+    depth, escaped, destination, angle = 1, False, False, False
+    for offset in range(start.end(), len(line)):
+        char = line[offset]
+        if escaped:
+            escaped = False
+            continue
+        if char == '\\':
+            escaped = True
+            continue
+        if not destination:
+            depth += (char == '[') - (char == ']')
+            if depth == 0:
+                if line[offset + 1:offset + 2] != '(':
+                    return None
+                destination, depth = True, 0
+            continue
+        if char == '<':
+            angle = True
+        elif char == '>':
+            angle = False
+        elif not angle:
+            depth += (char == '(') - (char == ')')
+            if depth == 0:
+                return offset + 1
+    return None
 
 
 def _compact_knowledge_index(content: str) -> Tuple[str, int, bool]:
@@ -580,19 +613,31 @@ def _compact_knowledge_index(content: str) -> Tuple[str, int, bool]:
     size = 0
     omitted = 0
     full = False
+    headings: List[str] = []
     for line in content.split("\n"):
-        entry = _INDEX_ENTRY_RE.match(line)
-        if entry:
-            line = entry.group(0).strip()
-        elif not line.lstrip().startswith("#"):
+        entry = _index_entry_end(line)
+        if entry is not None:
+            summary = re.sub(r"^\s*[—–-]\s*", "", line[entry:]).strip()
+            line = line[:entry].strip()
+            if summary:
+                line += f" — {summary[:_INDEX_PREVIEW_CHARS]}… [缩略/truncated]"
+        elif line.lstrip().startswith("#"):
+            headings.append(line)
             continue
-        if full or size + len(line) + 1 > _INDEX_MAX_CHARS:
+        else:
+            continue
+        # Commit category headings together with their first complete entry.
+        # A link (even one longer than the budget) is never sliced.
+        addition = headings + [line]
+        cost = len("\n".join(addition)) + bool(kept)
+        if full or size + cost > _INDEX_MAX_CHARS:
             full = True
             if entry:
                 omitted += 1
             continue
-        kept.append(line)
-        size += len(line) + 1
+        kept.extend(addition)
+        headings = []
+        size += cost
     return "\n".join(kept), omitted, True
 
 
@@ -609,12 +654,28 @@ def _build_knowledge_section(
     from common import state_dir
     knowledge_root = str(state_dir.knowledge_dir(base=workspace_dir))
     index_path = os.path.join(knowledge_root, "index.md")
+    organization = (
+        "Read knowledge-wiki and the authorized source text first, then use knowledge_ingest to decide purpose. "
+        "For long_term, submit organized pages with title, category, summary, body blocks and real sources; "
+        "organization_required means continue organizing. Each pages[].summary is required: a single line of plain text, "
+        "1–160 Unicode code points after trimming (30–60 recommended), based on that page's body. "
+        "No newlines or control characters. A task-level summary cannot replace each page's summary. "
+        "transient material and derived conclusions stay archived only; waiting is for necessary clarification. "
+        "Controlled publication maintains pages and the index. Report visual coverage separately and truthfully. "
+        "Only a currently valid, index-verified searchable receipt means searchable."
+        if language == "en" else
+        "个人资料先读取 knowledge-wiki 和授权原文，再用 knowledge_ingest 自主登记用途；长期资料须提交整理后的 pages"
+        "（标题、分类、summary、正文块与真实出处），organization_required 时继续整理。每页 pages[].summary 必填："
+        "以本页正文为依据的一句话，建议 30～60 字，去除首尾空白后 1～160 个 Unicode 码点的单行纯文本，禁止换行及控制字符；"
+        "任务级摘要不能替代每页摘要。transient 资料及派生结论仅留档，waiting 仅必要澄清。"
+        "受控发布自动维护知识页和索引，视觉覆盖单独如实说明。只有当前有效且索引核验通过的 searchable 回执表示可检索。"
+    )
     if not os.path.exists(index_path):
-        return ["个人资料先读取 knowledge-wiki 和原文，再用 knowledge_ingest 自主登记用途；长期资料须提交整理后的 pages（标题、分类、正文块与出处），organization_required 时继续整理。transient 仅留档，waiting 仅必要澄清。"]
+        return [organization]
 
     try:
         with open(index_path, 'r', encoding='utf-8') as f:
-            index_content = f.read().strip()
+            index_content = f.read()
     except Exception:
         return []
 
@@ -625,8 +686,6 @@ def _build_knowledge_section(
     index_content = "\n".join(line for line in index_content.splitlines()
         if all(readable(os.path.join(knowledge_root, _source_unquote(target)))
                for target in _source_re.findall(r"\]\((?:\./)?((?:managed|wiki)/[^)]+)\)", line)))
-
-    index_content = "个人资料先读取 knowledge-wiki 和原文，再由 knowledge_ingest 发布整理后的主题 pages；无 pages 仅登记用途，须继续整理，无需逐份询问。临时资料及派生结论仅留档。托管页引用回读有效原文位置；仅当前有效且索引核验通过的 searchable 回执表示可检索。\n" + index_content
 
     # Anchor knowledge paths to ~/cow when a project cwd is active, and to the
     # shared root when this Agent reads the shared copy.
@@ -647,7 +706,9 @@ def _build_knowledge_section(
             f"3. **The conversation involves an important entity** (person / company / project) → create or update `{kb}/entities/<name>.md`",
             f"4. **A technical concept / methodology is discussed** → organize it into `{kb}/concepts/<topic>.md`",
             "",
-            f"After writing any knowledge page, you **must update** `{kb}/index.md` with a new index line in sync.",
+            f"After writing ordinary conversation knowledge without managed sources, update `{kb}/index.md`. "
+            "Conclusions based on managed sources use knowledge_ingest(long_term,pages,reason), optionally without task_id; "
+            "query answers only read and answer, without copying into unsourced knowledge, memory or diaries.",
             "For detailed page format and conventions, read the SKILL.md of the `knowledge-wiki` skill.",
             "",
             "⚠️ Don't ask \"should I save this to the knowledge base?\" — if a case above matches, just write it. This is instinctive.",
@@ -677,9 +738,9 @@ def _build_knowledge_section(
 
     from common.personal_tasks import current_task_id
     if current_task_id():
-        lines = ["## 知识整理", "先实际读取 knowledge-wiki 技能和授权原文，自主判断用途。长期资料按主题提炼、分类、命名、关联，"
-                 "调用 knowledge_ingest 提交 pages 正文块及真实出处；受控发布自动维护知识页和索引。organization_required 时继续整理。"
-                 "临时资料及派生内容只留档。只有当前有效且索引核验通过才报告可检索，视觉覆盖单独如实说明。", ""]
+        lines = [("## Knowledge organization" if language == "en" else "## 知识整理"), ""]
+
+    lines.extend([organization, ""])
 
     if index_content:
         index_text, omitted, compacted = _compact_knowledge_index(index_content)
@@ -690,19 +751,22 @@ def _build_knowledge_section(
         if compacted:
             if language == "en":
                 more = f", {omitted} more entries are not listed" if omitted else ""
-                note = (f"The index is large, so only titles are listed here{more}. "
-                        f"`read` `{kb}/index.md` for the full index, or use `memory_search`.")
+                note = (f"The index is large; summaries are previews marked truncated{more}. "
+                        f"Use paginated `read` on `{kb}/index.md` (offset/limit), or `memory_search` to find pages. "
+                        "Previews only help select pages; read the full page body and its currently valid sources before answering.")
             else:
                 more = f"，另有 {omitted} 条未列出" if omitted else ""
-                note = (f"索引较大，此处只列出标题{more}。"
-                        f"完整索引请 `read` `{kb}/index.md` 查看，或用 `memory_search` 检索。")
+                note = (f"索引较大，摘要为标明缩略的预览{more}。"
+                        f"按需用 `read` 分页读取 `{kb}/index.md`（offset/limit），或用 `memory_search` 找页。"
+                        "预览只供选页；回答前回读知识正文及当前有效出处。")
             lines.extend([note, ""])
         lines.extend([index_text, ""])
 
     lines.extend([
-        ("**How to query**: use `read` to open a knowledge page, or `memory_search` for keyword retrieval."
+        ("**How to query**: use `read` to open a knowledge page, or `memory_search` to find pages. "
+         "Read the full body and currently valid original sources before answering, checking versions and source locations."
          if language == "en" else
-         "**查询方式**：用 `read` 读取知识页面，或用 `memory_search` 关键词检索。"),
+         "**查询方式**：用 `read` 读取知识页面，或用 `memory_search` 找页；回答前回读正文与当前有效原文出处，核对版本及原文位置。"),
         "",
     ])
 

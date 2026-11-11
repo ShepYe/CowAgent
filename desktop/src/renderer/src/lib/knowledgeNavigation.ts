@@ -76,7 +76,7 @@ export function groupCatalog(pages: KnowledgeCatalogPage[], search = ''): [strin
   const query = search.trim().toLocaleLowerCase()
   const groups = new Map<string, KnowledgeCatalogPage[]>()
   for (const page of pages) {
-    if (!page.searchable || (query && !`${page.title} ${page.category}`.toLocaleLowerCase().includes(query))) continue
+    if (!page.searchable || (query && !`${page.title} ${page.category || '未分类'} ${page.summary || ''}`.toLocaleLowerCase().includes(query))) continue
     const category = page.category || '未分类'
     groups.set(category, [...(groups.get(category) || []), page])
   }

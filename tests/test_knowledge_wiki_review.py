@@ -27,7 +27,7 @@ def registered_source(tmp_path):
 
 def publish_topic(workspace, source):
     wiki = WikiService(workspace)
-    batch = wiki.prepare([dict(title='审查主题', category='review', blocks=[
+    batch = wiki.prepare([dict(summary='说明本页知识的主题及适用范围。', title='审查主题', category='review', blocks=[
         dict(content='curated_wiki_conclusion', sources=[source])])])
     return wiki.publish(batch['batch_id'])[0]
 
@@ -72,7 +72,7 @@ def test_successful_replacement_retires_old_wiki_and_legacy(
     source.update(parse_id=parsed['parse_id'], ordinal=0)
     wiki = WikiService(tmp_path)
     batch = wiki.prepare([dict(page_id=topic['page_id'], expected_version=topic['page_version'],
-        title='审查主题', category='review', blocks=[
+        summary='说明本页知识的主题及适用范围。', title='审查主题', category='review', blocks=[
             dict(content='replacement_wiki_conclusion', sources=[source])])])
     replacement = wiki.publish(batch['batch_id'])[0]
 

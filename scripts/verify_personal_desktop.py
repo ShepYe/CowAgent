@@ -126,7 +126,8 @@ def choose_response(body):
                 facts.append("资料给出的链路 budget 为 " + budget[1] + (" " + budget[2] if budget[2] else "") + "。")
                 sources.append(dict(document_id=material["document_id"], revision_id=material["revision_id"],
                                     parse_id=material["parse_id"], ordinal=unit["ordinal"]))
-            args["pages"] = [dict(title="链路预算要点", category="工程/射频", blocks=[dict(
+            args["pages"] = [dict(title="链路预算要点", category="工程/射频",
+                summary="汇总资料中明确给出的链路预算数值。", blocks=[dict(
                 content="\n".join(facts), sources=sources)], related_page_ids=[], depends_on=[])]
             return call("knowledge_ingest", args)
         stats["refs_count"] = len(receipt.get("result_refs", []))

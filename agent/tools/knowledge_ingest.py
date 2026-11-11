@@ -28,6 +28,7 @@ class KnowledgeIngest(BaseTool):
             "type": "object", "properties": {
                 "page_id": {"type": "string"}, "expected_version": {"type": ["string", "null"]},
                 "title": {"type": "string"}, "category": {"type": "string"},
+                "summary": {"type": "string", "minLength": 1, "maxLength": 160, "description": "必填：本页正文的一句话摘要，1～160个Unicode码点，单行纯文本，无控制字符。"},
                 "blocks": {"type": "array", "items": {"type": "object", "properties": {
                     "content": {"type": "string"}, "sources": {"type": "array", "items": {
                         "type": "object", "properties": {"document_id": {"type": "string"},
@@ -37,7 +38,7 @@ class KnowledgeIngest(BaseTool):
                 "related_page_ids": {"type": "array", "items": {"type": "string"}},
                 "depends_on": {"type": "array", "items": {"type": "object", "properties": {
                     "page_id": {"type": "string"}, "page_version": {"type": "string"}}, "required": ["page_id", "page_version"]}}},
-            "required": ["title", "category", "blocks"]}}},
+            "required": ["title", "category", "summary", "blocks"]}}},
         "required": ["purpose", "reason"]}
 
     def __init__(self, config=None):
@@ -54,6 +55,9 @@ class KnowledgeIngest(BaseTool):
             return ToolResult.fail("forbidden")
         attempt, stage = None, "decide"
         try:
+            if 'pages' in args:
+                from agent.knowledge.wiki import validate_page_summaries
+                validate_page_summaries(args['pages'])
             if not task_id:
                 if args.get("purpose") != "long_term" or not args.get("pages"):
                     raise SourceError("invalid_request", "没有接收任务时须提交带已登记有效出处的长期知识 pages")
@@ -72,6 +76,8 @@ class KnowledgeIngest(BaseTool):
                 refs = []
                 for ref in task.get("result_refs", []):
                     display = dict(ref)
+                    if ref.get('page_id'):
+                        display.setdefault('summary', '')
                     if ref.get("publish_id"):
                         workspace = self.config.get("workspace_root") or self.config.get("cwd")
                         if not workspace:

@@ -299,3 +299,42 @@ for (const oldFails of [false, true]) for (const oldAfterB of [false, true]) tes
   assert.deepEqual(calls, ['A', 'B'])
   h.unmount()
 })
+
+
+test('主目录摘要最多两行，紧凑侧栏通过焦点和悬停访问完整中文摘要', () => {
+  const summary = '星河预算：' + '核验中文同名知识的适用边界及完整出处。'.repeat(6)
+  const current = { ...page, summary }
+  const main = renderToStaticMarkup(React.createElement(catalog.KnowledgeCatalogGroups, { pages: [current], onOpen() {} }))
+  assert.match(main, /line-clamp-2 break-words/)
+  assert.ok(main.includes(summary))
+  const compact = renderToStaticMarkup(React.createElement(catalog.KnowledgeCatalogGroups, { pages: [current], compact: true, onOpen() {} }))
+  assert.doesNotMatch(compact, /line-clamp-2/)
+  assert.ok(compact.includes(`aria-label="${page.title}：${summary}"`))
+  const h = harness(catalog.KnowledgeCatalogGroups, { pages: [current], compact: true, onOpen() {} })
+  const group = nodes(h.render()).find(n => typeof n.type === 'function')
+  const gh = harness(group.type, group.props)
+  const button = nodes(gh.render()).find(n => n.type === 'button' && text(n).includes(page.title))
+  assert.equal(typeof button.props.onFocus, 'function')
+  assert.equal(typeof button.props.onMouseEnter, 'function')
+  assert.equal(typeof button.props.onBlur, 'function')
+  const previousDocument = globalThis.document, previousWindow = globalThis.window
+  try {
+    globalThis.document = { body: { nodeType: 1 } }
+    globalThis.window = { innerWidth: 320, innerHeight: 568 }
+    const event = { currentTarget: { getBoundingClientRect: () => ({ left: 270, bottom: 550 }) } }
+    button.props.onFocus(event)
+    let portal = gh.render().props.children.find(n => n?.children?.props?.role === 'tooltip')
+    assert.equal(portal.children.props.children, summary)
+    assert.equal(portal.children.props.style.left, 8)
+    assert.ok(portal.children.props.style.top < 568)
+    button.props.onKeyDown({ key: 'Escape' })
+    assert.ok(!gh.render().props.children.some(n => n?.children?.props?.role === 'tooltip'))
+    button.props.onMouseEnter(event)
+    portal = gh.render().props.children.find(n => n?.children?.props?.role === 'tooltip')
+    assert.equal(portal.children.props.children, summary)
+    button.props.onBlur()
+    assert.ok(!gh.render().props.children.some(n => n?.children?.props?.role === 'tooltip'))
+  } finally { globalThis.document = previousDocument; globalThis.window = previousWindow }
+  const old = renderToStaticMarkup(React.createElement(catalog.KnowledgeCatalogGroups, { pages: [page], compact: true, onOpen() {} }))
+  assert.doesNotMatch(old, /line-clamp-2|aria-label="中文主题：/)
+})

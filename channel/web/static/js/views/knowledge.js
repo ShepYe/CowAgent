@@ -240,6 +240,7 @@ function _expandKnowledgeGroupFor(path) {
 
 function renderKnowledgeTree(tree, rootFilesOrFilter, filter) {
     const container = document.getElementById('knowledge-tree');
+    document.querySelectorAll('.knowledge-summary-tooltip').forEach(el => el.remove());
     container.innerHTML = '';
     let rootFiles, lowerFilter;
     if (typeof rootFilesOrFilter === 'string') {
@@ -250,11 +251,12 @@ function renderKnowledgeTree(tree, rootFilesOrFilter, filter) {
         lowerFilter = (filter || '').toLowerCase();
     }
     (rootFiles || []).forEach(f => {
-        if (lowerFilter && !f.title.toLowerCase().includes(lowerFilter) && !f.name.toLowerCase().includes(lowerFilter)) return;
+        if (!_knowledgeFileMatches(f, lowerFilter)) return;
         const fbtn = document.createElement('button');
         fbtn.className = 'knowledge-tree-file' + (_knowledgeCurrentFile === f.name ? ' active' : '');
         fbtn.dataset.path = f.name;
-        fbtn.innerHTML = `<i class="fas fa-file-lines text-[10px] text-slate-400"></i><span class="truncate">${escapeHtml(f.title)}</span>${_knowledgeFileActions(f.name)}`;
+        fbtn.innerHTML = `<i class="fas fa-file-lines text-[10px] text-slate-400"></i>${_knowledgeFileLabel(f)}${_knowledgeFileActions(f.name)}`;
+        _bindKnowledgeSummary(fbtn, f);
         fbtn.onclick = () => openKnowledgeFile(f.name, f.title);
         container.appendChild(fbtn);
     });
@@ -266,7 +268,7 @@ function _renderKnowledgeGroups(container, groups, parentPath, lowerFilter, dept
     groups.forEach(group => {
         const groupPath = parentPath ? parentPath + '/' + group.dir : group.dir;
         const files = (group.files || []).filter(f =>
-            !lowerFilter || f.title.toLowerCase().includes(lowerFilter) || f.name.toLowerCase().includes(lowerFilter)
+            _knowledgeFileMatches(f, lowerFilter)
         );
         const children = group.children || [];
         const hasMatchingChildren = lowerFilter ? _hasFilterMatch(children, lowerFilter) : children.length > 0;
@@ -291,7 +293,8 @@ function _renderKnowledgeGroups(container, groups, parentPath, lowerFilter, dept
             fbtn.className = 'knowledge-tree-file' + (_knowledgeCurrentFile === fpath ? ' active' : '');
             fbtn.dataset.path = fpath;
             fbtn.style.paddingLeft = (24 + indent) + 'px';
-            fbtn.innerHTML = `<i class="fas fa-file-lines text-[10px] text-slate-400"></i><span class="truncate">${escapeHtml(f.title)}</span>${_knowledgeFileActions(fpath)}`;
+            fbtn.innerHTML = `<i class="fas fa-file-lines text-[10px] text-slate-400"></i>${_knowledgeFileLabel(f)}${_knowledgeFileActions(fpath)}`;
+            _bindKnowledgeSummary(fbtn, f);
             fbtn.onclick = () => openKnowledgeFile(fpath, f.title);
             items.appendChild(fbtn);
         });
@@ -717,10 +720,43 @@ function moveKnowledgeDocument(path) {
     });
 }
 
+function _knowledgeFileMatches(file, query) {
+    return !query || [file.title, file.name, file.category, file.summary]
+        .some(value => typeof value === 'string' && value.toLocaleLowerCase().includes(query));
+}
+
+function _knowledgeFileLabel(file) {
+    const summary = file.summary ? `<span class="knowledge-tree-summary">${escapeHtml(file.summary)}</span>` : '';
+    return `<span class="knowledge-tree-label"><span class="knowledge-tree-title">${escapeHtml(file.title || file.name)}</span>${summary}</span>`;
+}
+
+function _bindKnowledgeSummary(button, file) {
+    if (!file.summary) return;
+    button.setAttribute('aria-label', `${file.title || file.name}：${file.summary}`);
+    let tooltip;
+    const hide = () => { tooltip?.remove(); tooltip = null; };
+    const show = () => {
+        hide();
+        tooltip = document.createElement('div');
+        tooltip.className = 'knowledge-summary-tooltip';
+        tooltip.setAttribute('role', 'tooltip');
+        tooltip.textContent = file.summary;
+        document.body.appendChild(tooltip);
+        const rect = button.getBoundingClientRect();
+        tooltip.style.left = Math.max(8, Math.min(rect.left, window.innerWidth - tooltip.offsetWidth - 8)) + 'px';
+        tooltip.style.top = Math.max(8, Math.min(rect.bottom + 4, window.innerHeight - tooltip.offsetHeight - 8)) + 'px';
+    };
+    button.onmouseenter = show;
+    button.onmouseleave = hide;
+    button.onfocus = show;
+    button.onblur = hide;
+    button.addEventListener('keydown', event => { if (event.key === 'Escape') hide(); });
+}
+
 function _hasFilterMatch(groups, lowerFilter) {
     for (const g of groups) {
         for (const f of (g.files || [])) {
-            if (f.title.toLowerCase().includes(lowerFilter) || f.name.toLowerCase().includes(lowerFilter)) return true;
+            if (_knowledgeFileMatches(f, lowerFilter)) return true;
         }
         if (_hasFilterMatch(g.children || [], lowerFilter)) return true;
     }

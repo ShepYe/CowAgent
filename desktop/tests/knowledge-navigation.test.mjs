@@ -74,3 +74,15 @@ test('锚点滚动按id或中文标题匹配，未找到返回false', () => {
   assert.deepEqual(calls, [{ block: 'start' }])
   assert.equal(scrollToKnowledgeAnchor({ querySelectorAll: () => [heading] }, 'missing'), false)
 })
+
+
+test('摘要独有词命中当前中文同名页，旧字段兼容且历史摘要不参与搜索', () => {
+  const a = { ...page, summary: '用于核验星河预算的边界条件', title: '同名知识' }
+  const b = { ...page, page_id: 'two', path: 'wiki/另一目录/中文 页-v2.md', title: a.title, summary: '天线校准' }
+  const paused = { ...a, page_id: 'old', summary: '历史独有词', searchable: false }
+  assert.deepEqual(groupCatalog([a, b, paused], '星河预算').flatMap(([, rows]) => rows.map(p => p.path)), [a.path])
+  assert.deepEqual(groupCatalog([a, b, paused], '历史独有词'), [])
+  assert.equal(groupCatalog([page], 'undefined').length, 0)
+  assert.equal(groupCatalog([page], page.title).length, 1)
+  assert.equal(resolveKnowledgeLink(list, `knowledge/${b.path}`, '', [a, b]).path, b.path)
+})

@@ -52,7 +52,7 @@ def derivation(tmp_path, monkeypatch):
         evidence = {k: receipt[k] for k in ('document_id', 'revision_id')}
         evidence.update(parse_id=parsed['parse_id'], ordinal=0)
         wiki = WikiService(tmp_path)
-        upstream = dict(title='预算依据', category='工程', blocks=[dict(
+        upstream = dict(summary='说明本页知识的主题及适用范围。', title='预算依据', category='工程', blocks=[dict(
             content='source_derivation_budget_4719 的预算为42 dB', sources=[evidence])])
         ref = wiki.publish(wiki.prepare([upstream])['batch_id'])[0]
         manager = MemoryManager(MemoryConfig(workspace_root=str(tmp_path)), embedding_provider=None)
@@ -79,7 +79,7 @@ def read_evidence(env, reader='read'):
 
 
 def draft(env, **changes):
-    page = dict(title='预算派生结论', category='工程', blocks=[dict(
+    page = dict(summary='说明本页知识的主题及适用范围。', title='预算派生结论', category='工程', blocks=[dict(
         content='derived_budget_4720：设计预算为42 dB', sources=[copy.deepcopy(env.evidence)])],
         depends_on=[dict(page_id=env.ref['page_id'], page_version=env.ref['page_version'])])
     page.update(changes)

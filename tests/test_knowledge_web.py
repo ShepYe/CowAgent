@@ -179,3 +179,38 @@ def test_knowledge_import_handler_rejects_large_content_length(tmp_path):
     assert response["status"] == "error"
     assert response["code"] == 413
     assert response["message"] == "import batch too large"
+
+
+def test_knowledge_list_projects_only_current_catalog_by_full_path(tmp_path):
+    from types import SimpleNamespace
+    from channel.web.api.knowledge import KnowledgeListHandler
+
+    tree = {"root_files": [{"name": "同名.md", "title": "旧标题", "category": "资料原文", "size": 1}], "tree": [
+        {"dir": "wiki", "files": [], "children": [
+            {"dir": "旧物理分类", "files": [
+                {"name": "中文.md", "title": "同名", "size": 2},
+                {"name": "中文-old.md", "title": "同名", "size": 3}], "children": []},
+            {"dir": "另一分类", "files": [{"name": "中文.md", "title": "同名", "size": 4}], "children": []}]},
+        {"dir": "未托管", "files": [{"name": "中文.md", "title": "同名", "size": 5}], "children": []}],
+        "stats": {"pages": 4, "size": 14}, "enabled": True}
+    pages = [
+        {"path": "wiki/旧物理分类/中文.md", "title": "同名", "category": "手动/有效分类", "summary": "星河预算", "searchable": True},
+        {"path": "wiki/另一分类/中文.md", "title": "同名", "category": "另一分类", "searchable": True},
+        {"path": "wiki/旧物理分类/中文-old.md", "title": "同名", "summary": "历史独有词", "searchable": False}]
+    with patch("channel.web.api.knowledge._require_auth"), \
+         patch("channel.web.api.knowledge.web.header"), \
+         patch("channel.web.api.knowledge.web.input", return_value=SimpleNamespace(agent_id="A")), \
+         patch("channel.web.api.knowledge._get_workspace_root", return_value=str(tmp_path)), \
+         patch("agent.knowledge.service.KnowledgeService.list_tree", return_value=tree), \
+         patch("agent.knowledge.service.KnowledgeService.catalog", return_value={"pages": pages}):
+        result = json.loads(KnowledgeListHandler().GET())
+    current, old_service = result["tree"][0]["children"]
+    assert len(current["files"]) == 1
+    assert current["files"][0]["summary"] == "星河预算"
+    assert current["files"][0]["category"] == "手动/有效分类"
+    assert old_service["files"][0]["summary"] == ""
+    assert result["root_files"][0]["summary"] == ""
+    assert result["root_files"][0]["category"] == "资料原文"
+    assert result["tree"][1]["files"][0]["summary"] == ""
+    assert "历史独有词" not in json.dumps(result, ensure_ascii=False)
+    assert "summary" not in tree["tree"][0]["children"][0]["files"][0]

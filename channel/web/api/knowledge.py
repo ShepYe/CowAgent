@@ -20,6 +20,40 @@ from channel.web.core._common import (
 from common.log import logger
 
 
+def _catalog_tree(result, pages):
+    """仅按当前目录的知识根完整路径投影，不向同名或历史文件借摘要。"""
+    current = {p['path']: p for p in pages if p.get('searchable') and isinstance(p.get('path'), str)}
+
+    def files(rows, parent):
+        projected = []
+        for row in rows:
+            path = '/'.join([*parent, row['name']])
+            page = current.get(path)
+            # wiki 为托管发布目录；历史及失效版本不进入当前浏览结果。
+            if parent and parent[0] == 'wiki' and page is None:
+                continue
+            item = {**row, 'summary': row.get('summary') or '',
+                    'category': row.get('category') or '/'.join(parent)}
+            if page is not None:
+                item.update(title=page['title'], category=page.get('category', ''),
+                            summary=page.get('summary') or '')
+            projected.append(item)
+        return projected
+
+    def groups(rows, parent):
+        projected = []
+        for row in rows:
+            parts = [*parent, row['dir']]
+            item = {**row, 'files': files(row.get('files', []), parts),
+                    'children': groups(row.get('children', []), parts)}
+            if parts[0] != 'wiki' or item['files'] or item['children']:
+                projected.append(item)
+        return projected
+
+    return {**result, 'root_files': files(result.get('root_files', []), []),
+            'tree': groups(result.get('tree', []), [])}
+
+
 class KnowledgeListHandler:
     def GET(self):
         _require_auth()
@@ -31,6 +65,7 @@ class KnowledgeListHandler:
                 _get_workspace_root(agent_id=_request_agent_id(params))
             )
             result = svc.list_tree()
+            result = _catalog_tree(result, svc.catalog()['pages'])
             return json.dumps({"status": "success", **result}, ensure_ascii=False)
         except Exception as e:
             logger.error(f"[WebChannel] Knowledge list error: {e}")

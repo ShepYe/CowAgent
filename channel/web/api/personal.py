@@ -99,6 +99,8 @@ def _decorate(task):
     parse_cache = {}
     for ref in task.get('result_refs', []):
         ref = dict(ref)
+        if ref.get('page_id'):
+            ref.setdefault('summary', '')
         ref['current_searchable'] = False
         if ref.get('document_id'):
             try:
@@ -110,7 +112,7 @@ def _decorate(task):
                     current = _wiki_service().current(ref['page_id'])
                     ref['current_searchable'] = bool(current and current.get('searchable') is True and current.get('publish_id') == ref.get('publish_id'))
                     if ref['current_searchable']:
-                        ref.update({key: current[key] for key in ('category', 'category_mode', 'category_revision')})
+                        ref.update({key: current[key] for key in ('summary', 'category', 'category_mode', 'category_revision')})
                 else:
                     current = service.current_publication(ref['document_id'], ref.get('revision_id'))
                     if current and current.get('publish_id') == ref.get('publish_id') and current.get('searchable') is True:
@@ -391,7 +393,9 @@ def _reorganize(store, task_id, attempt, body):
             raise TaskError('forbidden')
         payload = {'reorganize': directive, 'text':
             '请重新整理此已登记长期资料。先读取 knowledge-wiki 技能、原附件和已有相关知识，'
-            '根据真实证据提炼、命名、分类并提交主题知识页；调用 knowledge_ingest，保留下述 document_id、revision_id，'
+            '根据真实证据提炼、命名、分类并提交主题知识页，每页提交基于正文的一句话 summary；'
+            '已有主题沿用 page_id 并核对 expected_version，保持手动分类和历史，已有有效解析及出处直接复用，视觉缺口如实保留；'
+            '调用 knowledge_ingest，保留下述 document_id、revision_id，'
             '核对 expected_state。不得以原文拼接代替整理，不调用 knowledge_source_action republish，'
             '不得改变临时或撤回权限。新发布失败时保留旧有效知识。\n' + json.dumps(directive, ensure_ascii=False)}
         task = dict(schema_version=1, receipt_id=uuid4().hex, task_id=uuid4().hex, request_id=key,

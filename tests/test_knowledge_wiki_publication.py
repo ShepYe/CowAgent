@@ -22,8 +22,8 @@ def source(root, name='radio', text='原始依据：射频设备预算42 dB\n第
     return service, receipt, dict(document_id=receipt['document_id'], revision_id=receipt['revision_id'], parse_id=parsed['parse_id'], ordinal=0)
 
 
-def page(*sources, title='链路预算', content='整理结论：星际通信需要余量', **kwargs):
-    return dict(title=title, category='射频/设计', blocks=[dict(content=content, sources=list(sources))], **kwargs)
+def page(*sources, title='链路预算', content='整理结论：星际通信需要余量', summary='说明星际通信链路预算及余量要求。', **kwargs):
+    return dict(title=title, summary=summary, category='射频/设计', blocks=[dict(content=content, sources=list(sources))], **kwargs)
 
 
 def publish(wiki, *pages, task='task'):
@@ -517,3 +517,76 @@ def test_failed_first_wiki_publication_retains_previous_legacy_revision(tmp_path
     assert readable(tmp_path / old['path'])
     assert service.current_publication(s['document_id'], s['revision_id'])['publish_id'] == old['publish_id']
     assert service.search('射频设备')[0]['publish_id'] == old['publish_id']
+
+
+@pytest.mark.parametrize('invalid', [None, 7, True, [], {}, '', '   ', '摘' * 161,
+    '😀' * 161, '第一行\n第二行', '\r摘要', '\t摘要', '摘\x00要', '摘\x7f要',
+    '摘\x85要', '摘\u2028要', '摘\u2029要', '\ud800'])
+def test_summary_invalid_before_reconciliation_or_candidate(tmp_path, monkeypatch, invalid):
+    _, _, evidence = source(tmp_path)
+    wiki = WikiService(tmp_path)
+    def unexpected():
+        pytest.fail('摘要不合法时不能触发目录或状态刷新')
+    monkeypatch.setattr(wiki, '_reconcile', unexpected)
+    with pytest.raises(SourceError) as error:
+        wiki.prepare([page(evidence), page(evidence, summary=invalid)])
+    assert error.value.code == 'invalid_request'
+    with sqlite3.connect(wiki.db) as db:
+        assert db.execute('SELECT count(*) FROM wiki_batches').fetchone()[0] == 0
+    assert not (tmp_path / 'knowledge/index.md').exists()
+
+
+def test_summary_missing_is_not_replaced_by_title(tmp_path):
+    _, _, evidence = source(tmp_path)
+    draft = page(evidence)
+    del draft['summary']
+    with pytest.raises(SourceError) as error:
+        WikiService(tmp_path).prepare([draft])
+    assert error.value.code == 'invalid_request'
+
+
+@pytest.mark.parametrize('summary', ['摘', '摘' * 160, '😀' * 160, '  中文与😀摘要  '])
+def test_summary_versioned_receipt_roundtrip_and_not_fact_block(tmp_path, summary):
+    svc, receipt, evidence = source(tmp_path)
+    wiki = WikiService(tmp_path)
+    batch = wiki.prepare([page(evidence, summary=summary)], task_id='summary')
+    expected = summary.strip()
+    assert batch['pages'][0]['summary'] == expected
+    ref = wiki.publish(batch['batch_id'])[0]
+    assert WikiService(tmp_path).publish(batch['batch_id']) == [ref]
+    assert ref['summary'] == expected
+    assert wiki.current(ref['page_id'])['summary'] == expected
+    assert svc.current_publication(receipt['document_id'], receipt['revision_id'])['summary'] == expected
+    assert svc.read_reference(ref['publish_id'], 0)['summary'] == expected
+    assert wiki.catalog()['pages'][0]['summary'] == expected
+    assert wiki.version(ref['publish_id'])['summary'] == expected
+    assert wiki.history()['events'][0]['summary'] == expected
+    assert expected not in (tmp_path / ref['path']).read_text(encoding='utf-8')
+    with sqlite3.connect(wiki.db) as db:
+        assert json.loads(db.execute('SELECT record FROM wiki_publications').fetchone()[0])['summary'] == expected
+        assert db.execute('SELECT text FROM wiki_units').fetchone()[0] == '整理结论：星际通信需要余量'
+
+
+@pytest.mark.parametrize('with_attachment', [False, True])
+def test_ingest_missing_summary_rejects_before_task_or_source_side_effects(tmp_path, monkeypatch, with_attachment):
+    from agent.tools.knowledge_ingest import KnowledgeIngest
+    from common.personal_tasks import OWNER, TaskStore
+    from common.runtime_identity import identity_scope
+    store = TaskStore(tmp_path / 'tasks')
+    args = dict(purpose='long_term', reason='测试', summary='旧顶层摘要',
+                pages=[dict(title='知识', category='工程', blocks=[])])
+    if with_attachment:
+        task = store.submit(OWNER, 'attachment', {}, {'channel': 'test'}, 'cfg')
+        store.claim(OWNER, task['task_id'])
+        args['task_id'] = task['task_id']
+        before = store.get(OWNER, task['task_id'])
+    def unexpected(*a, **kw):
+        pytest.fail('无摘要不能创建任务或接收来源')
+    monkeypatch.setattr(store, 'submit', unexpected)
+    monkeypatch.setattr(SourceService, 'receive', unexpected)
+    with identity_scope(user_id=OWNER):
+        result = KnowledgeIngest(dict(cwd=str(tmp_path), task_store=store)).execute(args)
+    assert result.status == 'error' and result.result['code'] == 'invalid_request'
+    if with_attachment:
+        assert store.get(OWNER, task['task_id']) == before
+    assert not (tmp_path / '.personal_sources').exists()

@@ -239,12 +239,14 @@ class KnowledgeService:
         # Wiki owns all registered wiki entries. Keep the filesystem builder
         # in a separate replaceable block once a workspace has wiki history.
         wiki = None
+        registered_wiki_paths = set()
         if (Path(self.workspace_root) / '.personal_sources' / 'sources.sqlite3').is_file():
             from agent.knowledge.wiki import WikiService
             candidate = WikiService(self.workspace_root)
             with candidate.source.transaction() as db:
                 if db.execute('SELECT 1 FROM wiki_publications LIMIT 1').fetchone():
                     wiki = candidate
+                    registered_wiki_paths = {row[0].removeprefix('knowledge/') for row in db.execute('SELECT path FROM wiki_publications')}
 
         def collect(dir_path: Path) -> list:
             # Return sorted (rel_path, title) tuples for *.md under dir_path,
@@ -256,7 +258,7 @@ class KnowledgeService:
                     continue
                 if rel in self.PROTECTED_FILES:
                     continue
-                if wiki is not None and rel.startswith('wiki/'):
+                if rel in registered_wiki_paths:
                     continue
                 from agent.knowledge.personal_assistant import readable
                 if readable(md):
@@ -664,7 +666,8 @@ class KnowledgeService:
             return {"tree": [], "stats": {"pages": 0, "size": 0}, "enabled": conf().get("knowledge", True)}
 
         stats = {"pages": 0, "size": 0}
-        root_files, tree = self._scan_dir(self.knowledge_dir, stats, is_root=True)
+        root_files, tree = self._scan_dir(
+            self.knowledge_dir, stats, is_root=True, summaries=self._read_index_summaries())
 
         return {
             "root_files": root_files,
@@ -673,7 +676,7 @@ class KnowledgeService:
             "enabled": conf().get("knowledge", True),
         }
 
-    def _scan_dir(self, dir_path: str, stats: dict, is_root: bool = False) -> tuple:
+    def _scan_dir(self, dir_path: str, stats: dict, is_root: bool = False, *, summaries: dict) -> tuple:
         """
         Recursively scan a directory.
 
@@ -689,7 +692,7 @@ class KnowledgeService:
             if os.path.islink(full):
                 continue
             if os.path.isdir(full):
-                sub_files, sub_children = self._scan_dir(full, stats)
+                sub_files, sub_children = self._scan_dir(full, stats, summaries=summaries)
                 children.append({"dir": name, "files": sub_files, "children": sub_children})
             elif name.lower().endswith(".md"):
                 from agent.knowledge.personal_assistant import readable
@@ -710,7 +713,12 @@ class KnowledgeService:
                     except Exception:
                         pass
                 title, category = self._presentation(Path(full), title)
-                files.append({"name": name, "title": title, "category": category, "size": size})
+                item = {"name": name, "title": title, "category": category, "size": size}
+                relative = Path(full).relative_to(Path(self.knowledge_dir)).as_posix()
+                if (relative.split('/')[0] not in ('wiki', 'managed')
+                        and relative not in self.PROTECTED_FILES and summaries.get(relative)):
+                    item['summary'] = summaries[relative]
+                files.append(item)
         return files, children
 
     def _presentation(self, path: Path, title: str) -> tuple:

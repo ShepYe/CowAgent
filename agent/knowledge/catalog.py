@@ -181,7 +181,7 @@ def version(wiki, publish_id=None, *, path=None):
         if not pub:
             raise SourceError('invalid_request', '知识发布不存在')
         record, content = verify_archive(db, wiki.source, pub)
-        result = dict(page_id=record['page_id'], page_version=pub['id'], publish_id=pub['id'], title=record['title'],
+        result = dict(page_id=record['page_id'], page_version=pub['id'], publish_id=pub['id'], title=record['title'], summary=record.get('summary', ''),
                       category=record['category'], path=Path(wiki.workspace / pub['path']).relative_to(wiki.knowledge).as_posix(), content=content, created_at=record.get('created_at'), **status(db, wiki.source, pub))
         if result['searchable']:
             result.update(metadata(db, record))
@@ -205,12 +205,12 @@ def history(wiki, offset=0, limit=50):
             seen.add(pub['page'])
             if record.get('created_at'):
                 events.append(dict(id=pub['id'], event_type=kind, created_at=record['created_at'], page_id=pub['page'],
-                                   page_version=pub['id'], publish_id=pub['id'], title=record['title'], category=record['category'], **status(db, wiki.source, pub)))
+                                   page_version=pub['id'], publish_id=pub['id'], title=record['title'], summary=record.get('summary', ''), category=record['category'], **status(db, wiki.source, pub)))
         for row in db.execute('SELECT record FROM wiki_category_events ORDER BY rowid'):
             event = json.loads(row[0])
             pub = publications.get(event['publish_id'])
             if pub:
-                events.append(dict(event, **status(db, wiki.source, pub)))
+                events.append(dict(event, summary=json.loads(pub['record']).get('summary', ''), **status(db, wiki.source, pub)))
         events.sort(key=lambda e: e['created_at'], reverse=True)
         log = wiki.knowledge / 'log.md'
         legacy = log.read_text(encoding='utf-8') if log.exists() else ''

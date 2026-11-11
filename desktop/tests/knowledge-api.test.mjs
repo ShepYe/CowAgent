@@ -51,3 +51,18 @@ test('分类动作原样传双修订和显式Agent，恢复自动不修改当前
 })
 
 test.after(() => { client.request = request })
+
+
+test('API保留当前与历史各自摘要，兼容旧服务缺少字段', async () => {
+  const stub = client.request
+  try {
+    client.request = async url => url.includes('/catalog')
+      ? { status: 'success', pages: [{ title: '同名', summary: '当前独有词' }, { title: '旧无摘要' }] }
+      : { status: 'success', version: { title: '同名', summary: '历史独有词' } }
+    const catalog = await client.getKnowledgeCatalog('agent')
+    assert.equal(catalog.pages[0].summary, '当前独有词')
+    assert.equal(catalog.pages[1].summary, undefined)
+    assert.equal((await client.getKnowledgeVersion('old', 'agent')).version.summary, '历史独有词')
+    assert.equal((await client.getKnowledgeVersionByPath('wiki/旧/中文.md', 'agent')).version.summary, '历史独有词')
+  } finally { client.request = stub }
+})

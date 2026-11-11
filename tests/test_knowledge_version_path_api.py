@@ -11,12 +11,14 @@ catalog_api = _catalog_api_fixture
 
 def test_path_handler_preserves_current_and_historical_contract(catalog_api):
     api = catalog_api
-    first = publish_topic(api.roots['alpha'])
-    second = publish_topic(api.roots['alpha'], previous=first, sources=first['sources'], content='新内容')
+    first = publish_topic(api.roots['alpha'], summary='旧版路径摘要')
+    second = publish_topic(api.roots['alpha'], previous=first, sources=first['sources'], content='新内容', summary='新版路径摘要')
     rel = first['path'].removeprefix('knowledge/')
     result = api.request('KnowledgeVersionHandler', path='./wiki/../' + rel)
     assert result['status'] == 'success'
     assert result['version']['publish_id'] == first['publish_id']
+    assert result['version']['summary'] == '旧版路径摘要'
+    assert api.request('KnowledgeVersionHandler', publish_id=second['publish_id'])['version']['summary'] == '新版路径摘要'
     assert result['version']['path'] == rel
     assert result['version']['current_status'] == 'superseded'
     assert not result['version']['searchable']

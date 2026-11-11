@@ -109,7 +109,7 @@ def test_desktop_republish_runs_registered_source_with_expected_state(tmp_path, 
             assert registered.status == 'success', registered.result
             assert registered.result['organization_required']
             material = registered.result['source_materials'][0]
-            pages = [dict(title='恢复后的链路预算', category='工程', blocks=[dict(content='budget 为42。',
+            pages = [dict(summary='说明本页知识的主题及适用范围。', title='恢复后的链路预算', category='工程', blocks=[dict(content='budget 为42。',
                 sources=[dict(document_id=material['document_id'], revision_id=material['revision_id'],
                               parse_id=material['parse_id'], ordinal=0)])])]
             result = tool.execute(dict(args, pages=pages))

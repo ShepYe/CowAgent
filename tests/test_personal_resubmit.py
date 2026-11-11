@@ -99,3 +99,29 @@ def test_resubmitted_child_runs_with_current_revision_without_redownload(api, tm
     assert revisions == ['cfg-test']
     assert store.get(OWNER, child['task_id'])['status'] == 'succeeded'
     assert store.get(OWNER, old['task_id']) == old
+
+
+def test_config_unavailable_saved_wiki_candidate_is_kept_on_explicit_resubmit(api, tmp_path):
+    from agent.knowledge.wiki import WikiService
+    mod, store, _ = api
+    old = failed_attachment(store, tmp_path)
+    service = mod._source_service()
+    source = service.receive(old['attachments'][0]['path'], filename='source.txt', request_id='saved', origin={'channel': 'test'})
+    service.change(source['document_id'], purpose='long_term', expected_state=0, reason='分享')
+    parsed = service.parse(source['revision_id'])
+    wiki = WikiService(service.workspace)
+    batch = wiki.prepare([dict(title='候选知识', category='工程', summary='说明保存的原始依据。',
+                              blocks=[dict(content='antenna original', sources=[dict(document_id=source['document_id'],
+                                  revision_id=source['revision_id'], parse_id=parsed['parse_id'], ordinal=0)])])], task_id=old['task_id'])
+    store._change(OWNER, old['task_id'], 1, {'failed'},
+                  wiki_batch_id=batch['batch_id'], wiki_workspace=str(service.workspace),
+                  attachment_decisions={'0': {'purpose': 'long_term', 'ready': True}})
+    before = store.get(OWNER, old['task_id'])
+    new = mod._resubmit(store, old['task_id'], 1, 'new-current-config')
+    assert new['config_revision'] == 'cfg-test'
+    assert new['attachments'] == before['attachments']
+    assert 'wiki_batch_id' not in new and 'attachment_decisions' not in new
+    assert store.get(OWNER, old['task_id']) == before
+    with service.transaction() as db:
+        saved = db.execute('SELECT record,published FROM wiki_batches WHERE id=?', (batch['batch_id'],)).fetchone()
+    assert saved[1] == 0 and json.loads(saved[0])['pages'][0]['summary'] == '说明保存的原始依据。'

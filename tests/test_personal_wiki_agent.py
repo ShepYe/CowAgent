@@ -21,10 +21,11 @@ from scripts.verify_personal_desktop import choose_response
 
 class DeterministicToolLoop(LLMModel):
     """只替换模型传输；工具执行、Agent 调度、技能和索引均使用生产实现。"""
-    def __init__(self):
+    def __init__(self, page_count=1):
         super().__init__('offline-tool-loop')
         self.evidence = []
         self.calls = []
+        self.page_count = page_count
 
     def call_stream(self, request):
         messages = [{'role': 'system', 'content': request.system}]
@@ -51,16 +52,32 @@ class DeterministicToolLoop(LLMModel):
                     wire['tool_calls'] = calls
                 messages.append(wire)
         delta, stats = choose_response(dict(messages=messages, tools=[t if 'function' in t else dict(type='function', function=dict(name=t['name'], parameters=t.get('input_schema', {}))) for t in request.tools]))
+        # 本地模型夹具遵循新契约；共享安装探针由其负责者维护。
+        for call in delta.get('tool_calls', []):
+            if call['function']['name'] != 'knowledge_ingest':
+                continue
+            args = json.loads(call['function']['arguments'])
+            if args.get('pages'):
+                page = args['pages'][0]
+                if self.page_count == 2:
+                    import copy
+                    other = copy.deepcopy(page)
+                    other['title'] = '预算测量对照'
+                    args['pages'].append(other)
+                for page in args['pages']:
+                    page['summary'] = '汇集已读取资料中的链路预算测量值，供工程比较与核验原文时使用。'
+                call['function']['arguments'] = json.dumps(args, ensure_ascii=False)
         self.evidence.append(stats)
         self.calls.extend(delta.get('tool_calls', []))
         yield {'choices': [{'delta': delta, 'finish_reason': 'tool_calls' if 'tool_calls' in delta else 'stop'}]}
 
 
 @pytest.mark.parametrize('attachment_count', [1, 2])
+@pytest.mark.parametrize('page_count', [1, 2])
 @pytest.mark.parametrize('purpose,marker,status', [
     ('long_term', '', 'succeeded'), ('transient', 'P01_TRANSIENT', 'succeeded'),
     ('waiting', 'P01_WAITING', 'waiting_input')])
-def test_real_agent_reads_skill_evidence_decides_and_organizes(tmp_path, monkeypatch, purpose, marker, status, attachment_count):
+def test_real_agent_reads_skill_evidence_decides_and_organizes(tmp_path, monkeypatch, purpose, marker, status, attachment_count, page_count):
     import socket
     from common import state_dir
     from agent.tools.tool_manager import ToolManager
@@ -82,8 +99,10 @@ def test_real_agent_reads_skill_evidence_decides_and_organizes(tmp_path, monkeyp
     config = dict(cwd=str(tmp_path), task_store=store)
     skills = SkillManager(custom_dir=str(tmp_path / 'skills'))
     skill = skills.get_skill('knowledge-wiki').skill
-    assert skill and 'pages' in skill.content
-    model = DeterministicToolLoop()
+    assert skill and 'pages[].summary' in skill.content
+    assert skill.source == 'builtin'
+    assert Path(skill.file_path).resolve() == Path('skills/knowledge-wiki/SKILL.md').resolve()
+    model = DeterministicToolLoop(page_count)
     manager = MemoryManager(MemoryConfig(workspace_root=str(tmp_path)), embedding_provider=None)
     try:
         agent = Agent('按资料实际整理知识。', model=model,
@@ -97,12 +116,15 @@ def test_real_agent_reads_skill_evidence_decides_and_organizes(tmp_path, monkeyp
         assert Path(after['attachments'][0]['path']).read_bytes() == original.read_bytes()
         last = model.evidence[-1]
         assert last['skill_read'] and last['attachment_reads'] == attachment_count and last['tool_success']
+        assert Path(last['skill_path']).resolve() == Path(skill.file_path).resolve()
         names = [c['function']['name'] for c in model.calls]
         assert names[:attachment_count + 2] == ['read'] * (attachment_count + 1) + ['knowledge_ingest']
         args = [json.loads(c['function']['arguments']) for c in model.calls if c['function']['name'] == 'knowledge_ingest']
         assert args[0]['purpose'] == purpose and 'pages' not in args[0]
         if purpose == 'long_term':
             assert len(args) == 2 and last['pages_submitted']
+            assert len(args[1]['pages']) == page_count
+            assert all(1 <= len(p['summary']) <= 160 and '\n' not in p['summary'] for p in args[1]['pages'])
             page = args[1]['pages'][0]
             assert page['title'] == '链路预算要点' and page['category'] == '工程/射频'
             assert page['blocks'][0]['content'] != original.read_text(encoding='utf-8')
@@ -116,6 +138,10 @@ def test_real_agent_reads_skill_evidence_decides_and_organizes(tmp_path, monkeyp
             assert 'SEARCH_RESULT' in found and ref['publish_id'] in found
             assert '42 dB' in found
             assert len(readback['sources']) == attachment_count
+            assert len(after['result_refs']) == page_count
+            for submitted_page, result_ref in zip(args[1]['pages'], after['result_refs']):
+                published = WikiService(tmp_path).read_reference(result_ref['publish_id'])
+                assert published['summary'] == submitted_page['summary']
             if attachment_count == 2:
                 assert '57 dB' in found
         else:

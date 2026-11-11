@@ -56,7 +56,7 @@ def test_read_then_ingest_uses_returned_source_identity(tmp_path, extension, ret
         assert material['document_id'] == source['document_id']
         assert material['revision_id'] == source['revision_id']
         result = KnowledgeIngest(config).execute(dict(task_id=task['task_id'], purpose='long_term',
-            reason='完成主题整理', pages=[dict(title='天线链路预算', category='射频/预算',
+            reason='完成主题整理', pages=[dict(summary='说明本页知识的主题及适用范围。', title='天线链路预算', category='射频/预算',
                 blocks=[dict(content='天线预算 antenna 为 42 dB。', sources=[dict(
                     document_id=material['document_id'], revision_id=material['revision_id'],
                     parse_id=material['parse_id'], ordinal=0)])], related_page_ids=[], depends_on=[])]))
@@ -114,7 +114,7 @@ def test_content_revision_echo_cannot_bypass_later_source_state(tmp_path, action
 
 
 def topic_pages(material):
-    return [dict(title='天线预算结论', category='射频/预算', blocks=[dict(
+    return [dict(summary='说明本页知识的主题及适用范围。', title='天线预算结论', category='射频/预算', blocks=[dict(
         content='天线链路 antenna budget 为42 dB。', sources=[dict(
             document_id=material['document_id'], revision_id=material['revision_id'],
             parse_id=material['parse_id'], ordinal=0)])], related_page_ids=[], depends_on=[])]

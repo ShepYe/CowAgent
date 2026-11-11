@@ -1,6 +1,6 @@
 """A large knowledge index or workspace file must not cost the Agent its history.
 
-- index.md past a size is injected as titles only, then cut, and the prompt says so
+- large indexes keep summary previews, complete entries and an omission count
 - the root index.md / log.md are left out of the vector index
 - MEMORY.md past the byte cap keeps its newest entries, not just the hint
 - a system prompt that alone fills the budget still keeps the previous turn
@@ -41,11 +41,12 @@ class TestCompactKnowledgeIndex(unittest.TestCase):
         self.assertEqual(omitted, 0)
         self.assertFalse(compacted)
 
-    def test_a_large_index_keeps_every_title_and_drops_the_summaries(self):
+    def test_a_large_index_keeps_every_title_and_summary_preview(self):
         text, omitted, compacted = _compact_knowledge_index(_index(per_category=20))
         self.assertTrue(compacted)
         self.assertEqual(omitted, 0)
-        self.assertNotIn("xxxx", text)
+        self.assertIn("x" * 40 + "… [缩略/truncated]", text)
+        self.assertNotIn("x" * 41, text)
         self.assertIn("## Cat 2", text)
         self.assertIn("- [Title 2-19](cat2/p19.md)", text)
 
@@ -61,9 +62,11 @@ class TestCompactKnowledgeIndex(unittest.TestCase):
     def test_the_prompt_points_at_the_full_index_when_compacted(self):
         with _knowledge_dir(_index(per_category=20)) as ws:
             prompt = "\n".join(_build_knowledge_section(ws, "zh"))
-        self.assertIn("索引较大，此处只列出标题", prompt)
+        self.assertIn("摘要为标明缩略的预览", prompt)
         self.assertIn("index.md", prompt)
-        self.assertNotIn("xxxx", prompt)
+        self.assertIn("x" * 40, prompt)
+        self.assertIn("offset/limit", prompt)
+        self.assertIn("回读知识正文及当前有效出处", prompt)
 
     def test_the_prompt_is_unchanged_for_a_small_index(self):
         content = "# Knowledge Index\n\n## A\n- [T](a/t.md) — short summary"
@@ -72,6 +75,122 @@ class TestCompactKnowledgeIndex(unittest.TestCase):
             prompt = "\n".join(_build_knowledge_section(ws, "en"))
         self.assertIn("- [T](a/t.md) — short summary", prompt)
         self.assertNotIn("only titles are listed", prompt)
+
+    def test_full_threshold_is_based_on_index_only(self):
+        prefix = "# Index\n## 分类\n- [完整标题](category/page.md) — "
+        content = prefix + "字" * (_INDEX_FULL_CHARS - len(prefix))
+        self.assertEqual(_compact_knowledge_index(content), (content, 0, False))
+        with _knowledge_dir(content) as ws:
+            prompt = "\n".join(_build_knowledge_section(ws, "zh"))
+        self.assertIn(content, prompt)
+        self.assertNotIn("缩略/truncated", prompt)
+        text, omitted, compacted = _compact_knowledge_index(content + "字")
+        self.assertTrue(compacted)
+        self.assertEqual(omitted, 0)
+        self.assertIn("字" * 40 + "… [缩略/truncated]", text)
+        self.assertNotIn("字" * 41, text)
+
+    def test_short_legacy_and_unicode_summaries_keep_categories_and_links(self):
+        content = "\n".join([
+            "# 索引", "## 工程/射频",
+            "- [完整\\]标题](工程/预算(新版).md) — " + "📡" * 60,
+            "* [旧摘要](legacy.md) - 保留未托管摘要",
+            "- [旧无摘要](old.md)",
+            "## 第二分类", "- [短摘要](second.md) — 短摘要",
+            "<!--" + "填充" * 5000 + "-->",
+        ])
+        text, omitted, compacted = _compact_knowledge_index(content)
+        self.assertTrue(compacted)
+        self.assertEqual(omitted, 0)
+        self.assertIn("[完整\\]标题](工程/预算(新版).md)", text)
+        self.assertIn("📡" * 40 + "… [缩略/truncated]", text)
+        self.assertNotIn("📡" * 41, text)
+        self.assertIn("保留未托管摘要", text)
+        self.assertIn("- [旧无摘要](old.md)\n## 第二分类", text)
+        self.assertIn("短摘要", text)
+
+    def test_exact_maximum_and_one_extra_entry_omit_whole_links(self):
+        prefix = "# Index\n## 分类\n- ["
+        suffix = "](category/full.md)"
+        content = prefix + "标" * (_INDEX_MAX_CHARS - len(prefix) - len(suffix)) + suffix
+        self.assertEqual(_compact_knowledge_index(content), (content, 0, True))
+        text, omitted, compacted = _compact_knowledge_index(content + "\n- [Next](next.md)")
+        self.assertEqual(text, content)
+        self.assertEqual(omitted, 1)
+        self.assertTrue(compacted)
+
+    def test_arbitrary_nested_and_escaped_paths_keep_links_and_omission_count(self):
+        links = ['notes/budget(revision(2)).md', r'notes/escaped\(version\).md', '<notes/a(b(c).md>']
+        content = '# Index\n## Legacy\n' + '\n'.join(f'- [Legacy]({path}) — 选页摘要' for path in links)
+        content += '\n<!--' + 'x' * 8000 + '-->'
+        text, omitted, compacted = _compact_knowledge_index(content)
+        self.assertTrue(compacted)
+        self.assertEqual(omitted, 0)
+        for path in links:
+            self.assertIn(f'[Legacy]({path})', text)
+        too_long = '# Index\n- [' + 'x' * _INDEX_MAX_CHARS + '](notes/a(b(c)).md)'
+        self.assertEqual(_compact_knowledge_index(too_long), ('', 1, True))
+
+    def test_oversized_title_does_not_leave_a_partial_link_or_category(self):
+        content = "# Index\n## 巨大分类\n- [" + "长" * _INDEX_MAX_CHARS + "](huge.md)\n## 后续\n- [Next](next.md)"
+        text, omitted, compacted = _compact_knowledge_index(content)
+        self.assertEqual(text, "")
+        self.assertEqual(omitted, 2)
+        self.assertTrue(compacted)
+
+    def test_bilingual_prompts_report_omissions_and_require_readback(self):
+        content = _index(per_category=400, summary_len=100)
+        _, omitted, _ = _compact_knowledge_index(content)
+        for language in ("zh", "en"):
+            with self.subTest(language=language), _knowledge_dir(content) as ws:
+                prompt = "\n".join(_build_knowledge_section(ws, language))
+                self.assertIn(str(omitted), prompt)
+                self.assertIn("offset/limit", prompt)
+                self.assertIn("memory_search", prompt)
+                self.assertIn("pages[].summary", prompt)
+                self.assertIn("缩略/truncated", prompt)
+                self.assertIn("currently valid sources" if language == "en" else "当前有效出处", prompt)
+
+    def test_bilingual_empty_and_task_prompts_require_per_page_summary(self):
+        from common.personal_tasks import task_scope
+        for language in ("zh", "en"):
+            with self.subTest(language=language), _knowledge_dir("") as ws:
+                Path(ws, "knowledge", "index.md").unlink()
+                empty = "\n".join(_build_knowledge_section(ws, language))
+                self.assertIn("pages[].summary", empty)
+                Path(ws, "knowledge", "index.md").write_text("# Index", encoding="utf-8")
+                with task_scope("test-summary-task"):
+                    task = "\n".join(_build_knowledge_section(ws, language))
+                self.assertIn("pages[].summary", task)
+                self.assertIn("160", task)
+
+    def test_stale_index_never_injects_withdrawn_page_or_summary(self):
+        from agent.knowledge.personal_assistant import SourceService
+        from agent.knowledge.wiki import WikiService
+
+        with _knowledge_dir("") as ws:
+            root = Path(ws)
+            original = root / "source.txt"
+            original.write_text("核验过的预算为42 dB。", encoding="utf-8")
+            source = SourceService(root)
+            receipt = source.receive(original, filename="source.txt", request_id="prompt-source", origin={"channel": "test"})
+            source.change(receipt["document_id"], purpose="long_term", expected_state=0, reason="分享")
+            parsed = source.parse(receipt["revision_id"])
+            evidence = dict(document_id=receipt["document_id"], revision_id=receipt["revision_id"], parse_id=parsed["parse_id"], ordinal=0)
+            wiki = WikiService(root)
+            ref = wiki.publish(wiki.prepare([dict(title="有效预算页", summary="OnlyValidSummary", category="工程", blocks=[dict(content="预算为42 dB。", sources=[evidence])])])["batch_id"])[0]
+            index_path = root / "knowledge/index.md"
+            index = index_path.read_text(encoding="utf-8")
+            for language in ("zh", "en"):
+                self.assertIn("OnlyValidSummary", "\n".join(_build_knowledge_section(ws, language)))
+            source.change(receipt["document_id"], action="withdraw", expected_state=1, reason="撤回")
+            # 即使磁盘残留旧投影，也必须先过滤有效性，再计算上下文预算。
+            index_path.write_text(index, encoding="utf-8")
+            for language in ("zh", "en"):
+                prompt = "\n".join(_build_knowledge_section(ws, language))
+                self.assertNotIn("OnlyValidSummary", prompt)
+                self.assertNotIn("有效预算页", prompt)
+                self.assertNotIn(ref["path"].removeprefix("knowledge/"), prompt)
 
 
 class _knowledge_dir:
@@ -129,7 +248,7 @@ class TestBookkeepingFilesAreNotEmbedded(unittest.TestCase):
             real_read = Path.read_text
 
             def spy_read(self, *a, **kw):
-                seen.append(str(self.relative_to(tmp)))
+                seen.append(self.relative_to(tmp).as_posix())
                 return real_read(self, *a, **kw)
 
             from common import state_dir

@@ -137,7 +137,7 @@ def run_agent(task):
         query += ("\n[系统接收记录] task_id=" + task["task_id"] +
                   "\n附件已可靠保存。根据用户上下文自主判断用途，分享资料主动整理，无需逐份询问。"
                   "先读取 knowledge-wiki 技能正文及资料，调用 knowledge_ingest 登记用途；长期资料须继续提炼、分类、命名，"
-                  "以 pages 正文块与真实出处完成受控发布，支持拆页、跨来源和更新已有页。organization_required 表示须继续整理。"
+                  "以 pages 正文块、每页必填的一句话 summary 与真实出处完成受控发布，支持拆页、跨来源和更新已有页。organization_required 表示须继续整理。"
                   "临时资料只留档，缺少必要信息时具体澄清。"
                   "面向用户只展示标题、分类、出处和真实处理状态；document_id、revision_id、parse_id、publish_id及状态修订仅用于工具参数，不在回复中罗列。"
                   "禁止将未完成索引称为可检索。附件：\n" + json.dumps(task["attachments"], ensure_ascii=False))

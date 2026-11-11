@@ -35,7 +35,7 @@ def organized_pages(task, content="设备预算资料已按主题整理。", tit
     decisions = task["attachment_decisions"].values()
     sources = [dict(document_id=d["source"]["document_id"], revision_id=d["source"]["revision_id"],
                     parse_id=d["parse_id"], ordinal=0) for d in decisions if d["purpose"] == "long_term"]
-    return [dict(title=title, category="工程/预算", blocks=[dict(content=content, sources=sources)],
+    return [dict(summary='说明本页知识的主题及适用范围。', title=title, category="工程/预算", blocks=[dict(content=content, sources=sources)],
                  related_page_ids=[], depends_on=[])]
 
 
@@ -407,7 +407,7 @@ def test_source_action_pages_cannot_complete_attachment_batch(tmp_path, action, 
     config = {"cwd": str(tmp_path), "task_store": store}
     args = dict(document_id=source["document_id"], revision_id=source["revision_id"],
                 expected_state=2, action=action, purpose="long_term", reason="恢复并提交第一份成品")
-    pages = [dict(title="射频预算", category="工程", blocks=[dict(content="射频预算为42 dB。", sources=[dict(
+    pages = [dict(summary='说明本页知识的主题及适用范围。', title="射频预算", category="工程", blocks=[dict(content="射频预算为42 dB。", sources=[dict(
         document_id=source["document_id"], revision_id=source["revision_id"],
         parse_id=parsed["parse_id"], ordinal=0)])], related_page_ids=[], depends_on=[])]
     with identity_scope(user_id=OWNER), task_scope(task["task_id"]):
@@ -470,7 +470,7 @@ def test_restore_registered_source_without_attachment(tmp_path, action):
         assert not result.result["searchable"] and not service.search("预算")
         assert result.result["revision_id"] == source["revision_id"]
         material = result.result
-        pages = [dict(title="射频预算", category="工程/预算", blocks=[dict(content="射频预算为42 dB。",
+        pages = [dict(summary='说明本页知识的主题及适用范围。', title="射频预算", category="工程/预算", blocks=[dict(content="射频预算为42 dB。",
             sources=[dict(document_id=material["document_id"], revision_id=material["revision_id"],
                           parse_id=material["parse_id"], ordinal=0)])], related_page_ids=[], depends_on=[])]
         result = tool.execute(dict(document_id=source["document_id"], expected_state=material["state_revision"],
@@ -500,7 +500,7 @@ def test_restore_pending_index_retries_without_reparse(tmp_path, monkeypatch):
         args = dict(document_id=source["document_id"], expected_state=2, action="republish", reason="恢复")
         material = tool.execute(args).result
         assert material["organization_required"] and not service.search("预算")
-        pages = [dict(title="恢复预算", category="工程", blocks=[dict(content="射频预算42 dB。", sources=[dict(
+        pages = [dict(summary='说明本页知识的主题及适用范围。', title="恢复预算", category="工程", blocks=[dict(content="射频预算42 dB。", sources=[dict(
             document_id=source["document_id"], revision_id=source["revision_id"], parse_id=material["parse_id"], ordinal=0)])])]
         monkeypatch.setattr(WikiService, "publish", lambda *a: (_ for _ in ()).throw(SourceError("index_failed", "索引暂不可用")))
         result = tool.execute(dict(args, pages=pages))
@@ -532,7 +532,7 @@ def test_restore_text_task_checkpoint_and_cancel(tmp_path, monkeypatch):
     with identity_scope(user_id=OWNER), task_scope(task["task_id"]):
         material = tool.execute(args).result
         assert material["organization_required"]
-        pages = [dict(title="恢复资料", category="工程", blocks=[dict(content="预算42 dB。", sources=[dict(
+        pages = [dict(summary='说明本页知识的主题及适用范围。', title="恢复资料", category="工程", blocks=[dict(content="预算42 dB。", sources=[dict(
             document_id=source["document_id"], revision_id=source["revision_id"], parse_id=material["parse_id"], ordinal=0)])])]
         assert tool.execute(dict(args, pages=pages)).status == "error"
         checkpoint = store.get(OWNER, task["task_id"])

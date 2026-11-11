@@ -24,8 +24,8 @@ def publish_wiki(mod, tmp_path, title='模型整理的主题'):
         sources.append(dict(receipt, parse_id=parsed['parse_id'], ordinal=index + 1))
     wiki = WikiService(mod._get_workspace_root())
     batch = wiki.prepare([
-        dict(page_id='topic-one', title=title, category='技术', blocks=[dict(content='经证据支撑的整理结论', sources=sources)]),
-        dict(page_id='topic-two', title='相关主题', category='技术', blocks=[dict(content='另一个结论', sources=[sources[0]])], related_page_ids=['topic-one'])])
+        dict(page_id='topic-one', summary='说明本页知识的主题及适用范围。', title=title, category='技术', blocks=[dict(content='经证据支撑的整理结论', sources=sources)]),
+        dict(page_id='topic-two', summary='说明本页知识的主题及适用范围。', title='相关主题', category='技术', blocks=[dict(content='另一个结论', sources=[sources[0]])], related_page_ids=['topic-one'])])
     refs = wiki.publish(batch['batch_id'])
     return svc, wiki, refs
 
@@ -34,6 +34,27 @@ def task_with_refs(store, refs):
     task = store.submit(OWNER, 'wiki-result', {}, {'channel': 'web'}, 'cfg')
     store.claim(OWNER, task['task_id'])
     return store.complete(OWNER, task['task_id'], 1, 'published', refs)
+
+
+@pytest.mark.parametrize('legacy_publication', [False, True])
+def test_task_api_fills_version_summary_for_old_receipts(api, tmp_path, legacy_publication):
+    mod, store, _ = api
+    _, wiki, refs = publish_wiki(mod, tmp_path)
+    if legacy_publication:
+        with wiki.source.transaction() as db:
+            for ref in refs:
+                record = json.loads(db.execute('SELECT record FROM wiki_publications WHERE id=?', (ref['publish_id'],)).fetchone()[0])
+                record.pop('summary')
+                db.execute('UPDATE wiki_publications SET record=? WHERE id=?', (json.dumps(record, ensure_ascii=False), ref['publish_id']))
+    expected = '' if legacy_publication else refs[0]['summary']
+    for ref in refs:
+        ref.pop('summary')
+    task = task_with_refs(store, refs)
+    display = mod._decorate(task)['result_refs'][0]
+    assert display['current_searchable'] and display['summary'] == expected
+    wiki.source.change(refs[0]['document_id'], action='withdraw', expected_state=1, reason='隔离失效')
+    display = mod._decorate(task)['result_refs'][0]
+    assert not display['current_searchable'] and display['summary'] == ''
 
 
 @pytest.mark.parametrize('normalized_contract', [False, True])

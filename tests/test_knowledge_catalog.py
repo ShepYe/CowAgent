@@ -212,3 +212,63 @@ def test_catalog_legacy_content_preserves_unmanaged_text_and_links_without_writi
     assert result['legacy_content'] == note.strip()
     assert result['pages']
     assert (index.read_bytes(), index.stat().st_mtime_ns) == before
+
+
+
+def test_summary_follows_content_version_not_category_and_filters_invalid(tmp_path):
+    svc, receipt, evidence = source(tmp_path)
+    wiki = WikiService(tmp_path)
+    first = publish(wiki, page(evidence, summary='旧版独有摘要'))[0]
+    changed = wiki.set_page_category(first['page_id'], first['page_version'], 0, '我的/分类')
+    assert changed['summary'] == first['summary']
+    assert changed['page_version'] == first['page_version']
+    second = publish(wiki, page(evidence, page_id=first['page_id'],
+        expected_version=first['page_version'], summary='新版独有摘要'), task='updated')[0]
+    index = tmp_path / 'knowledge/index.md'
+    assert '## 我的/分类' in index.read_text(encoding='utf-8')
+    assert '新版独有摘要' in index.read_text(encoding='utf-8')
+    assert '旧版独有摘要' not in index.read_text(encoding='utf-8')
+    assert wiki.version(first['publish_id'])['summary'] == '旧版独有摘要'
+    assert wiki.version(second['publish_id'])['summary'] == '新版独有摘要'
+    assert wiki.read_reference(first['publish_id'], historical=True)['summary'] == '旧版独有摘要'
+    assert {e['summary'] for e in wiki.history()['events']} == {'旧版独有摘要', '新版独有摘要'}
+    svc.change(receipt['document_id'], action='withdraw', expected_state=1, reason='摘要失效')
+    assert wiki.catalog()['pages'] == []
+    assert '新版独有摘要' not in index.read_text(encoding='utf-8')
+    assert wiki.version(second['publish_id'])['summary'] == '新版独有摘要'
+
+
+def test_old_publication_summary_defaults_empty_and_never_uses_index_suffix(tmp_path):
+    _, _, evidence = source(tmp_path)
+    wiki = WikiService(tmp_path)
+    ref = publish(wiki, page(evidence))[0]
+    with sqlite3.connect(wiki.db) as db:
+        record = json.loads(db.execute('SELECT record FROM wiki_publications').fetchone()[0])
+        del record['summary']
+        db.execute('UPDATE wiki_publications SET record=?', (json.dumps(record, ensure_ascii=False),))
+    index = tmp_path / 'knowledge/index.md'
+    index.write_text('- [旧托管条目](./' + ref['path'].removeprefix('knowledge/') + ') — 旧分类伪摘要\n', encoding='utf-8')
+    reopened = WikiService(tmp_path)
+    assert reopened.current(ref['page_id'])['summary'] == ''
+    assert reopened.catalog()['pages'][0]['summary'] == ''
+    assert reopened.history()['events'][0]['summary'] == ''
+    assert reopened.version(ref['publish_id'])['summary'] == ''
+    assert '旧分类伪摘要' not in index.read_text(encoding='utf-8')
+    assert ') — ' not in index.read_text(encoding='utf-8')
+
+
+def test_summary_projection_rebuild_preserves_unmanaged_wiki_summary(tmp_path):
+    _, _, evidence = source(tmp_path)
+    wiki = WikiService(tmp_path)
+    ref = publish(wiki, page(evidence, summary='普通摘要包含 [括号] <标签> *星号*'))[0]
+    unmanaged = tmp_path / 'knowledge/wiki/手写.md'
+    unmanaged.write_text('# 手写笔记\n自有内容', encoding='utf-8')
+    index = tmp_path / 'knowledge/index.md'
+    with index.open('a', encoding='utf-8') as out:
+        out.write('\n- [手写笔记](./wiki/手写.md) — 保留的未托管摘要\n')
+    assert KnowledgeService(tmp_path).rebuild_index_md()
+    text = index.read_text(encoding='utf-8')
+    assert '保留的未托管摘要' in text
+    assert ref['summary'] == wiki.catalog()['pages'][0]['summary']
+    assert '\\[括号\\]' in text and '&lt;标签&gt;' in text
+    assert text.count(ref['path'].removeprefix('knowledge/')) == 1

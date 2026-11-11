@@ -80,6 +80,48 @@
     overflow: hidden;
     text-overflow: ellipsis;
 }
+.knowledge-tree-label {
+    flex: 1;
+    min-width: 0;
+}
+.knowledge-tree-title {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.knowledge-tree-summary {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    overflow: hidden;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    margin-top: 3px;
+    line-height: 1.5;
+    color: rgb(var(--cw-slate-500));
+}
+.knowledge-summary-tooltip {
+    position: fixed;
+    z-index: 9999;
+    width: max-content;
+    max-width: min(320px, calc(100vw - 16px));
+    padding: 8px 12px;
+    border: 1px solid rgb(var(--cw-slate-200));
+    border-radius: 8px;
+    background: rgb(var(--cw-panel));
+    color: rgb(var(--cw-slate-700));
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.12);
+    pointer-events: none;
+}
+.dark .knowledge-summary-tooltip {
+    border-color: rgb(var(--cw-slate-700));
+    color: rgb(var(--cw-slate-200));
+}
 .knowledge-tree-file:hover {
     background: rgba(0,0,0,0.04);
     color: rgb(var(--cw-slate-700));
