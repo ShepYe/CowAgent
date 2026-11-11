@@ -7,8 +7,11 @@ import copy
 import hashlib
 import json
 from contextlib import contextmanager
+from contextvars import ContextVar
 
 from config import Config, conf, config_scope, config_lock
+
+_pinned_config = ContextVar("personal_pinned_config", default=None)
 
 
 class ConfigUnavailable(ValueError):
@@ -29,6 +32,9 @@ def _revision(snapshot):
 
 def capture_config_revision() -> str:
     """Capture before receipt commit; do not hold config_lock at the call site."""
+    pinned = _pinned_config.get()
+    if pinned is not None:
+        return pinned[0]
     with config_lock:
         return _revision(conf())
 
@@ -46,12 +52,24 @@ def use_config_revision(revision: str):
     Workers spawned on other threads must enter this context themselves.
     The caller must use fresh clients, never a global Bridge cached client.
     """
+    pinned = _pinned_config.get()
+    if pinned is not None:
+        if revision != pinned[0]:
+            raise ConfigUnavailable()
+        # 工具初始化可能补齐运行时字段；子能力仍使用接收时已核验的原始快照。
+        with config_scope(Config(copy.deepcopy(pinned[1]))):
+            yield
+        return
     with config_lock:
-        snapshot = Config(copy.deepcopy(dict(conf())))
+        snapshot = copy.deepcopy(dict(conf()))
         if revision != _revision(snapshot):
             raise ConfigUnavailable()
-    with config_scope(snapshot):
-        yield
+    token = _pinned_config.set((revision, copy.deepcopy(snapshot)))
+    try:
+        with config_scope(Config(snapshot)):
+            yield
+    finally:
+        _pinned_config.reset(token)
 
 
 def provider_references(cfg, provider_id):

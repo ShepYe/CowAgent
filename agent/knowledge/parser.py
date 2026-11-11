@@ -1,9 +1,10 @@
 """Bounded full source extraction; display pagination never enters publication."""
 from pathlib import Path
 from io import BytesIO
+from zipfile import ZipFile
 
 PARSER_ID = "personal-source"
-PARSER_VERSION = "1"
+PARSER_VERSION = "2"
 MAX_BYTES = 10 * 1024 * 1024
 MAX_UNITS = 200000
 MAX_PAGES = 2000
@@ -15,11 +16,14 @@ class SourceError(ValueError):
         super().__init__(message)
 
 
-def parse_source(path, filename=None, *, max_bytes=MAX_BYTES, max_units=MAX_UNITS):
+def parse_source(path, filename=None, *, max_bytes=MAX_BYTES, max_units=MAX_UNITS,
+                 render_budget=None):
     """Return all text with genuine positions, or fail without a partial result."""
     path = Path(path)
     ext = Path(filename or path.name).suffix.lower()
     units, size = [], 0
+    visual_coverage, render_config = [], None
+    visual_warnings = []
 
     def add(text, location, **metadata):
         nonlocal size
@@ -39,10 +43,10 @@ def parse_source(path, filename=None, *, max_bytes=MAX_BYTES, max_units=MAX_UNIT
                 raise SourceError("limit_exceeded", "PDF 物理页数超限")
             for number, page in enumerate(reader.pages, 1):
                 text = page.extract_text() or ""
-                # A mixed scanned/text document also requires OCR: no silent omission.
-                if not text.strip() and page.images:
-                    raise SourceError("needs_ocr", f"PDF 物理页 {number} 需要 OCR")
-                add(text, {"kind": "pdf", "physical_page": number})
+                add(text, {"kind": "pdf", "physical_page": number, "type": "text"}, type="text")
+            from agent.knowledge.visual import inspect_pdf, RENDER_BUDGET
+            render_config = dict(RENDER_BUDGET, **(render_budget or {}))
+            visual_coverage = inspect_pdf(path, len(reader.pages), units, budget=render_budget)
         elif ext == ".docx":
             from docx import Document
             from common.office_text import iter_docx_source_units
@@ -86,12 +90,25 @@ def parse_source(path, filename=None, *, max_bytes=MAX_BYTES, max_units=MAX_UNIT
                 add(line, {"kind": "text", "line": number})
         else:
             raise SourceError("invalid_request", f"不支持的资料格式：{ext}")
+        if ext in (".docx", ".xlsx"):
+            prefix = "word" if ext == ".docx" else "xl"
+            with ZipFile(path) as package:
+                for part in sorted(set(package.namelist())):
+                    if part.endswith("/"):
+                        continue
+                    for folder, kind in (("media", "image"), ("charts", "chart")):
+                        if part.startswith(f"{prefix}/{folder}/") and "/_rels/" not in part:
+                            visual_warnings.append(dict(kind=kind, part=part, status="pending",
+                                                        reason="visual_not_supported"))
     except SourceError:
         raise
     except Exception as exc:
         raise SourceError("parse_failed", f"资料解析失败：{type(exc).__name__}") from exc
-    if not units:
+    if not units and not visual_coverage and not visual_warnings:
         raise SourceError("needs_ocr" if ext == ".pdf" else "parse_failed", "未提取到可定位文本")
+    config = {"max_bytes": max_bytes, "max_units": max_units, "max_pages": MAX_PAGES}
+    if render_config is not None:
+        config["render"] = render_config
     return {"parser_id": PARSER_ID, "parser_version": PARSER_VERSION,
-            "config": {"max_bytes": max_bytes, "max_units": max_units, "max_pages": MAX_PAGES},
-            "units": units}
+            "config": config,
+            "units": units, "visual_coverage": visual_coverage, "visual_warnings": visual_warnings}

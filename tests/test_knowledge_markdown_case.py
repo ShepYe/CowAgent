@@ -105,7 +105,9 @@ def test_admitted_extension_case_survives_knowledge_consumers(tmp_path, extensio
         'PYTHONPATH': os.pathsep.join([str(REPO), *sys.path]),
         'PYTHONDONTWRITEBYTECODE': '1',
     }
+    if sys.platform == 'win32' and os.environ.get('SystemRoot'):
+        env['SystemRoot'] = os.environ['SystemRoot']  # Winsock 初始化依赖系统目录。
     result = subprocess.run([sys.executable, '-c', PROGRAM, str(workspace), extension, action],
                             cwd=tmp_path, env=env, capture_output=True, text=True, timeout=20)
-    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.returncode == 0, (result.stdout or '') + (result.stderr or '')
     assert json.loads(result.stdout.splitlines()[-1])['action'] == action

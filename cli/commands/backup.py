@@ -578,6 +578,8 @@ def _relocate_personal_databases(staging: Path, manifest: dict, data_root: Path,
                     record[key] = relocate(record[key])
 
     def task_record(record):
+        if "wiki_workspace" in record:
+            record["wiki_workspace"] = relocate(record["wiki_workspace"])
         for item in record.get("attachments", []):
             if "path" in item:
                 item["path"] = relocate(item["path"])

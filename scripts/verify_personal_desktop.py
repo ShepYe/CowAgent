@@ -1,4 +1,5 @@
-"""P-01 本机替身；真实桌面操作证据存入 local/p01-evidence。
+"""P-01 确定性工具回路替身；执行证据存入 local/p01-evidence。
+仅验证真实工具链，模型判断质量由真实模型调试单独验收。
 
 启动：.venv/Scripts/python scripts/verify_personal_desktop.py serve
 断言：.venv/Scripts/python scripts/verify_personal_desktop.py check
@@ -24,70 +25,129 @@ def content_text(content):
     return ""
 
 
+def _tool_value(raw):
+    """解包真实工具回执；错误和非 JSON 正文保留给调用方验证。"""
+    value = content_text(raw)
+    for _ in range(3):
+        try:
+            value = json.loads(value) if isinstance(value, str) else value
+        except (ValueError, TypeError):
+            break
+        if isinstance(value, dict) and "result" in value:
+            if value.get("status") == "error":
+                return value
+            value = value["result"]
+        else:
+            break
+    return value
+
+
 def choose_response(body):
-    """Only this user turn selects intent; historical tool replies cannot finish it."""
+    """确定性工具回路替身，仅验收执行链；模型判断质量由真实调试验收。"""
     messages = body.get("messages", [])
     user_index = next((i for i in range(len(messages) - 1, -1, -1)
                        if messages[i].get("role") == "user"
                        and content_text(messages[i].get("content"))), -1)
     text = content_text(messages[user_index].get("content")) if user_index >= 0 else ""
     tools = {t.get("function", {}).get("name") for t in body.get("tools", [])}
-    returned = [m for m in messages[user_index + 1:] if m.get("role") == "tool"]
+    calls = {c["id"]: c["function"] for m in messages[user_index + 1:] for c in m.get("tool_calls", [])}
+    returned = []
+    for message in messages[user_index + 1:]:
+        call = calls.get(message.get("tool_call_id"))
+        if message.get("role") == "tool" and call:
+            returned.append((call["name"], json.loads(call.get("arguments", "{}")),
+                             _tool_value(message.get("content"))))
     task = re.search(r"\[系统接收记录\]\s*task_id=([A-Za-z0-9_-]+)", text)
-    name, args = None, {}
+    stats = dict(tool_offered="ls" in tools, ingest_offered="knowledge_ingest" in tools,
+                 search_offered="memory_search" in tools, tool_returned=len(returned),
+                 tool_success=False, refs_count=0, skill_read=False, attachment_reads=0,
+                 pages_submitted=False, fixture_kind="deterministic-tool-loop")
+
+    def call(name, args):
+        stats.update(tool_called=name, purpose=args.get("purpose"))
+        if name not in tools:
+            return {"content": "P01_TOOL_UNAVAILABLE " + name}, stats
+        return {"tool_calls": [{"index": 0, "id": "call_p01_" + str(len(returned)), "type": "function",
+                 "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}]}, stats
+
+    def finish(answer, success=False):
+        stats.update(tool_called=None, tool_success=success)
+        return {"content": answer}, stats
+
     if task:
-        # The appended receipt/instructions and system prompt never decide purpose.
-        purpose = "transient" if "P01_TRANSIENT" in text[:task.start()] else "long_term"
-        name, args = "knowledge_ingest", {"task_id": task[1], "purpose": purpose,
-                    "reason": "本机替身：按用户测试标记选择用途"}
-    elif "P01_SEARCH" in text:
+        try:
+            attachments = json.loads(text.split("附件：", 1)[1].strip())
+        except (ValueError, IndexError):
+            return finish("INGEST_UNVERIFIED missing attachment manifest")
+        # 技能路径必须来自本轮真实系统技能清单，不猜本机路径。
+        system = "\n".join(content_text(m.get("content")) for m in messages if m.get("role") == "system")
+        locations = re.findall(r"<location>(.*?)</location>", system, flags=re.S)
+        skill_path = next((p.strip() for p in locations if "knowledge-wiki" in p.replace("\\", "/")), None)
+        if not skill_path:
+            return finish("INGEST_UNVERIFIED knowledge-wiki not loaded")
+        stats["skill_path"] = skill_path
+        skill_reads = [v for n, a, v in returned if n == "read" and a.get("path") == skill_path]
+        if not skill_reads:
+            return call("read", {"path": skill_path})
+        skill_value = skill_reads[-1]
+        skill_text = skill_value.get("content", "") if isinstance(skill_value, dict) else str(skill_value)
+        stats["skill_read"] = "knowledge_ingest" in skill_text and "pages" in skill_text
+        if not stats["skill_read"]:
+            return finish("INGEST_UNVERIFIED skill read failed")
+        materials = []
+        for entry in attachments:
+            reads = [v for n, a, v in returned if n == "read" and a.get("path") == entry["path"]]
+            if not reads:
+                return call("read", {"path": entry["path"]})
+            material = reads[-1]
+            if not isinstance(material, dict) or not material.get("parse_id") or not material.get("units"):
+                return finish("INGEST_UNVERIFIED attachment read failed")
+            materials.append(material)
+        stats["attachment_reads"] = len(materials)
+        intent = text[:task.start()]
+        purpose = "transient" if "P01_TRANSIENT" in intent else "waiting" if "P01_WAITING" in intent else "long_term"
+        args = dict(task_id=task[1], purpose=purpose, reason="确定性工具回路：按测试标记分流" if purpose != "waiting" else "应替代哪份资料？")
+        ingests = [(a, v) for n, a, v in returned if n == "knowledge_ingest"]
+        if not ingests:
+            return call("knowledge_ingest", args)
+        submitted, receipt = ingests[-1]
+        stats["pages_submitted"] = bool(submitted.get("pages"))
+        stats["organization_required"] = bool(isinstance(receipt, dict) and receipt.get("organization_required"))
+        if not isinstance(receipt, dict) or receipt.get("task_id") != task[1]:
+            return finish("INGEST_UNVERIFIED " + json.dumps(receipt, ensure_ascii=False))
+        if purpose == "long_term" and receipt.get("organization_required") and not stats["pages_submitted"]:
+            sources, facts = [], []
+            for material in materials:
+                unit = material["units"][0]
+                evidence = unit["text"]
+                budget = re.search(r"(?:budget|预算).*?(\d+(?:\.\d+)?)\s*(dB)?", evidence, re.I)
+                if not budget:
+                    return finish("INGEST_UNVERIFIED fixture requires explicit budget evidence")
+                facts.append("资料给出的链路 budget 为 " + budget[1] + (" " + budget[2] if budget[2] else "") + "。")
+                sources.append(dict(document_id=material["document_id"], revision_id=material["revision_id"],
+                                    parse_id=material["parse_id"], ordinal=unit["ordinal"]))
+            args["pages"] = [dict(title="链路预算要点", category="工程/射频", blocks=[dict(
+                content="\n".join(facts), sources=sources)], related_page_ids=[], depends_on=[])]
+            return call("knowledge_ingest", args)
+        stats["refs_count"] = len(receipt.get("result_refs", []))
+        success = (receipt.get("status") == "waiting_input" if purpose == "waiting" else
+                   receipt.get("status") == "succeeded" and receipt.get("outcome") ==
+                   ("published" if purpose == "long_term" else "transient"))
+        if purpose == "long_term":
+            success = success and stats["pages_submitted"] and stats["refs_count"] > 0 and all(
+                ref.get("searchable") and ref.get("index_mode") == "keyword" for ref in receipt["result_refs"])
+        return finish(("INGEST_OK " if success else "INGEST_NOT_SUCCEEDED ") + json.dumps(receipt, ensure_ascii=False), success)
+    if "P01_SEARCH" in text:
         query = text.split("P01_SEARCH", 1)[1].strip() or "budget"
-        name, args = "memory_search", {"query": query, "max_results": 10}
-    elif "P01_TOOL" in text:
-        name, args = "ls", {"path": "."}
-    result = None
-    for reply in reversed(returned):
-        # Resolve the returned ID against the assistant's actual function call.
-        reply_id = reply.get("tool_call_id")
-        calls = [c for m in messages[user_index + 1:] for c in m.get("tool_calls", [])
-                 if c.get("id") == reply_id and c.get("function", {}).get("name") == name]
-        if calls:
-            result = content_text(reply.get("content"))
-            break
-    success, refs_count = False, 0
-    if result is not None:
-        if name == "knowledge_ingest":
-            try:
-                receipt = json.loads(result)
-                receipt = receipt.get("result", receipt)
-                if isinstance(receipt, str):
-                    receipt = json.loads(receipt)
-                success = receipt.get("status") == "succeeded" and receipt.get("task_id") == task[1]
-                refs = receipt.get("result_refs", [])
-                refs_count = len(refs)
-                answer = ("INGEST_OK " if success else "INGEST_NOT_SUCCEEDED ") + json.dumps(
-                    receipt, ensure_ascii=False)
-            except (ValueError, TypeError, AttributeError):
-                answer = "INGEST_UNVERIFIED " + result
-        elif name == "memory_search":
-            # Verbatim real result, including empty/error results; invent no refs.
-            answer = "SEARCH_RESULT " + result
-            success = not result.startswith("Error")
-        else:
-            success = "P01_READONLY_SENTINEL.txt" in result
-            answer = "P01_TOOL_OK" if success else "P01_TOOL_UNVERIFIED " + result
-        delta = {"content": answer}
-    elif name and name in tools:
-        delta = {"tool_calls": [{"index": 0, "id": "call_p01_" + name, "type": "function",
-                                 "function": {"name": name, "arguments": json.dumps(args)}}]}
-    else:
-        delta = {"content": "P01_TOOL_UNAVAILABLE " + name if name else "P01_CHAT_OK"}
-    return delta, {"tool_offered": "ls" in tools,
-                   "ingest_offered": "knowledge_ingest" in tools,
-                   "search_offered": "memory_search" in tools,
-                   "tool_called": name if "tool_calls" in delta else None,
-                   "purpose": args.get("purpose"), "tool_returned": len(returned),
-                   "tool_success": success, "refs_count": refs_count}
+        replies = [v for n, _, v in returned if n == "memory_search"]
+        return finish("SEARCH_RESULT " + json.dumps(replies[-1], ensure_ascii=False)) if replies else call("memory_search", {"query": query, "max_results": 10})
+    if "P01_TOOL" in text:
+        replies = [v for n, _, v in returned if n == "ls"]
+        if replies:
+            success = "P01_READONLY_SENTINEL.txt" in str(replies[-1])
+            return finish("P01_TOOL_OK" if success else "P01_TOOL_UNVERIFIED " + str(replies[-1]), success)
+        return call("ls", {"path": "."})
+    return finish("P01_CHAT_OK")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -223,6 +283,9 @@ def main():
                       "stream": any(r["stream"] for r in rows),
                       "readonly_tool_called": any(r["tool_called"] == "ls" for r in rows),
                       "readonly_tool_result": any(r["tool_success"] for r in rows),
+                      "skill_body_read": any(r.get("skill_read") for r in rows),
+                      "attachments_read": any(r.get("attachment_reads", 0) for r in rows),
+                      "organized_pages_executed": any(r.get("pages_submitted") and r["tool_success"] for r in rows),
                       "no_embedding_on_stub": all("embedding" not in r["path"] for r in rows)}
         (EVIDENCE / "assertions.json").write_text(json.dumps(assertions, indent=2), encoding="utf-8")
         print(json.dumps(assertions, indent=2))

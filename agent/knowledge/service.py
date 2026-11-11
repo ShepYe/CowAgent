@@ -16,6 +16,7 @@ import re
 import asyncio
 import shutil
 import threading
+import json
 from pathlib import Path
 from typing import Dict, Optional, Iterable
 from urllib.parse import quote, unquote
@@ -676,9 +677,7 @@ class KnowledgeService:
                 if not is_root:
                     stats["pages"] += 1
                     stats["size"] += size
-                # Prefer the H1 heading as a readable title for normal docs.
-                # System files (index.md / log.md) keep their filename so the
-                # tree never hides what they actually are.
+                # 标题用于呈现，name 始终保留真实文件名。
                 title = name[:-3]
                 if name not in self.PROTECTED_FILES:
                     try:
@@ -688,8 +687,25 @@ class KnowledgeService:
                             title = first_line[2:].strip() or title
                     except Exception:
                         pass
-                files.append({"name": name, "title": title, "size": size})
+                title, category = self._presentation(Path(full), title)
+                files.append({"name": name, "title": title, "category": category, "size": size})
         return files, children
+
+    def _presentation(self, path: Path, title: str) -> tuple:
+        """旧投影仅以真实原件名展示，避免将内部编号冒充知识标题。"""
+        parts = path.relative_to(Path(self.knowledge_dir)).parts
+        if len(parts) == 1 and parts[0] in self.PROTECTED_FILES:
+            return {'index.md': '知识索引', 'log.md': '整理记录'}[parts[0]], '知识管理'
+        if parts[0] == 'managed':
+            from agent.knowledge.personal_assistant import SourceService
+            service = SourceService(self.workspace_root)
+            with service.transaction() as db:
+                for row in db.execute('SELECT p.path,r.filename FROM publications p JOIN revisions r ON r.id=p.revision'):
+                    if Path(row[0]).resolve() == path.resolve():
+                        return Path(row[1]).stem, '资料原文'
+            return '资料原文', '资料原文'
+        category = '/'.join(parts[1:-1] if parts[0] == 'wiki' else parts[:-1])
+        return title, category or '未分类'
 
     # ------------------------------------------------------------------
     # read — single file content
@@ -712,6 +728,27 @@ class KnowledgeService:
 
         with open(full_path, "r", encoding="utf-8") as f:
             content = f.read()
+        if rel_path in self.PROTECTED_FILES:
+            content = re.sub(r'<!--\s*wiki-projection:(?:start|end)\s*-->', '', content)
+        if rel_path.startswith('managed/'):
+            content = re.sub(r'\A(?:<!--.*?-->\s*)+', '', content, flags=re.DOTALL)
+            labels = {'physical_page': '物理页', 'page': '物理页', 'sheet': '工作表', 'cell': '单元格',
+                      'paragraph': '段落', 'table': '表格', 'row': '行', 'column': '列', 'line': '行'}
+            lines = []
+            for line in content.splitlines():
+                try:
+                    location = json.loads(line)
+                except (ValueError, TypeError):
+                    location = None
+                if isinstance(location, dict) and 'kind' in location and any(key in labels for key in location):
+                    line = ' · '.join(f'{labels[key]} {value}' for key, value in location.items() if key in labels)
+                elif isinstance(location, dict) and location.get('kind') == 'docx' and isinstance(location.get('path'), str):
+                    names = dict(paragraph='段落', table='表格', row='行', cell='单元格', control='内容控件')
+                    line = ' · '.join('正文' if part == 'body' else re.sub(
+                        r'^(paragraph|table|row|cell|control)\[(\d+)\]$',
+                        lambda match: f'{names[match[1]]} {match[2]}', part) for part in location['path'].split('/'))
+                lines.append(line)
+            content = '\n'.join(lines)
         stat = full_path.stat()
         return {
             "content": content,
@@ -720,7 +757,7 @@ class KnowledgeService:
             # index.md is regenerated from the tree and log.md is the Agent's
             # own journal, so neither is offered for editing. The size bound is
             # the one update_document would enforce on the way back in.
-            "editable": (rel_path not in self.PROTECTED_FILES
+            "editable": (rel_path not in self.PROTECTED_FILES and rel_path.split('/')[0] not in {'wiki', 'managed'}
                          and stat.st_size <= MAX_TEXT_BYTES),
         }
 
@@ -774,8 +811,11 @@ class KnowledgeService:
                 if first_line.startswith("# "):
                     title = first_line[2:].strip()
                 hrefs[rel] = link_re.findall(content)
+                title, display_category = self._presentation(md_file, title)
+                if parts[0] in {'wiki', 'managed'}:
+                    category = display_category
             except Exception:
-                pass
+                continue
             nodes[rel] = {"id": rel, "label": title, "category": category}
 
         by_name = {}
@@ -794,6 +834,24 @@ class KnowledgeService:
                     seen.add(key)
                     links.append({"source": rel, "target": target_rel})
 
+        # 相关页关系独立于正文出处元数据，图谱从有效发布记录补充连线。
+        if any(rel.startswith('wiki/') for rel in nodes):
+            from agent.knowledge.wiki import WikiService
+            wiki = WikiService(self.workspace_root)
+            with wiki.source.transaction() as db:
+                records = [json.loads(row[0]) for row in db.execute(
+                    'SELECT v.record FROM wiki_pages p JOIN wiki_publications v ON v.id=p.current')]
+            paths = {r['page_id']: r['path'].removeprefix('knowledge/') for r in records}
+            for record in records:
+                source = paths[record['page_id']]
+                for page_id in record.get('related_page_ids', []):
+                    target = paths.get(page_id)
+                    if source not in nodes or target not in nodes or source == target:
+                        continue
+                    key = tuple(sorted([source, target]))
+                    if key not in seen:
+                        seen.add(key)
+                        links.append({'source': source, 'target': target})
         return {"nodes": list(nodes.values()), "links": links}
 
     @staticmethod

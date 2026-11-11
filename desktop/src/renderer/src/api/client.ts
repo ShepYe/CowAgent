@@ -1695,7 +1695,7 @@ export interface PersonalTask {
   config_revision: string
   notification: string
   error?: { code: string; message?: string; retryable?: boolean }
-  payload?: { text?: string; filename?: string; source_action?: Record<string, unknown> }
+  payload?: { text?: string; filename?: string; source_action?: Record<string, unknown>; reorganize?: { document_id: string; revision_id: string; expected_state: number } }
   attachments: { attachment_id: string; filename: string; sha256: string }[]
   result_refs: Record<string, unknown>[]
 }
@@ -1729,10 +1729,14 @@ export interface PersonalSourceAction {
   request_id?: string
 }
 export interface PersonalReference {
+  title?: string
+  category?: string
+  filename?: string
   text: string
   location: Record<string, unknown>
   current_status: string
   ordinal: number
+  source_ordinal?: number
   unit_count: number
-  units: { ordinal: number; location: Record<string, unknown> }[]
+  units: { ordinal: number; source_ordinal?: number; filename?: string; location: Record<string, unknown> }[]
 }

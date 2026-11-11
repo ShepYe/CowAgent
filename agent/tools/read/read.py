@@ -135,7 +135,9 @@ class Read(BaseTool):
             "pages": {
                 "type": "string",
                 "description": f"PDF only: page range to extract, e.g. \"3\", \"1-5\" or \"10-\". Defaults to the first {PDF_MAX_PAGES_PER_READ} pages; at most {PDF_MAX_PAGES_PER_READ} pages are read per call."
-            }
+            },
+            "parse_id": {"type": "string", "description": "个人 PDF 续读时回传上次 parse_id，复用已登记视觉结果和 ordinal；继续视觉批次也使用此基线。"},
+            "visual": {"type": "boolean", "description": "个人 PDF 是否显式处理下一批待视觉页，默认 true。仅分页读取已有解析稿时传 false，避免重复模型调用。"}
         },
         "required": ["path"]
     }
@@ -197,13 +199,17 @@ class Read(BaseTool):
             guard_path(absolute_path)
         except ValueError as exc:
             return ToolResult.fail(str(exc))
+        if any(parent.name in ("wiki", "managed") and parent.parent.name == "knowledge" for parent in Path(absolute_path).resolve().parents):
+            from agent.knowledge.purpose import note_source_evidence
+            note_source_evidence()
 
         # Security check: block credential files and their aliases.
         # See issue #2913 (/proc/self/environ bypass) and #2863 (scope).
         if self._is_credential_path(absolute_path):
             return ToolResult.fail(DENIED_MESSAGE)
 
-        attachment_result = self._read_task_attachment(absolute_path, offset, limit, pages)
+        attachment_result = self._read_task_attachment(absolute_path, offset, limit, pages,
+            visual=args.get("visual", True), parse_id=args.get("parse_id"))
         if attachment_result is not None:
             return attachment_result
         
@@ -268,7 +274,7 @@ class Read(BaseTool):
         # Read text file (with truncation for large files)
         return self._read_text(absolute_path, path, offset, limit)
     
-    def _read_task_attachment(self, absolute_path, offset, limit, pages=None):
+    def _read_task_attachment(self, absolute_path, offset, limit, pages=None, *, visual=True, parse_id=None):
         """Read authorized hash blobs using their registered original filename.
 
         Extraction remains complete; only the returned source units are paged.
@@ -294,17 +300,59 @@ class Read(BaseTool):
             attachment = store.attachment(owner, task_id, entry["attachment_id"])
             workspace = self.config.get("workspace_root") or self.cwd
             service = SourceService(workspace, owner)
-            receipt = service.receive(attachment["path"], filename=attachment["filename"],
-                request_id=f"{task_id}:{attachment['attachment_id']}", origin=task["origin"])
-            parsed = service.parse(receipt["revision_id"])
+            directive = task.get("payload", {}).get("reorganize") or task.get("payload", {}).get("source_action")
+            document_id = None
+            if directive:
+                from agent.knowledge.parser import SourceError
+                document_id = directive["document_id"]
+                revision = service.registered_revision(document_id, directive["revision_id"])
+                checkpoint = task.get("source_action_checkpoint") or {}
+                expected_state = (checkpoint.get("state") if task.get("payload", {}).get("source_action")
+                                  else directive.get("expected_state"))
+                if (type(expected_state) is not int or service.get(document_id)["state"] != expected_state):
+                    raise SourceError("version_conflict", "来源状态已变化，不能重绑原件")
+                if revision["sha256"] != attachment["sha256"]:
+                    raise SourceError("version_conflict", "任务附件与已登记原件不符")
+            receive_args = dict(filename=attachment["filename"],
+                request_id=f"{task_id}:{attachment['attachment_id']}", origin=task["origin"],
+                document_id=document_id)
+            if document_id is None:
+                receive_args.pop("document_id")
+            receipt = service.receive(attachment["path"], **receive_args)
+            is_pdf = Path(attachment["filename"]).suffix.lower() in self.pdf_extensions
             page_range = None
-            if Path(attachment["filename"]).suffix.lower() in self.pdf_extensions:
+            if is_pdf:
                 from pypdf import PdfReader
-                # Parsed units omit blank pages, including trailing ones.
-                # Read only the page count from the authorized original;
-                # keep the persisted extraction and parse identity unchanged.
                 total_pages = len(PdfReader(attachment["path"]).pages)
                 page_range = _parse_page_range(pages, total_pages)
+            offset = 1 if offset is None else offset
+            limit = 20 if limit is None else limit
+            if type(offset) is not int or type(limit) is not int or limit <= 0:
+                return ToolResult.fail({"code": "invalid_request", "message": "offset/limit 须为整数且 limit 大于零"})
+            if type(visual) is not bool or (parse_id is not None and not isinstance(parse_id, str)):
+                return ToolResult.fail({"code": "invalid_request", "message": "visual 须为布尔值，parse_id 须为字符串"})
+            if is_pdf and not parse_id:
+                parse_id = (task.get("source_read_parses") or {}).get(receipt["revision_id"])
+            parse_args = {"base_parse_id": parse_id} if parse_id else {}
+            parsed = service.parse(receipt["revision_id"], **parse_args)
+            if visual and is_pdf and parsed.get("visual_coverage"):
+                from agent.tools.vision.vision import Vision
+                vision = Vision(dict(self.config, cwd=str(workspace)))
+                vision.model = self.model
+                parsed = service.parse(receipt["revision_id"], visual=True, vision=vision,
+                    visual_budget=self.config.get("visual_budget"), config_revision=task.get("config_revision"),
+                    base_parse_id=parsed["parse_id"])
+            if is_pdf and task.get("status") == "running":
+                # Persist the baseline for later page windows and task recovery;
+                # cancellation/attempt changes must reject a late read result.
+                with store.commit_guard(owner, task_id, task["attempt"]):
+                    current = store.get(owner, task_id)
+                    read_parses = dict(current.get("source_read_parses") or {})
+                    read_parses[receipt["revision_id"]] = parsed["parse_id"]
+                    store._change(owner, task_id, task["attempt"], {"running"}, source_read_parses=read_parses)
+            if directive and service.get(document_id)["state"] != expected_state:
+                from agent.knowledge.parser import SourceError
+                raise SourceError("version_conflict", "阅读期间来源状态已变化")
             # Preserve full locations while splitting very large physical pages
             # into display fragments; text offsets make every fragment resumable.
             units = []
@@ -316,31 +364,65 @@ class Read(BaseTool):
                 for begin in range(0, len(unit["text"]), 2000):
                     units.append(dict(unit, text=unit["text"][begin:begin+2000], ordinal=ordinal,
                                       text_start=begin, text_end=min(begin+2000, len(unit["text"]))))
-            offset = 1 if offset is None else offset
-            limit = 20 if limit is None else limit
-            if type(offset) is not int or type(limit) is not int or limit <= 0:
-                return ToolResult.fail({"code": "invalid_request", "message": "offset/limit 须为整数且 limit 大于零"})
             start = max(0, len(units) + offset) if offset < 0 else max(0, offset-1)
             selected = []
-            result = dict(document_id=receipt["document_id"], revision_id=receipt["revision_id"],
+            # Continuation precedes potentially large source/coverage/body data.
+            result = dict(has_more=start < len(units), next_offset=start+1 if start < len(units) else None,
+                next_pages=None, next_visual_page=None, visual_continuation=None,
+                parse_id=parsed["parse_id"], document_id=receipt["document_id"], revision_id=receipt["revision_id"],
                 expected_current_revision=service.get(receipt["document_id"])["current"],
-                parse_id=parsed["parse_id"], attachment_id=attachment["attachment_id"], filename=attachment["filename"],
-                units=selected, total_units=len(units), offset=start+1, has_more=True,
-                next_offset=len(units)+1, published=False, searchable=False, display_fragments=True)
+                attachment_id=attachment["attachment_id"], filename=attachment["filename"],
+                total_units=len(units), offset=start+1,
+                published=False, searchable=False, display_fragments=True)
+            coverage = parsed.get("visual_coverage", [])
             if page_range is not None:
                 first_page, last_page = page_range
                 result.update(total_pages=total_pages, pages_read=f"{first_page}-{last_page}",
                               next_pages=f"{last_page+1}-" if last_page < total_pages else None)
+                pending_visual = sorted((c for c in coverage
+                                         if c["status"] == "pending"),
+                                        key=lambda c: (c.get("attempts", 0), c["physical_page"]))
+                result["next_visual_page"] = pending_visual[0]["physical_page"] if pending_visual else None
+                result["visual_continuation"] = (dict(parse_id=parsed["parse_id"], visual=True,
+                    pages=f"{pending_visual[0]['physical_page']}-")
+                                                 if pending_visual else None)
+                result["visual_coverage_summary"] = dict(
+                    total_pages=total_pages, recorded_pages=len(coverage),
+                    text_pages=sum(bool(c.get("text")) for c in coverage),
+                    rendered_pages=sum(bool(c.get("rendered")) for c in coverage),
+                    ocr_pages=sum(bool(c.get("ocr")) for c in coverage),
+                    visual_interpretation_pages=sum(bool(c.get("visual_interpretation")) for c in coverage),
+                    processed_pages=sum(c.get("status") == "processed" for c in coverage),
+                    pending_pages=sum(c.get("status") == "pending" for c in coverage),
+                    partial_pages=sum(c.get("status") == "partial" for c in coverage),
+                    blank_pages=sum(c.get("status") == "blank" for c in coverage))
+                coverage = [c for c in coverage if first_page <= c["physical_page"] <= last_page]
+            result["visual_coverage"] = coverage
+            result["visual_warnings"] = parsed.get("visual_warnings", [])
+            result["units"] = selected
             # Include metadata and JSON separators in the budget. Leave room
             # below the Agent's 50000-character cutoff so continuation survives.
             budget = min(DEFAULT_MAX_BYTES, 45000)
-            used = len(json.dumps(result, ensure_ascii=False, default=str).encode("utf-8")) + 32
+            def response_bytes():
+                return len(json.dumps(result, ensure_ascii=False, default=str).encode("utf-8"))
+
+            def oversized_metadata():
+                return ToolResult.fail(dict(code="limit_exceeded", parse_id=parsed["parse_id"],
+                    pages_read=result.get("pages_read"), next_offset=start+1,
+                    message="当前页窗元数据与片段超过回执预算，请缩小 pages 范围后续读"))
+
+            if response_bytes() > budget:
+                return oversized_metadata()
             for unit in units[start:start+min(limit, 200)]:
-                size = len(json.dumps(unit, ensure_ascii=False, default=str).encode("utf-8")) + 2
-                if selected and used + size > budget:
-                    break
                 selected.append(unit)
-                used += size
+                next_index = start + len(selected)
+                result.update(has_more=next_index < len(units),
+                              next_offset=next_index+1 if next_index < len(units) else None)
+                if response_bytes() > budget:
+                    selected.pop()
+                    if not selected:
+                        return oversized_metadata()
+                    break
             next_index = start + len(selected)
             result.update(has_more=next_index < len(units),
                           next_offset=next_index+1 if next_index < len(units) else None)

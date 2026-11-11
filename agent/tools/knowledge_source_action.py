@@ -4,6 +4,7 @@ from common.runtime_identity import current_identity
 from agent.knowledge.personal_assistant import SourceService
 from agent.knowledge.parser import SourceError
 from contextlib import nullcontext
+from agent.tools.knowledge_ingest import KnowledgeIngest
 
 
 class KnowledgeSourceAction(BaseTool):
@@ -15,6 +16,7 @@ class KnowledgeSourceAction(BaseTool):
         "purpose": {"type": "string", "enum": ["long_term", "transient", "waiting"]},
         "revision_id": {"type": "string", "description": "可选已登记版本；省略时恢复该资料最新登记版本"},
         "candidate_id": {"type": "string", "description": "仅用于接续索引失败回执中的恢复候选，expected_state 使用该回执的新状态修订"},
+        "pages": KnowledgeIngest.params["properties"]["pages"],
         "reason": {"type": "string"}}, "required": ["document_id", "expected_state", "action", "reason"]}
 
     def __init__(self, config=None):
@@ -36,6 +38,8 @@ class KnowledgeSourceAction(BaseTool):
                 store = self.config.get("task_store") or TaskStore()
                 task = store.get("local-owner", task_id)
                 attempt = task["attempt"]
+                if args.get("pages") and task["attachments"]:
+                    raise SourceError("invalid_request", "附件任务须通过 knowledge_ingest 为每份附件明确用途后统一提交整理成品")
             action, document_id = args["action"], args["document_id"]
             if type(args["expected_state"]) is not int or not args.get("reason"):
                 raise SourceError("invalid_request", "缺少有效状态修订或操作理由")
@@ -67,26 +71,24 @@ class KnowledgeSourceAction(BaseTool):
                     doc = service.get(document_id)
                     if doc["state"] != state or doc["purpose"] != "long_term" or doc["validity"] != "active":
                         raise SourceError("version_conflict", "恢复操作已因新用途或撤回失效")
-                    candidate_id = args.get("candidate_id") or (checkpoint or {}).get("candidate_id")
-                    if candidate_id:
-                        with service.transaction() as db:
-                            row = db.execute("SELECT document,state,revision FROM candidates WHERE id=?", (candidate_id,)).fetchone()
-                            if not row or row["document"] != document_id or row["state"] != state:
-                                raise SourceError("version_conflict", "恢复候选不属于当前资料状态")
-                    else:
-                        stage = "parse"
-                        candidate_id = service.prepare(source["revision_id"], expected_current_revision=doc["current"],
-                                                       task_id=task_id)["candidate_id"]
+                    stage = "parse"
+                    parsed = service.parse(source["revision_id"])
+                    if not args.get("pages"):
+                        return ToolResult.success(dict(source, state_revision=state, expected_current_revision=doc["current"],
+                            parse_id=parsed["parse_id"], units=parsed["units"][:20],
+                            total_units=len(parsed["units"]), organization_required=True, searchable=False,
+                            next_action="来源已恢复长期资格；须读取资料并提交模型整理的 pages 后才能可检索。附件任务继续调用 knowledge_ingest。"))
+                    from agent.knowledge.wiki import WikiService
+                    wiki = WikiService(workspace)
+                    batch = wiki.prepare(args["pages"], task_id=task_id)
                     stage = "pending_index"
                     if store:
-                        checkpoint["candidate_id"] = candidate_id
                         store._change("local-owner", task_id, attempt, {"running"}, stage=stage,
-                            source_action_checkpoint=checkpoint,
-                            source_candidates=[dict(candidate_id=candidate_id, workspace=str(service.workspace))])
-                    result = service.publish(candidate_id)
-                    if store and not task["attachments"]:
-                        store.complete("local-owner", task_id, attempt, "published", [result])
-                    return ToolResult.success(result)
+                            wiki_batch_id=batch["batch_id"], wiki_workspace=str(workspace))
+                    refs = wiki.publish(batch["batch_id"])
+                    if store:
+                        store.complete("local-owner", task_id, attempt, "published", refs)
+                    return ToolResult.success(dict(result_refs=refs, searchable=True))
                 result = service.change(document_id, expected_state=args["expected_state"],
                     action=action, purpose=args.get("purpose"), reason=args["reason"])
                 return ToolResult.success(result)

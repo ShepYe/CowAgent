@@ -49,6 +49,8 @@ class SourceService:
             db.execute("CREATE TABLE IF NOT EXISTS publications(id TEXT PRIMARY KEY, document TEXT, revision TEXT, parse TEXT, path TEXT UNIQUE, hash TEXT, record TEXT)")
             db.execute("CREATE TABLE IF NOT EXISTS keyword_units(publication TEXT, ordinal INTEGER, text TEXT, location TEXT, PRIMARY KEY(publication,ordinal))")
             db.execute("CREATE TABLE IF NOT EXISTS changes(id TEXT PRIMARY KEY, document TEXT, record TEXT)")
+            from agent.knowledge.wiki import ensure_schema
+            ensure_schema(db)
             if added_publication:
                 # An additive v1 upgrade must retain existing valid evidence.
                 # Run only alongside ADD COLUMN, never on ordinary reopen:
@@ -59,7 +61,7 @@ class SourceService:
                     for publication in publications:
                         candidate_document = dict(document, publication=publication["id"])
                         try:
-                            valid = self._valid(candidate_document, publication)
+                            valid = self._valid(candidate_document, publication, db)
                         except (KeyError, TypeError, ValueError):
                             valid = False
                         if valid:
@@ -136,9 +138,16 @@ class SourceService:
             if not old:
                 db.execute("INSERT INTO revisions VALUES(?,?,?,?,?)", (revision, document_id, digest, filename, _json(record)))
             db.execute("INSERT INTO receipts VALUES(?,?,?)", (request_id, fingerprint, _json(record)))
-            return record
+        self._refresh_wiki_projection()
+        return record
 
-    def parse(self, revision_id):
+    def _refresh_wiki_projection(self):
+        from agent.knowledge.wiki import project_indexes
+        with self.transaction() as db:
+            project_indexes(db, self)
+
+    def parse(self, revision_id, *, visual=False, vision=None, visual_budget=None,
+              config_revision=None, base_parse_id=None):
         with self.transaction() as db:
             row = db.execute("SELECT * FROM revisions WHERE id=?", (revision_id,)).fetchone()
             if not row:
@@ -147,11 +156,77 @@ class SourceService:
         blob = Path(record["original"])
         if _hash(blob.read_bytes()) != record["sha256"]:
             raise SourceError("storage_failed", "原件哈希校验失败")
-        result = parse_source(blob, record["filename"])
+        metadata = {"parse_id", "revision_id", "document_id", "sha256"}
+        if base_parse_id is None and Path(record["filename"]).suffix.lower() == ".pdf":
+            from agent.knowledge.parser import PARSER_ID, PARSER_VERSION
+            source_identity = dict(document_id=record["document_id"], revision_id=revision_id)
+            best = None
+            for candidate in (self.root / "parses").glob("*.json"):
+                if not re.fullmatch(r"[0-9a-f]{64}", candidate.stem):
+                    continue
+                try:
+                    cached = json.loads(candidate.read_text(encoding="utf-8"))
+                    if (not isinstance(cached, dict) or cached.get("parse_id") != candidate.stem
+                            or cached.get("document_id") != record["document_id"]
+                            or cached.get("revision_id") != revision_id or cached.get("sha256") != record["sha256"]
+                            or cached.get("source_identity") != source_identity
+                            or cached.get("parser_id") != PARSER_ID or cached.get("parser_version") != PARSER_VERSION):
+                        continue
+                    content = {key: value for key, value in cached.items() if key not in metadata}
+                    if _hash(_json([record["sha256"], content]).encode()) != candidate.stem:
+                        continue
+                    coverage = cached.get("visual_coverage", [])
+                    # Append-only continuations win over offline/unavailable
+                    # parses; ties retain retry progress without changing ordinals.
+                    score = (sum(bool(c.get("ocr") or c.get("visual_interpretation")) for c in coverage),
+                             sum(c.get("status") == "processed" for c in coverage),
+                             len(cached["units"]), sum(c.get("attempts", 0) for c in coverage),
+                             candidate.stat().st_mtime_ns, candidate.stem)
+                    if best is None or score > best[0]:
+                        best = (score, candidate.stem)
+                except (OSError, ValueError, TypeError, KeyError, AttributeError):
+                    continue  # A damaged cache is never promoted to source evidence.
+            if best is not None:
+                base_parse_id = best[1]
+        if base_parse_id is not None:
+            if not isinstance(base_parse_id, str) or not re.fullmatch(r"[0-9a-f]{64}", base_parse_id):
+                raise SourceError("invalid_request", "解析版本标识无效")
+            try:
+                base = json.loads((self.root / "parses" / f"{base_parse_id}.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise SourceError("invalid_request", "解析版本不存在或已损坏") from exc
+            if (not isinstance(base, dict) or base.get("parse_id") != base_parse_id
+                    or base.get("revision_id") != revision_id
+                    or base.get("document_id") != record["document_id"]
+                    or base.get("sha256") != record["sha256"]):
+                raise SourceError("version_conflict", "解析版本不属于当前资料原件")
+            result = {key: value for key, value in base.items() if key not in metadata}
+            if _hash(_json([record["sha256"], result]).encode()) != base_parse_id:
+                raise SourceError("storage_failed", "解析稿哈希校验失败")
+        else:
+            result = parse_source(blob, record["filename"])
+        # Equal bytes may belong to distinct logical documents. Bind this
+        # immutable parse to its source without changing legacy hash checks.
+        result.setdefault("source_identity", dict(document_id=record["document_id"], revision_id=revision_id))
+        if type(visual) is not bool:
+            raise SourceError("invalid_request", "visual 须为布尔值")
+        if visual and Path(record["filename"]).suffix.lower() == ".pdf":
+            from agent.knowledge.visual import enrich_pdf_visual
+            result = enrich_pdf_visual(blob, result, vision=vision, budget=visual_budget,
+                                       config_revision=config_revision)
         parse_id = _hash(_json([record["sha256"], result]).encode())
         result.update(parse_id=parse_id, revision_id=revision_id, document_id=record["document_id"], sha256=record["sha256"])
         (self.root / "parses").mkdir(exist_ok=True)
-        write_text_atomic(self.root / "parses" / f"{parse_id}.json", _json(result), newline="")
+        target = self.root / "parses" / f"{parse_id}.json"
+        if target.exists():
+            try:
+                existing = json.loads(target.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise SourceError("storage_failed", "已有解析稿损坏，禁止覆盖") from exc
+            if existing != result:
+                raise SourceError("storage_failed", "已有解析稿身份冲突，禁止覆盖")
+        else:
+            write_text_atomic(target, _json(result), newline="")
         return result
 
     def change(self, document_id, *, purpose=None, action="purpose", expected_state, reason):
@@ -166,7 +241,11 @@ class SourceService:
             # Every purpose/correction/withdrawal invalidates candidates and old evidence.
             db.execute("UPDATE documents SET state=state+1,purpose=?,validity=?,current=NULL,publication=NULL WHERE id=?", (purpose, validity, document_id))
             db.execute("INSERT INTO changes VALUES(?,?,?)", (uuid4().hex, document_id, _json(dict(action=action, purpose=purpose, reason=reason, previous_revision=doc["current"], state=expected_state+1))))
-            return self._document(db, document_id)
+            from agent.knowledge.wiki import suspend_sources
+            suspend_sources(db, [document_id], reason)
+            result = self._document(db, document_id)
+        self._refresh_wiki_projection()
+        return result
 
     @staticmethod
     def _document(db, document_id):
@@ -182,6 +261,8 @@ class SourceService:
     def evidence_revision(self):
         """Stable fingerprint of current evidence, including external edits."""
         with self.transaction() as db:
+            from agent.knowledge.wiki import refresh
+            refresh(db, self)
             documents = [tuple(row) for row in db.execute(
                 "SELECT id,current,state,purpose,validity,publication FROM documents ORDER BY id")]
             projections = []
@@ -191,7 +272,14 @@ class SourceService:
                 except OSError:
                     actual = None
                 projections.append((row["id"], row["hash"], actual))
-        return _hash(_json([documents, projections]).encode())
+            wiki = [tuple(row) for row in db.execute("SELECT id,current,status,reason FROM wiki_pages ORDER BY id")]
+            for row in db.execute("SELECT v.id,v.path,v.hash FROM wiki_publications v JOIN wiki_pages p ON p.current=v.id ORDER BY v.id"):
+                try:
+                    actual = _hash((self.workspace / row['path']).read_bytes())
+                except OSError:
+                    actual = None
+                projections.append((row['id'], row['hash'], actual))
+        return _hash(_json([documents, projections, wiki]).encode())
 
     def registered_revision(self, document_id, revision_id=None):
         """Resolve only an already registered source, never a model file path."""
@@ -207,10 +295,19 @@ class SourceService:
 
     def current_publication(self, document_id, revision_id):
         with self.transaction() as db:
+            from agent.knowledge.wiki import refresh, _valid as wiki_valid, _ref
+            refresh(db, self)
+            wiki_pubs = db.execute("SELECT DISTINCT v.* FROM wiki_publications v JOIN wiki_sources s ON s.publication=v.id JOIN wiki_pages p ON p.current=v.id WHERE s.document=? AND s.revision=? ORDER BY v.rowid DESC", (document_id, revision_id)).fetchall()
+            for publication in wiki_pubs:
+                if wiki_valid(db, self, publication):
+                    record = json.loads(publication['record'])
+                    ordinal = next(i for i, source in enumerate(record['sources'])
+                                   if source['document_id'] == document_id and source['revision_id'] == revision_id)
+                    return _ref(record, ordinal)
             doc = self._document(db, document_id)
             pubs = db.execute("SELECT * FROM publications WHERE document=? AND revision=?", (document_id, revision_id)).fetchall()
             for pub in reversed(pubs):
-                if self._valid(doc, pub):
+                if self._valid(doc, pub, db):
                     return json.loads(pub["record"])
         return None
 
@@ -222,9 +319,15 @@ class SourceService:
             if not row:
                 raise SourceError("invalid_request", "内容版本不存在")
             baseline = self._document(db, row[0])
+            from agent.knowledge.wiki import legacy_retired
+            if legacy_retired(db, row[0]):
+                raise SourceError('version_conflict', '资料已转由主题知识页维护，禁止旧原文候选')
         parsed = self.parse(revision_id)
         with self.transaction() as db:
             doc = self._document(db, parsed["document_id"])
+            from agent.knowledge.wiki import legacy_retired
+            if legacy_retired(db, doc['id']):
+                raise SourceError('version_conflict', '资料已转由主题知识页维护，禁止旧原文候选')
             if doc["state"] != baseline["state"] or doc["current"] != expected_current_revision or doc["purpose"] != "long_term" or doc["validity"] != "active":
                 raise SourceError("version_conflict", "内容版本或用途状态不允许发布")
             candidate_id = uuid4().hex
@@ -237,10 +340,13 @@ class SourceService:
             candidate = db.execute("SELECT * FROM candidates WHERE id=?", (candidate_id,)).fetchone()
             if not candidate:
                 raise SourceError("invalid_request", "候选不存在")
+            from agent.knowledge.wiki import legacy_retired
+            if legacy_retired(db, candidate['document']):
+                raise SourceError('version_conflict', '资料已转由主题知识页维护，旧原文候选已退役')
             old = db.execute("SELECT record FROM publications WHERE id=?", (candidate_id,)).fetchone()
             if old:
                 pub = db.execute("SELECT * FROM publications WHERE id=?", (candidate_id,)).fetchone()
-                if not self._valid(self._document(db, pub["document"]), pub):
+                if not self._valid(self._document(db, pub["document"]), pub, db):
                     raise SourceError("version_conflict", "历史发布已失效")
                 return json.loads(old[0])
             doc = self._document(db, candidate["document"])
@@ -273,11 +379,16 @@ class SourceService:
 
     def read_reference(self, publish_id, ordinal, *, historical=False):
         with self.transaction() as db:
+            is_wiki = db.execute('SELECT 1 FROM wiki_publications WHERE id=?', (publish_id,)).fetchone()
+        if is_wiki:
+            from agent.knowledge.wiki import WikiService
+            return WikiService(self.workspace, self.owner).read_reference(publish_id, ordinal, historical)
+        with self.transaction() as db:
             pub = db.execute("SELECT * FROM publications WHERE id=?", (publish_id,)).fetchone()
             if not pub:
                 raise SourceError("invalid_request", "引用不存在")
             doc = self._document(db, pub["document"])
-            valid = self._valid(doc, pub)
+            valid = self._valid(doc, pub, db)
             if not valid and not historical:
                 raise SourceError("version_conflict", "引用已失效或投影存在未发布变更")
             unit = db.execute("SELECT * FROM keyword_units WHERE publication=? AND ordinal=?", (publish_id, ordinal)).fetchone()
@@ -291,8 +402,10 @@ class SourceService:
                         location=parsed["units"][ordinal]["location"], valid=valid,
                         current_status=doc["validity"] if doc["validity"] != "active" else ("current" if valid else "superseded_or_modified"), original=revision["original"])
 
-    @staticmethod
-    def _valid(doc, pub):
+    def _valid(self, doc, pub, db=None):
+        from agent.knowledge.wiki import replaced
+        if db is not None and replaced(db, doc["id"], pub["revision"], self):
+            return False
         try:
             return (doc["current"] == pub["revision"] and doc["publication"] == pub["id"] and doc["validity"] == "active" and doc["purpose"] == "long_term"
                     and doc["state"] == json.loads(pub["record"])["state_revision"]
@@ -301,6 +414,10 @@ class SourceService:
             return False
 
     def search(self, query, limit=10):
+        if limit <= 0:
+            return []
+        from agent.knowledge.wiki import WikiService, replaced
+        results = WikiService(self.workspace, self.owner).search(query, limit=limit)
         tokens = re.findall(r"[a-zA-Z0-9_]+|[\u4e00-\u9fff]{2}", query.lower())
         # Chinese overlapping bigrams allow real questions without a tokenizer
         # dependency or an embedding request. Rank by matched keyword count.
@@ -311,10 +428,15 @@ class SourceService:
             where = " OR ".join("instr(lower(text),?)>0" for _ in tokens)
             rows = db.execute(f"SELECT publication,ordinal,text FROM keyword_units WHERE {where}", tokens).fetchall()
         rows = sorted(rows, key=lambda row: sum(token in row[2].lower() for token in tokens), reverse=True)
-        results = []
         for row in rows:
+            if len(results) >= limit:
+                break
             try:
-                results.append(self.read_reference(row[0], row[1]))
+                ref = self.read_reference(row[0], row[1])
+                with self.transaction() as db:
+                    if replaced(db, ref['document_id'], ref['revision_id'], self):
+                        continue
+                results.append(ref)
             except SourceError:
                 continue
             if len(results) >= limit:
@@ -332,16 +454,23 @@ def guard_path(path, *, write=False):
             continue
         rel = path.relative_to(knowledge)
         authority = knowledge.parent / ".personal_sources" / "sources.sqlite3"
-        if rel.parts[0] != "managed" and not authority.exists():
+        if rel.parts[0] not in ("managed", "wiki") and not authority.exists():
             return
-        managed = rel.parts[0] == "managed"
+        managed = rel.parts[0] in ("managed", "wiki")
         if authority.exists():
             service = SourceService(knowledge.parent, knowledge_root=knowledge)
             with service.transaction() as db:
+                from agent.knowledge.wiki import refresh, _valid as wiki_valid
+                refresh(db, service)
+                wiki_pub = db.execute('SELECT * FROM wiki_publications WHERE path=?', (f'knowledge/{rel.as_posix()}',)).fetchone()
+                if wiki_pub:
+                    managed = True
+                    if not write and wiki_valid(db, service, wiki_pub):
+                        return
                 pub = db.execute("SELECT * FROM publications WHERE path=?", (str(path),)).fetchone()
                 if pub:
                     managed = True
-                    if not write and service._valid(service._document(db, pub["document"]), pub):
+                    if not write and service._valid(service._document(db, pub["document"]), pub, db):
                         return
         if managed:
             raise SourceError("version_conflict", "托管页须通过来源发布入口处理；当前页无有效发布或禁止直接写入")

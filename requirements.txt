@@ -19,6 +19,8 @@ qrcode
 json-repair
 # 个人助手首期的原件解析能力，与桌面冻结依赖保持一致。
 pypdf
+# PDFium renders complete PDF pages (including scans and vector charts).
+pypdfium2>=4.30,<6
 python-docx
 openpyxl
 # search_files tool: regex.search() supports a real per-call timeout, stdlib re does not

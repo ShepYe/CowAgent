@@ -610,7 +610,7 @@ def _build_knowledge_section(
     knowledge_root = str(state_dir.knowledge_dir(base=workspace_dir))
     index_path = os.path.join(knowledge_root, "index.md")
     if not os.path.exists(index_path):
-        return ["个人接收任务使用 knowledge_ingest 自主处理资料；long_term 发布、transient 仅留档、waiting 仅用于必要澄清。托管资料禁止用 write/edit 绕过版本登记。"]
+        return ["个人资料先读取 knowledge-wiki 和原文，再用 knowledge_ingest 自主登记用途；长期资料须提交整理后的 pages（标题、分类、正文块与出处），organization_required 时继续整理。transient 仅留档，waiting 仅必要澄清。"]
 
     try:
         with open(index_path, 'r', encoding='utf-8') as f:
@@ -624,9 +624,9 @@ def _build_knowledge_section(
     from urllib.parse import unquote as _source_unquote
     index_content = "\n".join(line for line in index_content.splitlines()
         if all(readable(os.path.join(knowledge_root, _source_unquote(target)))
-               for target in _source_re.findall(r"\]\((?:\./)?(managed/[^)]+)\)", line)))
+               for target in _source_re.findall(r"\]\((?:\./)?((?:managed|wiki)/[^)]+)\)", line)))
 
-    index_content = "个人接收任务使用 knowledge_ingest 自主处理，无需逐份询问。临时资料及派生结论不得写入日记或 Deep Dream。托管页引用必须回读有效原文位置；仅 published/searchable 回执表示可检索。\n" + index_content
+    index_content = "个人资料先读取 knowledge-wiki 和原文，再由 knowledge_ingest 发布整理后的主题 pages；无 pages 仅登记用途，须继续整理，无需逐份询问。临时资料及派生结论仅留档。托管页引用回读有效原文位置；仅当前有效且索引核验通过的 searchable 回执表示可检索。\n" + index_content
 
     # Anchor knowledge paths to ~/cow when a project cwd is active, and to the
     # shared root when this Agent reads the shared copy.
@@ -668,12 +668,18 @@ def _build_knowledge_section(
             f"3. **对话涉及重要实体**（人物/公司/项目）→ 创建或更新 `{kb}/entities/<name>.md`",
             f"4. **讨论了技术概念/方法论** → 整理为 `{kb}/concepts/<topic>.md`",
             "",
-            f"每次写入知识页面后，**必须同步更新** `{kb}/index.md` 添加一行索引。",
+            f"普通无来源对话知识写入后更新 `{kb}/index.md`。引用托管资料的结论使用 knowledge_ingest(long_term,pages,reason) 受控发布，可省略 task_id；检索问答只回读回答，不复制为无来源知识、记忆或日记。",
             "详细的页面格式和操作规范，请读取技能 `knowledge-wiki` 的 SKILL.md。",
             "",
             "⚠️ 不要问「要不要存到知识库」——符合上述场景就直接写入，这是你的本能行为。",
             "",
         ]
+
+    from common.personal_tasks import current_task_id
+    if current_task_id():
+        lines = ["## 知识整理", "先实际读取 knowledge-wiki 技能和授权原文，自主判断用途。长期资料按主题提炼、分类、命名、关联，"
+                 "调用 knowledge_ingest 提交 pages 正文块及真实出处；受控发布自动维护知识页和索引。organization_required 时继续整理。"
+                 "临时资料及派生内容只留档。只有当前有效且索引核验通过才报告可检索，视觉覆盖单独如实说明。", ""]
 
     if index_content:
         index_text, omitted, compacted = _compact_knowledge_index(index_content)
@@ -694,9 +700,9 @@ def _build_knowledge_section(
         lines.extend([index_text, ""])
 
     lines.extend([
-        ("**How to query**: use `read` to open a knowledge page, or `memory_search` (knowledge is in the vector index)."
+        ("**How to query**: use `read` to open a knowledge page, or `memory_search` for keyword retrieval."
          if language == "en" else
-         "**查询方式**：用 `read` 读取知识页面，或用 `memory_search` 检索（知识已纳入向量索引）。"),
+         "**查询方式**：用 `read` 读取知识页面，或用 `memory_search` 关键词检索。"),
         "",
     ])
 

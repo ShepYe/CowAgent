@@ -6,6 +6,7 @@ from pathlib import Path
 
 def run(root):
     from agent.knowledge.personal_assistant import SourceService
+    from agent.knowledge.wiki import WikiService
     from common.personal_tasks import TaskStore, OWNER
     from cli.commands.backup import create_backup_archive, restore_backup_archive
     from docx import Document
@@ -54,9 +55,15 @@ def run(root):
         state = service.get(s["document_id"])
         if state["purpose"] != "long_term":
             service.change(s["document_id"], purpose="long_term", expected_state=state["state"], reason="离线验收")
-        candidate = service.prepare(s["revision_id"])
+        parsed = service.parse(s["revision_id"])
+        wiki = WikiService(workspace)
+        ordinal = next(i for i, unit in enumerate(parsed["units"]) if "budget" in unit["text"])
+        candidate = wiki.prepare([dict(title=path.suffix[1:].upper() + " 离线预算知识", category="验收",
+            blocks=[dict(content="## 预算依据\n" + parsed["units"][ordinal]["text"], sources=[dict(
+                document_id=s["document_id"], revision_id=s["revision_id"], parse_id=parsed["parse_id"], ordinal=ordinal)])])],
+            task_id=t["task_id"])
         with store.commit_guard(OWNER, t["task_id"], t["attempt"]):
-            published = service.publish(candidate["candidate_id"])
+            published = wiki.publish(candidate["batch_id"])[0]
             store.complete(OWNER, t["task_id"], t["attempt"], "published", [published])
         hit = service.read_reference(published["publish_id"], 0)
         assert hit["valid"] and service.search("budget")

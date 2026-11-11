@@ -51,16 +51,89 @@ def _source_service():
     return SourceService(_get_workspace_root(), owner_id=OWNER)
 
 
+def _wiki_service():
+    from agent.knowledge.wiki import WikiService
+    return WikiService(_get_workspace_root(), owner_id=OWNER)
+
+
+def _task_source_refs(task):
+    """授权只来自本任务留存的回执，不扩展至其他任务或整份知识库。"""
+    return [source for ref in task.get('result_refs', []) for source in [ref, *ref.get('sources', [])]]
+
+
+def _display_parse(source, service, cache):
+    """视觉展示使用本修订最佳离线解析；引用的不可变 parse_id 不变。"""
+    key = (source.get('document_id'), source.get('revision_id'))
+    if key not in cache:
+        parse = getattr(service, 'parse', None)
+        parsed = parse(source['revision_id']) if callable(parse) else None
+        if not isinstance(parsed, dict):
+            parsed = json.loads((service.root / 'parses' / (source['parse_id'] + '.json')).read_text(encoding='utf-8'))
+        cache[key] = parsed
+    return cache[key]
+
+
+def _decorate_source(source, service, parse_cache):
+    source = dict(source, source_state=None, source_status='unavailable')
+    try:
+        state = service.get(source['document_id'])
+        revision = service.registered_revision(source['document_id'], source.get('revision_id'))
+        latest = service.registered_revision(source['document_id'])
+        status = state['validity'] if state['validity'] != 'active' else (
+            'transient' if state['purpose'] != 'long_term' else (
+                'superseded_or_changed' if latest['revision_id'] != revision['revision_id'] or
+                source.get('source_state_snapshot', state) != state else 'current'))
+        source.update(source_state=state, source_status=status, filename=revision['filename'],
+                      title=Path(revision['filename'].replace('\\', '/')).stem or '资料原文')
+        if source.get('parse_id'):
+            parsed = _display_parse(source, service, parse_cache)
+            source['visual_coverage'] = parsed.get('visual_coverage', [])
+            source['visual_warnings'] = parsed.get('visual_warnings', [])
+    except (ValueError, OSError):
+        pass
+    return source
+
+
 def _decorate(task):
     refs = []
+    parse_cache = {}
     for ref in task.get('result_refs', []):
         ref = dict(ref)
+        ref['current_searchable'] = False
         if ref.get('document_id'):
             try:
                 service = _source_service()
+                if ref.get('sources'):
+                    ref['sources'] = [_decorate_source(source, service, parse_cache) for source in ref['sources']]
                 ref['source_state'] = service.get(ref['document_id'])
-                current = service.current_publication(ref['document_id'], ref.get('revision_id'))
-                ref['current_searchable'] = bool(current and current.get('publish_id') == ref.get('publish_id'))
+                if ref.get('page_id'):
+                    current = _wiki_service().current(ref['page_id'])
+                    ref['current_searchable'] = bool(current and current.get('searchable') is True and current.get('publish_id') == ref.get('publish_id'))
+                else:
+                    current = service.current_publication(ref['document_id'], ref.get('revision_id'))
+                    if current and current.get('publish_id') == ref.get('publish_id') and current.get('searchable') is True:
+                        parsed = json.loads((service.root / 'parses' / (current['parse_id'] + '.json')).read_text(encoding='utf-8'))
+                        with service.transaction() as db:
+                            rows = db.execute('SELECT text,location FROM keyword_units WHERE publication=? ORDER BY ordinal', (current['publish_id'],)).fetchall()
+                        ref['current_searchable'] = bool(rows) and [(r[0], json.loads(r[1])) for r in rows] == [(u['text'], u['location']) for u in parsed['units']]
+                revision = service.registered_revision(ref['document_id'], ref.get('revision_id'))
+                if not ref.get('page_id') or not isinstance(ref.get('title'), str) or not ref['title'].strip():
+                    ref['title'] = Path(revision['filename'].replace('\\', '/')).stem or '资料原文'
+                if not ref.get('page_id') or not ref.get('category'):
+                    ref['category'] = '资料原文' if not ref.get('page_id') else '未分类'
+                ref['filename'] = revision['filename']
+                coverage = []
+                warnings = []
+                seen_revisions = set()
+                for source in ref.get('sources') or [ref]:
+                    key = (source.get('document_id'), source.get('revision_id'))
+                    if source.get('parse_id') and key not in seen_revisions:
+                        seen_revisions.add(key)
+                        parsed = _display_parse(source, service, parse_cache)
+                        coverage.extend(dict(page, filename=source.get('filename', revision['filename'])) for page in parsed.get('visual_coverage', []))
+                        warnings.extend(parsed.get('visual_warnings', []))
+                ref['visual_coverage'] = coverage
+                ref['visual_warnings'] = list({json.dumps(warning, ensure_ascii=False, sort_keys=True): warning for warning in warnings}.values())
             except (ValueError, OSError):
                 ref['source_state'] = None
                 ref['current_searchable'] = False
@@ -138,6 +211,8 @@ class PersonalTaskHandler:
                 task = store.retry(OWNER, task_id, attempt)
             elif action == 'resubmit':
                 task = _resubmit(store, task_id, attempt, body.get('request_id'))
+            elif action == 'reorganize':
+                task = _reorganize(store, task_id, attempt, body)
             elif action == 'update_input':
                 task = store.update_input(OWNER, task_id, attempt, body.get('input'))
             elif action in {'withdraw', 'correct', 'change_purpose', 'republish'}:
@@ -145,7 +220,7 @@ class PersonalTaskHandler:
                 document_id = body.get('document_id')
                 if task['attempt'] != attempt:
                     raise TaskError('version_conflict')
-                source_ref = next((r for r in task['result_refs'] if r.get('document_id') == document_id), None)
+                source_ref = next((r for r in _task_source_refs(task) if r.get('document_id') == document_id), None)
                 if not source_ref:
                     raise TaskError('forbidden')
                 state = body.get('expected_state')
@@ -229,6 +304,77 @@ def _resubmit(store, task_id, attempt, request_id):
         return store._save(db, task)
 
 
+def _reorganize(store, task_id, attempt, body):
+    """复用受信原件；任务与附件一次提交，旧知识在新发布成功前继续有效。"""
+    request_id, state = body.get('request_id'), body.get('expected_state')
+    if (not isinstance(request_id, str) or not request_id or len(request_id) > 200 or
+            type(state) is not int or state < 0):
+        raise TaskError('invalid_request')
+    service = _source_service()
+    from models.config_revision import capture_config_revision
+    from common.personal_tasks import now
+    from uuid import uuid4
+    revision_config = capture_config_revision()
+    with service.transaction() as source_db, store._transaction() as db:
+        parent = store._read(db, OWNER, task_id)
+        if parent['attempt'] != attempt:
+            raise TaskError('version_conflict')
+        document_id = body.get('document_id')
+        # 新页可以有多个来源；授权仍必须来自当前父任务的回执。
+        refs = _task_source_refs(parent)
+        ref = next((r for r in refs if r.get('document_id') == document_id), None)
+        if not ref:
+            raise TaskError('forbidden')
+        directive = dict(document_id=document_id, revision_id=ref.get('revision_id'), expected_state=state)
+        key = f'reorganize:{task_id}:{attempt}:{request_id}'
+        fingerprint = hashlib.sha256(json.dumps(directive, sort_keys=True).encode()).hexdigest()
+        previous = db.execute('SELECT fingerprint,record FROM tasks WHERE owner=? AND request_id=?', (OWNER, key)).fetchone()
+        if previous:
+            if previous[0] != fingerprint:
+                raise TaskError('idempotency_conflict')
+            return json.loads(previous[1])
+        doc = service._document(source_db, document_id)
+        if doc['state'] != state:
+            raise TaskError('version_conflict')
+        if doc['purpose'] != 'long_term' or doc['validity'] != 'active':
+            raise TaskError('forbidden')
+        row = source_db.execute('SELECT record FROM revisions WHERE id=? AND document=?',
+                                (directive['revision_id'], document_id)).fetchone()
+        if not row:
+            raise TaskError('forbidden')
+        revision = json.loads(row[0])
+        latest = source_db.execute('SELECT id FROM revisions WHERE document=? ORDER BY rowid DESC LIMIT 1', (document_id,)).fetchone()
+        if latest[0] != directive['revision_id']:
+            raise TaskError('version_conflict')
+        if hashlib.sha256(Path(revision['original']).read_bytes()).hexdigest() != revision['sha256']:
+            raise TaskError('storage_failed')
+        if doc['current'] and doc['current'] != directive['revision_id']:
+            raise TaskError('version_conflict')
+        attachments = []
+        for attachment in parent['attachments']:
+            if attachment['sha256'] != revision['sha256']:
+                continue
+            path = Path(attachment['path']).resolve()
+            if (path.parent != (store.root / 'originals').resolve() or
+                    hashlib.sha256(path.read_bytes()).hexdigest() != revision['sha256']):
+                raise TaskError('storage_failed')
+            attachments.append(dict(attachment))
+        if not attachments:
+            raise TaskError('forbidden')
+        payload = {'reorganize': directive, 'text':
+            '请重新整理此已登记长期资料。先读取 knowledge-wiki 技能、原附件和已有相关知识，'
+            '根据真实证据提炼、命名、分类并提交主题知识页；调用 knowledge_ingest，保留下述 document_id、revision_id，'
+            '核对 expected_state。不得以原文拼接代替整理，不调用 knowledge_source_action republish，'
+            '不得改变临时或撤回权限。新发布失败时保留旧有效知识。\n' + json.dumps(directive, ensure_ascii=False)}
+        task = dict(schema_version=1, receipt_id=uuid4().hex, task_id=uuid4().hex, request_id=key,
+                    owner_id=OWNER, origin={'channel': 'web', 'channel_instance_id': 'desktop', 'parent_task_id': task_id},
+                    payload=payload, status='queued', stage='receive', attempt=1, config_revision=revision_config,
+                    attachments=attachments, download_complete=True, result_refs=[], outcome=None, error=None,
+                    notification='pending', created_at=now(), updated_at=now())
+        db.execute('INSERT INTO tasks VALUES(?,?,?,?,?)', (task['task_id'], OWNER, key, fingerprint, json.dumps(task, ensure_ascii=False)))
+        return store._save(db, task)
+
+
 def _republish(store, parent, ref, state, reason, request_id, service):
     """显式新任务；原件只能来自父任务，状态授权快照交给 worker 再核验。"""
     if not isinstance(request_id, str) or not request_id or len(request_id) > 200:
@@ -285,9 +431,27 @@ class PersonalReferenceHandler:
             service = _source_service()
             reference = service.read_reference(publish_id, ordinal, historical=True)
             # 位置目录来自已发布版本的解析稿，不接受客户端指定 parse 路径。
-            parsed = json.loads((service.root / 'parses' / (reference['parse_id'] + '.json')).read_text(encoding='utf-8'))
-            reference['units'] = [{'ordinal': i, 'location': unit['location']} for i, unit in enumerate(parsed['units'])]
-            reference['unit_count'] = len(parsed['units'])
+            if reference.get('page_id'):
+                units = _wiki_service().references(publish_id)
+                # 兼容此前把两种 ordinal 反向命名的返回；对外统一目录索引与解析索引。
+                units = [dict(unit, ordinal=i, source_ordinal=unit['ordinal'] if unit['ordinal'] != i else unit.get('source_ordinal', unit['ordinal']))
+                         for i, unit in enumerate(units)]
+                unit = units[ordinal]
+                revision = service.registered_revision(unit['document_id'], unit['revision_id'])
+                if hashlib.sha256(Path(revision['original']).read_bytes()).hexdigest() != revision['sha256']:
+                    raise TaskError('storage_failed')
+                parsed = json.loads((service.root / 'parses' / (unit['parse_id'] + '.json')).read_text(encoding='utf-8'))
+                reference['text'] = parsed['units'][unit['source_ordinal']]['text']
+                reference['location'] = unit['location']
+                reference['ordinal'] = ordinal
+                reference['source_ordinal'] = unit['source_ordinal']
+                reference['sources'] = units
+            else:
+                parsed = json.loads((service.root / 'parses' / (reference['parse_id'] + '.json')).read_text(encoding='utf-8'))
+                units = parsed['units']
+            reference['units'] = [{**{k: unit[k] for k in ('document_id', 'revision_id', 'parse_id', 'location', 'filename', 'source_ordinal', 'source_status') if k in unit},
+                                   'ordinal': i} for i, unit in enumerate(units)]
+            reference['unit_count'] = len(units)
             reference.pop('original', None)
             return _reply(status='success', reference=reference)
         except (ValueError, OSError) as exc:

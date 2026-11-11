@@ -33,7 +33,7 @@ def recover():
     for r in records:
         if r["status"] == "needs_reconcile":
             # 知识发布的恢复由知识登记核对；不盲目重新调用模型。
-            if r.get("source_candidates") or r.get("attachment_decisions") or r["stage"] in {"receive", "download", "decide"}:
+            if r.get("wiki_batch_id") or r.get("source_candidates") or r.get("attachment_decisions") or r["stage"] in {"receive", "download", "decide"}:
                 r = store._change(OWNER, r["task_id"], r["attempt"], {"needs_reconcile"}, status="queued")
             else:
                 store.fail(OWNER, r["task_id"], r["attempt"], "needs_reconcile", r["stage"])
@@ -69,19 +69,18 @@ def _run(task_id):
         task = store.claim(OWNER, task_id)
         from models.config_revision import require_config_revision
         require_config_revision(task["config_revision"])
-        if task["payload"].get("source_action"):
-            execute_source_action(store, task)
-            _notify(store, store.get(OWNER, task_id), "资料已重新发布，可检索。")
-            return
         decisions = task.get("attachment_decisions") or {}
         fully_decided = bool(decisions) and len(decisions) == len(task["attachments"]) and all(d.get("ready") for d in decisions.values())
-        if task.get("source_candidates") or fully_decided:
+        if task.get("wiki_batch_id") or task.get("source_candidates") or fully_decided:
             from agent.tools.knowledge_ingest import resume_publication
             store.stage(OWNER, task_id, task["attempt"], "pending_index")
             resume_publication(task, store)
             result = store.get(OWNER, task_id)
             _notify(store, result, "资料索引与发布已完成，可检索。" if result["outcome"] in {"published", "duplicate"} else "资料已按临时用途处理并留档。")
             return
+        if task["payload"].get("source_action"):
+            execute_source_action(store, task)
+            task = store.get(OWNER, task_id)
         origin = task["origin"]
         if origin.get("channel") != "feishu":
             expected = len(task["payload"].get("files", [])) or (1 if task["payload"].get("filename") else 0)
@@ -104,7 +103,8 @@ def _run(task_id):
             return
         if task["status"] == "running":
             if task["attachments"]:
-                store.wait_input(OWNER, task_id, task["attempt"], response or "资料用途或版本关系需要补充。")
+                # 只有 Agent 明确调用 waiting 才向用户追问；缺少整理成品属于处理未完成。
+                store.fail(OWNER, task_id, task["attempt"], "organization_incomplete", "publish")
             else:
                 store.complete(OWNER, task_id, task["attempt"], "transient", [])
         with store._transaction() as db:
@@ -136,7 +136,10 @@ def run_agent(task):
         import json
         query += ("\n[系统接收记录] task_id=" + task["task_id"] +
                   "\n附件已可靠保存。根据用户上下文自主判断用途，分享资料主动整理，无需逐份询问。"
-                  "必须调用 knowledge_ingest 完成真实处理；临时资料只留档，缺少必要信息时具体澄清。"
+                  "先读取 knowledge-wiki 技能正文及资料，调用 knowledge_ingest 登记用途；长期资料须继续提炼、分类、命名，"
+                  "以 pages 正文块与真实出处完成受控发布，支持拆页、跨来源和更新已有页。organization_required 表示须继续整理。"
+                  "临时资料只留档，缺少必要信息时具体澄清。"
+                  "面向用户只展示标题、分类、出处和真实处理状态；document_id、revision_id、parse_id、publish_id及状态修订仅用于工具参数，不在回复中罗列。"
                   "禁止将未完成索引称为可检索。附件：\n" + json.dumps(task["attachments"], ensure_ascii=False))
     context = Context(ContextType.TEXT, query)
     context["session_id"] = task["origin"].get("session_id") or "personal:" + task["task_id"]
@@ -168,6 +171,4 @@ def execute_source_action(store, task):
             outcome = KnowledgeSourceAction({"task_store": store}).execute(directive)
             if outcome.status != "success":
                 raise TaskError(outcome.result.get("code", "index_failed"))
-            current = store.get(OWNER, task["task_id"])
-            if current["status"] == "running":
-                store.complete(OWNER, task["task_id"], task["attempt"], "published", [outcome.result])
+            # 恢复来源资格后仍由主 Agent 重新整理；来源资格不是可检索回执。

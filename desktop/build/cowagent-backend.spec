@@ -13,7 +13,7 @@ Build from the repo root:
     pyinstaller desktop/build/cowagent-backend.spec --noconfirm
 """
 import os
-from PyInstaller.utils.hooks import collect_submodules, collect_data_files
+from PyInstaller.utils.hooks import collect_submodules, collect_data_files, collect_dynamic_libs, copy_metadata
 
 # Resolve the repo root from the spec's own location (desktop/build/ -> root),
 # independent of the current working directory. PyInstaller exposes SPECPATH.
@@ -123,6 +123,8 @@ hiddenimports += collect_submodules('pypdf')
 hiddenimports += collect_submodules('docx')
 hiddenimports += collect_submodules('pptx')
 hiddenimports += collect_submodules('openpyxl')
+hiddenimports += collect_submodules('pypdfium2')
+hiddenimports += collect_submodules('pypdfium2_raw')
 
 # Playwright powers the browser tool. Only the pure-Python package + its bundled
 # Node driver are shipped (~10-15MB); the ~150MB Chromium binary is NOT bundled
@@ -163,6 +165,10 @@ datas += collect_data_files('tiktoken_ext', include_py_files=False)
 # so ship them or document parsing fails in the frozen build.
 datas += collect_data_files('docx')
 datas += collect_data_files('pptx')
+# PDFium's native library and license/version data live in pypdfium2_raw.
+datas += collect_data_files('pypdfium2_raw', excludes=['*.dll', '*.so', '*.dylib'])
+datas += copy_metadata('pypdfium2')  # Includes PDFium and bundled-library licenses.
+pdfium_binaries = collect_dynamic_libs('pypdfium2_raw')
 
 # Playwright ships its Node.js driver + package.json under playwright/driver/.
 # These are NOT Python modules, so hiddenimports won't pull them in — collect
@@ -191,7 +197,7 @@ block_cipher = None
 a = Analysis(
     [rp('app.py')],
     pathex=[ROOT],
-    binaries=[],
+    binaries=pdfium_binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],

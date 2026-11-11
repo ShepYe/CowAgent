@@ -103,7 +103,7 @@ const knowledgeEditor = createDocEditorStore<KnowledgeRef, KnowledgeReadResult>(
   // The read never truncates, so size is the only other reason it reports a
   // page as uneditable - the bound the save would reject it against anyway.
   refusal: (data) =>
-    PROTECTED_KNOWLEDGE_PAGES.includes(data.path) ? t('knowledge_doc_readonly') : t('ws_edit_too_large'),
+    isProtectedPage(data.path) ? t('knowledge_doc_readonly') : t('ws_edit_too_large'),
 })
 
 const formatSize = (bytes: number): string => {
@@ -129,6 +129,7 @@ function stripDuplicateH1(content: string, title: string): string {
 function categoryPaths(dirs: KnowledgeDir[], parent = ''): string[] {
   const paths: string[] = []
   for (const dir of dirs || []) {
+    if (!parent && ['wiki', 'managed'].includes(dir.dir)) continue
     const path = parent ? `${parent}/${dir.dir}` : dir.dir
     paths.push(path, ...categoryPaths(dir.children || [], path))
   }
@@ -163,7 +164,9 @@ interface DialogState {
 }
 
 // Index pages the Agent maintains; the backend refuses to move or delete them.
-const isProtectedPage = (path: string) => PROTECTED_KNOWLEDGE_PAGES.includes(path)
+const isProtectedPage = (path: string) => PROTECTED_KNOWLEDGE_PAGES.includes(path) || /^(wiki|managed)\//.test(path)
+
+const displayCategory = (path: string) => path.startsWith('managed/') ? '资料原文' : path.split('/').slice(path.startsWith('wiki/') ? 1 : 0, -1).join(' / ') || '未分类'
 
 // Where a document can be moved to: any category but the one it is already in.
 const moveTargets = (categories: string[], path: string) => {
@@ -235,8 +238,8 @@ function resolveKnowledgeLink(list: KnowledgeList, href: string): { path: string
 }
 
 // Resolve a document's display title from its path, falling back to the stem.
-function findTitle(list: KnowledgeList, path: string): string {
-  const fallback = path.split('/').pop()?.replace(/\.md$/i, '') || path
+function findTitle(list: KnowledgeList, path: string, knownTitle?: string): string {
+  const fallback = knownTitle || (path.startsWith('managed/') ? '资料原文' : path.startsWith('wiki/') ? '知识页' : path.split('/').pop()?.replace(/\.md$/i, '') || path)
   for (const f of list.root_files || []) {
     if (f.name === path) return f.title || fallback
   }
@@ -288,7 +291,7 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
   const activePath = doc?.path ?? null
   // Taken from the tree rather than from whatever opened the page, so a save
   // that rewrote the H1 retitles the header as soon as the tree is re-read.
-  const docTitle = doc ? (data ? findTitle(data, doc.path) : doc.title) : ''
+  const docTitle = doc ? (data ? findTitle(data, doc.path, doc.title) : doc.title) : ''
 
   const [graph, setGraph] = useState<KnowledgeGraphData | null>(null)
   const [graphLoading, setGraphLoading] = useState(false)
@@ -409,6 +412,12 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
       setGraphLoading(false)
     }
   }, [graph, viewingAgentId])
+
+  const onPersonalKnowledgeChanged = useCallback(() => {
+    // 任务发布版本或有效性变化后刷新统计，并让图谱下次打开时读取新数据。
+    setGraph(null)
+    void refresh()
+  }, [refresh])
 
   const switchTab = async (next: Tab) => {
     if (next === tab) return
@@ -770,7 +779,7 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
         />
       </div>
 
-      {tab === 'personal' ? <PersonalTasksPanel /> : isEmpty ? (
+      {tab === 'personal' ? <PersonalTasksPanel onKnowledgeChanged={onPersonalKnowledgeChanged} onOpenKnowledge={(path, title) => { setTab('docs'); openDoc(path.replace(/^knowledge\//, ''), title) }} /> : isEmpty ? (
         <div className="flex-1 flex flex-col items-center justify-center px-6 text-center border-t border-default">
           <div className="w-14 h-14 rounded-2xl bg-accent-soft text-accent flex items-center justify-center mb-5">
             <Files size={26} />
@@ -867,9 +876,9 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
                     className={`text-xs text-content-tertiary truncate max-w-[45%] ${
                       readonly ? '' : 'font-mono'
                     }`}
-                    title={readonly || activePath || ''}
+                    title={readonly || undefined}
                   >
-                    {readonly || activePath}
+                    {activePath ? displayCategory(activePath) : ''}
                   </span>
                   <DocActions store={knowledgeEditor} textareaRef={editorRef} />
                 </div>
@@ -1402,6 +1411,12 @@ const DirNode: React.FC<{
   )
   const expanded = open || !!search
 
+  // 保留真实路径用于打开页面，只隐藏存储层的内部目录。
+  if (dirPath === 'wiki' || dirPath.startsWith('managed')) return <>
+    {visibleFiles.map(f => <FileLeaf key={`${dirPath}/${f.name}`} path={`${dirPath}/${f.name}`} title={f.title} active={activePath === `${dirPath}/${f.name}`} onOpen={onOpen} actions={actions} />)}
+    {dir.children.map(c => <DirNode key={c.dir} dir={c} prefix={dirPath} search={search} activePath={activePath} onOpen={onOpen} actions={actions} />)}
+  </>
+
   return (
     <div>
       <button
@@ -1413,7 +1428,7 @@ const DirNode: React.FC<{
         <span className="ml-auto text-xs text-content-tertiary group-hover:hidden">
           {matchCount}
         </span>
-        <span className="ml-auto -my-1 hidden group-hover:flex items-center gap-0.5 flex-shrink-0">
+        {!/^(wiki|managed)(\/|$)/.test(dirPath) && <span className="ml-auto -my-1 hidden group-hover:flex items-center gap-0.5 flex-shrink-0">
           <RowAction icon={Pencil} label={t('knowledge_rename')} onClick={() => actions.renameCategory(dirPath)} />
           <RowAction
             icon={Trash2}
@@ -1421,7 +1436,7 @@ const DirNode: React.FC<{
             danger
             onClick={() => actions.deleteCategory(dirPath)}
           />
-        </span>
+        </span>}
       </button>
       {expanded && (
         <div className="ml-3 border-l border-default pl-1.5 space-y-0.5">

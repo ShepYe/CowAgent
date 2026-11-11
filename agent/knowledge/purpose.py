@@ -5,6 +5,25 @@ import threading
 _evidence_lock = threading.RLock()
 _evidence_tokens = {}
 _discarded_evidence = {}
+_sourced_sessions = set()
+
+
+def _session_key():
+    identity = current_identity()
+    return (identity.agent_id, identity.user_id, identity.session_id) if identity.session_id else None
+
+
+def note_source_evidence():
+    """已核验来源进入会话后，派生持久化须继续走来源发布。"""
+    key = _session_key()
+    if key is not None:
+        with _evidence_lock:
+            _sourced_sessions.add(key)
+
+
+def _source_bearing(message):
+    text = str(message.get('content', ''))
+    return any(marker in text for marker in ('source_reference', 'knowledge/managed/', 'knowledge/wiki/'))
 
 
 def source_task_context():
@@ -12,11 +31,17 @@ def source_task_context():
     return bool(current_task_id()) or (current_identity().session_id or "").startswith("personal:")
 
 
+def source_derived_context():
+    with _evidence_lock:
+        sourced = _session_key() in _sourced_sessions
+    return source_task_context() or sourced
+
+
 def durable_messages(messages):
     # Derived assistant turns share the exclusion of the source conversation.
     # Long-term material is published through SourceService instead of a second,
     # unversioned diary copy. Explicit message metadata survives worker snapshots.
-    if source_task_context() or any(
+    if source_derived_context() or any(_source_bearing(m) for m in messages) or any(
         m.get("personal_task_id") or "[personal-task:" in str(m.get("content", "")) or m.get("purpose") in ("transient", "waiting")
         or m.get("metadata", {}).get("personal_task_id")
         or m.get("metadata", {}).get("purpose") in ("transient", "waiting")
@@ -48,14 +73,14 @@ def mark_messages(messages, task_id):
 
 def guard_memory_write(path, workspace_root=None):
     from pathlib import Path
-    if not source_task_context():
+    if not source_derived_context():
         return
     from common import state_dir
     target = Path(path).resolve()
     workspace = workspace_root or state_dir.state_root()
     knowledge = Path(state_dir.knowledge_dir(base=workspace)).resolve()
     if target.is_relative_to(knowledge) or "memory" in target.parts or target.name == "MEMORY.md":
-        raise ValueError("临时资料及派生结论不能写入摘要/日记/Deep Dream；长期资料使用 knowledge_ingest")
+        raise ValueError("来源资料及派生结论须携带出处通过 knowledge_ingest 发布；临时资料只留档，不能写入摘要/日记/Deep Dream")
 
 
 def refresh_evidence_context(agent):
@@ -86,9 +111,11 @@ def refresh_evidence_context(agent):
 
     def source_evidence(message):
         text = str(message.get("content", ""))
-        return any(marker in text for marker in ("source_reference", "knowledge/managed/", "document_id", "publish_id"))
+        return any(marker in text for marker in ("source_reference", "knowledge/managed/", "knowledge/wiki/", "document_id", "publish_id", "page_version"))
 
     with agent.messages_lock:
+        if any(_source_bearing(message) for message in agent.messages):
+            note_source_evidence()
         messages = [message for message in agent.messages if not archive(message) and str(message) not in discarded]
         if unknown or changed:
             # Drop source-bearing turns and their assistant/tool follow-ups.

@@ -130,6 +130,9 @@ class MemoryGetTool(BaseTool):
             
             from agent.knowledge.personal_assistant import guard_path
             guard_path(file_path)
+            if any(part in ('wiki', 'managed') for part in file_path.parts) and 'knowledge' in file_path.parts:
+                from agent.knowledge.purpose import note_source_evidence
+                note_source_evidence()
             content = file_path.read_text(encoding='utf-8')
             lines = content.split('\n')
             

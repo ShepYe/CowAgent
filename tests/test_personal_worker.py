@@ -90,6 +90,40 @@ def test_desktop_republish_runs_registered_source_with_expected_state(tmp_path, 
     child = store.claim(OWNER, child['task_id'])
     worker.execute_source_action(store, child)
     after = store.get(OWNER, child['task_id'])
+    assert after['status'] == 'running' and not service.search('budget')
+    assert after['source_action_checkpoint']['revision_id'] == source['revision_id']
+    called = []
+    def organize(task):
+        from agent.tools.knowledge_ingest import KnowledgeIngest
+        from common.personal_tasks import task_scope
+        from common.runtime_identity import identity_scope
+        called.append(task['task_id'])
+        assert task['source_action_checkpoint']['expected_state'] == 2
+        assert not service.search('budget')
+        # 桌面恢复必须复用登记原件，并继续走模型整理阶段。
+        assert task['attachments'][0]['sha256'] == parent['attachments'][0]['sha256']
+        tool = KnowledgeIngest({'cwd': str(workspace), 'task_store': store})
+        with identity_scope(user_id=OWNER), task_scope(task['task_id']):
+            args = dict(task_id=task['task_id'], purpose='long_term', reason='恢复后重新整理')
+            registered = tool.execute(args)
+            assert registered.status == 'success', registered.result
+            assert registered.result['organization_required']
+            material = registered.result['source_materials'][0]
+            pages = [dict(title='恢复后的链路预算', category='工程', blocks=[dict(content='budget 为42。',
+                sources=[dict(document_id=material['document_id'], revision_id=material['revision_id'],
+                              parse_id=material['parse_id'], ordinal=0)])])]
+            result = tool.execute(dict(args, pages=pages))
+            assert result.status == 'success', result.result
+        return '已整理并核验索引'
+    monkeypatch.setattr(worker, 'run_agent', organize)
+    # 重启重新排队后，恢复资格检查点不应再次改变来源状态。
+    store._change(OWNER, child['task_id'], 1, {'running'}, status='needs_reconcile')
+    store._change(OWNER, child['task_id'], 1, {'needs_reconcile'}, status='queued')
+    parent = store.get(OWNER, parent['task_id'])
+    store.attach(OWNER, child['task_id'], original, 'source.txt', 'file')
+    worker._run(child['task_id'])
+    after = store.get(OWNER, child['task_id'])
+    assert called == [child['task_id']]
     assert after['status'] == 'succeeded' and service.search('budget')
     # Another withdrawal committed after admission wins; the old expected state
     # cannot be silently updated to republish a newer business decision.
@@ -100,3 +134,26 @@ def test_desktop_republish_runs_registered_source_with_expected_state(tmp_path, 
     from common.personal_tasks import TaskError
     with pytest.raises(TaskError, match='version_conflict'):
         worker.execute_source_action(store, stale)
+
+
+def test_missing_organized_pages_is_failure_not_clarification(tmp_path, monkeypatch):
+    from agent.tools.knowledge_ingest import KnowledgeIngest
+    from common.personal_tasks import task_scope
+    from common.runtime_identity import identity_scope
+    store = setup_worker(tmp_path / 'tasks', monkeypatch)
+    t = task(store)
+    original = tmp_path / 'source.txt'
+    original.write_text('budget 42 dB', encoding='utf-8')
+    store.attach(OWNER, t['task_id'], original)
+    def incomplete(record):
+        with identity_scope(user_id=OWNER), task_scope(record['task_id']):
+            result = KnowledgeIngest({'cwd': str(tmp_path), 'task_store': store}).execute(dict(
+                task_id=record['task_id'], purpose='long_term', reason='有价值'))
+            assert result.status == 'success' and result.result['organization_required']
+        return '尚未提交整理成品'
+    monkeypatch.setattr(worker, 'run_agent', incomplete)
+    worker._run(t['task_id'])
+    after = store.get(OWNER, t['task_id'])
+    assert after['status'] == 'failed'
+    assert after['error']['code'] == 'organization_incomplete'
+    assert not after['result_refs']

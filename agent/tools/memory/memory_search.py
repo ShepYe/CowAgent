@@ -4,7 +4,7 @@ Memory search tool
 Allows agents to search their memory using semantic and keyword search
 """
 
-from typing import Dict, Any, Optional
+from typing import Optional
 from agent.tools.base_tool import BaseTool
 
 
@@ -94,6 +94,10 @@ class MemorySearchTool(BaseTool):
                     f"This is normal if no memories have been stored yet. "
                     f"You can store new memories by writing to MEMORY.md or memory/YYYY-MM-DD.md files."
                 )
+
+            if any('source_reference' in result.snippet or result.path.replace('\\', '/').startswith(('knowledge/wiki/', 'knowledge/managed/')) for result in results):
+                from agent.knowledge.purpose import note_source_evidence
+                note_source_evidence()
             
             # Format results
             output = [f"Found {len(results)} relevant memories:\n"]

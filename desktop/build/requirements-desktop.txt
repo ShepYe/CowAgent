@@ -50,6 +50,7 @@ gTTS>=2.3.1
 
 # ---- document parsing (web_fetch / knowledge) ----
 pypdf
+pypdfium2>=4.30,<6
 python-docx
 openpyxl
 python-pptx

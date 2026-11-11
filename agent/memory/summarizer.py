@@ -417,8 +417,8 @@ class MemoryFlushManager:
         :return: True on success.
         """
         summary = (summary or "").strip()
-        from agent.knowledge.purpose import source_task_context
-        if source_task_context() or "[personal-task:" in summary:
+        from agent.knowledge.purpose import source_derived_context
+        if source_derived_context() or "[personal-task:" in summary:
             return False
         if not summary:
             return False

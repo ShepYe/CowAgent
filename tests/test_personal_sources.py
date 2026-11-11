@@ -30,6 +30,15 @@ def setup_source(tmp_path, text="射频预算为42 dB，设备型号RF100"):
     return service, source
 
 
+def organized_pages(task, content="设备预算资料已按主题整理。", title="设备预算"):
+    """确定性成品夹具；出处来自首轮用途登记，不冒充模型判断验收。"""
+    decisions = task["attachment_decisions"].values()
+    sources = [dict(document_id=d["source"]["document_id"], revision_id=d["source"]["revision_id"],
+                    parse_id=d["parse_id"], ordinal=0) for d in decisions if d["purpose"] == "long_term"]
+    return [dict(title=title, category="工程/预算", blocks=[dict(content=content, sources=sources)],
+                 related_page_ids=[], depends_on=[])]
+
+
 def test_three_formats_full_and_locations(tmp_path):
     from docx import Document
     from openpyxl import Workbook
@@ -190,15 +199,20 @@ def test_ingest_multi_recovery_and_no_reparse(tmp_path, monkeypatch):
         raise OSError("complete 前退出")
     monkeypatch.setattr(store, "complete", crash)
     with identity_scope(user_id=OWNER, session_id="ordinary-desktop"), task_scope(task["task_id"]):
-        assert tool.execute({"task_id": task["task_id"], "purpose": "long_term", "reason": "有价值"}).status == "error"
+        args = {"task_id": task["task_id"], "purpose": "long_term", "reason": "有价值"}
+        registered = tool.execute(args)
+        assert registered.status == "success" and registered.result["organization_required"]
+        assert not SourceService(tmp_path).search("设备预算")
+        assert tool.execute(dict(args, pages=organized_pages(registered.result))).status == "error"
     task = store.get(OWNER, task["task_id"])
-    assert len(task["source_candidates"]) == 2 and task["stage"] == "pending_index"
+    assert task["wiki_batch_id"] and task["wiki_workspace"] == str(tmp_path) and task["stage"] == "pending_index"
     monkeypatch.setattr(store, "complete", old)
     store.retry(OWNER, task["task_id"], 1)
     task = store.claim(OWNER, task["task_id"])
     monkeypatch.setattr(SourceService, "parse", lambda *a: pytest.fail("恢复不能重新解析"))
     result = resume_publication(task, store)
-    assert result["status"] == "succeeded" and len(result["result_refs"]) == 2
+    assert result["status"] == "succeeded" and len(result["result_refs"]) == 1
+    assert len(result["result_refs"][0]["sources"]) == 2
 
 
 def test_purpose_context_and_history_round_trip(tmp_path):
@@ -242,7 +256,7 @@ def test_ingest_duplicate_and_action_barrier(tmp_path):
     tool = KnowledgeIngest({"cwd": str(tmp_path), "task_store": store})
     path = tmp_path / "source.txt"
     path.write_text("同资料同版本", encoding="utf-8")
-    document = None
+    document, ref = None, None
     with identity_scope(user_id=OWNER):
         for n in range(2):
             task = store.submit(OWNER, str(n), {"text": "整理"}, {"channel": "web"}, "cfg")
@@ -252,11 +266,19 @@ def test_ingest_duplicate_and_action_barrier(tmp_path):
             if document:
                 args["document_id"] = document
             with task_scope(task["task_id"]):
-                result = tool.execute(args)
-            assert result.status == "success"
+                registered = tool.execute(args)
+                assert registered.status == "success" and registered.result["organization_required"]
+                pages = organized_pages(registered.result, "同资料同版本的整理结论")
+                if ref is not None:
+                    # 同源重复提交仍须携带成品；更新同一页而非自动原文发布。
+                    pages[0].update(page_id=ref["page_id"], expected_version=ref["page_version"])
+                result = tool.execute(dict(args, pages=pages))
+                replay = tool.execute(dict(args, pages=pages))
+                assert replay.result["result_refs"] == result.result["result_refs"]
+            assert result.status == "success", result.result
             ref = result.result["result_refs"][0]
             document = ref["document_id"]
-            assert result.result["outcome"] == ("published" if n == 0 else "duplicate")
+            assert result.result["outcome"] == "published"
         action = KnowledgeSourceAction({"cwd": str(tmp_path)})
         assert action.execute({"document_id": document, "expected_state": 1, "action": "withdraw", "reason": "撤回"}).status == "success"
         assert action.execute({"document_id": document, "expected_state": 1, "action": "republish", "reason": "迟到"}).status == "error"
@@ -303,18 +325,23 @@ def test_attachment_subsets_mixed_purposes(tmp_path, monkeypatch, interrupt):
         first = tool.execute(dict(task_id=task["task_id"], attachment_id="a0", purpose="long_term", reason="可复用"))
         assert first.status == "success" and first.result["status"] == "running"
         assert not first.result["source_candidates"]
-        assert first.result["attachment_decisions"]["a0"]["candidate_id"]
+        assert first.result["attachment_decisions"]["a0"]["parse_id"]
         assert not service.search("长期资料")
         with pytest.raises(SourceError):
             resume_publication(store.get(OWNER, task["task_id"]), store)
-        # Repeating the subset decision reuses the existing parse/candidate.
-        monkeypatch.setattr(SourceService, "parse", lambda *a: pytest.fail("已有候选不可重新解析"))
+        # 重复子集决定复用已有解析；可靠性断言继续保留。
+        monkeypatch.setattr(SourceService, "parse", lambda *a, **kw: pytest.fail("已有解析不可重新解析"))
         repeated = tool.execute(dict(task_id=task["task_id"], attachment_id="a0", purpose="long_term", reason="重试"))
-        assert repeated.result["attachment_decisions"]["a0"]["candidate_id"] == first.result["attachment_decisions"]["a0"]["candidate_id"]
+        assert repeated.result["attachment_decisions"]["a0"]["parse_id"] == first.result["attachment_decisions"]["a0"]["parse_id"]
+        last = tool.execute(dict(task_id=task["task_id"], attachment_id="a1", purpose="transient", reason="仅本次"))
+        assert last.status == "success" and last.result["organization_required"]
+        assert last.result["attachment_decisions"]["a1"]["purpose"] == "transient"
         complete = store.complete
         if interrupt:
             monkeypatch.setattr(store, "complete", lambda *a, **kw: (_ for _ in ()).throw(OSError("模拟发布后退出")))
-        last = tool.execute(dict(task_id=task["task_id"], attachment_id="a1", purpose="transient", reason="仅本次"))
+        last = tool.execute(dict(task_id=task["task_id"], purpose="long_term", reason="完成整理",
+                                 pages=organized_pages(last.result, "长期资料的可靠结论")))
+        monkeypatch.setattr(SourceService, "parse", lambda *a: pytest.fail("恢复不能重新解析"))
         if interrupt:
             assert last.status == "error"
             monkeypatch.setattr(store, "complete", complete)
@@ -325,7 +352,8 @@ def test_attachment_subsets_mixed_purposes(tmp_path, monkeypatch, interrupt):
             assert last.status == "success"
             finished = last.result
     assert finished["status"] == "succeeded" and len(finished["result_refs"]) == 2
-    assert [ref["purpose"] for ref in finished["result_refs"]] == ["long_term", "transient"]
+    assert finished["attachment_decisions"]["a0"]["purpose"] == "long_term"
+    assert finished["result_refs"][1]["purpose"] == "transient"
     assert finished["result_refs"][1]["searchable"] is False
     assert service.search("长期资料") and not service.search("临时机密")
     assert all(Path(ref["original"]).exists() for ref in (finished["attachment_decisions"][key]["source"] for key in ("a0", "a1")))
@@ -357,6 +385,76 @@ def test_waiting_and_cancel_block_partial_batch(tmp_path):
 
 
 @pytest.mark.parametrize("action", ["republish", "purpose"])
+@pytest.mark.parametrize("other_purpose", ["undecided", "transient"])
+def test_source_action_pages_cannot_complete_attachment_batch(tmp_path, action, other_purpose):
+    from agent.tools.knowledge_ingest import KnowledgeIngest
+    from agent.tools.knowledge_source_action import KnowledgeSourceAction
+    from agent.tools.read.read import Read
+    from common.personal_tasks import TaskStore, OWNER, task_scope
+    from common.runtime_identity import identity_scope
+
+    service, source = setup_source(tmp_path)
+    parsed = service.parse(source["revision_id"])
+    service.change(source["document_id"], action="withdraw", expected_state=1, reason="已撤回")
+    store = TaskStore(tmp_path / "tasks")
+    task = store.submit(OWNER, "source-action-batch", {"text": "第一份恢复整理，第二份另行决定用途"},
+                        {"channel": "web"}, "cfg")
+    store.attach(OWNER, task["task_id"], tmp_path / "input.txt", attachment_id="first")
+    other = tmp_path / "other.txt"
+    other.write_text("临时机密：不得随第一份资料长期发布", encoding="utf-8")
+    attachment = store.attach(OWNER, task["task_id"], other, attachment_id="second")
+    store.claim(OWNER, task["task_id"])
+    config = {"cwd": str(tmp_path), "task_store": store}
+    args = dict(document_id=source["document_id"], revision_id=source["revision_id"],
+                expected_state=2, action=action, purpose="long_term", reason="恢复并提交第一份成品")
+    pages = [dict(title="射频预算", category="工程", blocks=[dict(content="射频预算为42 dB。", sources=[dict(
+        document_id=source["document_id"], revision_id=source["revision_id"],
+        parse_id=parsed["parse_id"], ordinal=0)])], related_page_ids=[], depends_on=[])]
+    with identity_scope(user_id=OWNER), task_scope(task["task_id"]):
+        read = Read(config).execute({"path": attachment["path"]})
+        assert read.status == "success", read.result
+        if other_purpose == "transient":
+            decision = KnowledgeIngest(config).execute(dict(task_id=task["task_id"], attachment_id="second",
+                purpose="transient", reason="仅供当前任务使用"))
+            assert decision.status == "success" and decision.result["status"] == "running"
+        before = store.get(OWNER, task["task_id"])
+        sources_before = {document: service.get(document) for document in
+                          (source["document_id"], read.result["document_id"])}
+        with service.transaction() as db:
+            counts_before = [db.execute("SELECT COUNT(*) FROM " + table).fetchone()[0]
+                             for table in ("changes", "wiki_batches", "wiki_publications")]
+        tool = KnowledgeSourceAction(config)
+        result = tool.execute(dict(args, pages=pages))
+        assert result.status == "error" and result.result["code"] == "invalid_request"
+        assert not result.result["searchable"]
+        after = store.get(OWNER, task["task_id"])
+        assert after["status"] == "failed" and after["outcome"] is None
+        assert after["error"]["code"] == "invalid_request"
+        assert not after["result_refs"] and len(after["attachments"]) == 2
+        assert after.get("attachment_decisions") == before.get("attachment_decisions")
+        assert not after.get("wiki_batch_id") and not after.get("source_action_checkpoint")
+        assert {document: service.get(document) for document in sources_before} == sources_before
+        with service.transaction() as db:
+            assert [db.execute("SELECT COUNT(*) FROM " + table).fetchone()[0]
+                    for table in ("changes", "wiki_batches", "wiki_publications")] == counts_before
+        assert not service.search("预算") and not service.search("临时机密")
+
+        # 不携带成品仍可恢复资格，之后必须由 knowledge_ingest 统一处理附件。
+        store.retry(OWNER, task["task_id"], 1)
+        store.claim(OWNER, task["task_id"])
+        restored = tool.execute(args)
+        assert restored.status == "success" and restored.result["organization_required"]
+        assert not restored.result["searchable"]
+        after = store.get(OWNER, task["task_id"])
+        assert after["status"] == "running" and not after["result_refs"]
+        assert after.get("attachment_decisions") == before.get("attachment_decisions")
+        assert not after.get("wiki_batch_id")
+        assert service.get(read.result["document_id"]) == sources_before[read.result["document_id"]]
+        assert service.get(source["document_id"])["state"] == 3
+        assert not service.search("预算")
+
+
+@pytest.mark.parametrize("action", ["republish", "purpose"])
 def test_restore_registered_source_without_attachment(tmp_path, action):
     from common.runtime_identity import identity_scope
     from agent.tools.knowledge_source_action import KnowledgeSourceAction
@@ -368,32 +466,54 @@ def test_restore_registered_source_without_attachment(tmp_path, action):
     with identity_scope(user_id="local-owner"):
         result = tool.execute(dict(document_id=source["document_id"], expected_state=2,
                                    action=action, purpose="long_term", reason="恢复该资料"))
+        assert result.status == "success" and result.result["organization_required"]
+        assert not result.result["searchable"] and not service.search("预算")
+        assert result.result["revision_id"] == source["revision_id"]
+        material = result.result
+        pages = [dict(title="射频预算", category="工程/预算", blocks=[dict(content="射频预算为42 dB。",
+            sources=[dict(document_id=material["document_id"], revision_id=material["revision_id"],
+                          parse_id=material["parse_id"], ordinal=0)])], related_page_ids=[], depends_on=[])]
+        result = tool.execute(dict(document_id=source["document_id"], expected_state=material["state_revision"],
+                                  action=action, purpose="long_term", reason="重新整理", pages=pages))
     assert result.status == "success" and result.result["searchable"]
-    assert result.result["revision_id"] == source["revision_id"]
-    assert result.result["publish_id"] != previous["publish_id"]
-    assert service.search("预算")[0]["publish_id"] == result.result["publish_id"]
+    ref = result.result["result_refs"][0]
+    assert ref["publish_id"] != previous["publish_id"]
+    assert service.search("预算")[0]["publish_id"] == ref["publish_id"]
     with pytest.raises(SourceError):
         service.read_reference(previous["publish_id"], 0)
 
 
 def test_restore_pending_index_retries_without_reparse(tmp_path, monkeypatch):
-    from common.runtime_identity import identity_scope
+    from agent.knowledge.wiki import WikiService
+    from agent.tools.knowledge_ingest import resume_publication
     from agent.tools.knowledge_source_action import KnowledgeSourceAction
+    from common.runtime_identity import identity_scope
+    from common.personal_tasks import TaskStore, OWNER, task_scope
     service, source = setup_source(tmp_path)
     service.change(source["document_id"], purpose="transient", expected_state=1, reason="暂用")
-    tool = KnowledgeSourceAction({"cwd": str(tmp_path)})
-    publish = SourceService.publish
-    monkeypatch.setattr(SourceService, "publish", lambda *a: (_ for _ in ()).throw(SourceError("index_failed", "索引暂不可用")))
-    with identity_scope(user_id="local-owner"):
-        result = tool.execute(dict(document_id=source["document_id"], expected_state=2,
-                                   action="republish", reason="恢复"))
+    store = TaskStore(tmp_path / "tasks")
+    task = store.submit(OWNER, "restore-index", {"text": "恢复"}, {"channel": "web"}, "cfg")
+    store.claim(OWNER, task["task_id"])
+    tool = KnowledgeSourceAction({"cwd": str(tmp_path), "task_store": store})
+    publish = WikiService.publish
+    with identity_scope(user_id=OWNER), task_scope(task["task_id"]):
+        args = dict(document_id=source["document_id"], expected_state=2, action="republish", reason="恢复")
+        material = tool.execute(args).result
+        assert material["organization_required"] and not service.search("预算")
+        pages = [dict(title="恢复预算", category="工程", blocks=[dict(content="射频预算42 dB。", sources=[dict(
+            document_id=source["document_id"], revision_id=source["revision_id"], parse_id=material["parse_id"], ordinal=0)])])]
+        monkeypatch.setattr(WikiService, "publish", lambda *a: (_ for _ in ()).throw(SourceError("index_failed", "索引暂不可用")))
+        result = tool.execute(dict(args, pages=pages))
         assert result.status == "error" and result.result["stage"] == "pending_index"
         assert not result.result["searchable"] and not service.search("预算")
-        monkeypatch.setattr(SourceService, "publish", publish)
+        checkpoint = store.get(OWNER, task["task_id"])
+        assert checkpoint["wiki_batch_id"] and checkpoint["wiki_workspace"]
+        monkeypatch.setattr(WikiService, "publish", publish)
         monkeypatch.setattr(SourceService, "parse", lambda *a: pytest.fail("索引重试不能重新解析"))
-        result = tool.execute(dict(document_id=source["document_id"], expected_state=result.result["expected_state"],
-            candidate_id=result.result["candidate_id"], action="republish", reason="接续索引"))
-        assert result.status == "success" and result.result["searchable"]
+        store.retry(OWNER, task["task_id"], 1)
+        reopened = TaskStore(tmp_path / "tasks")
+        result = resume_publication(reopened.claim(OWNER, task["task_id"]), reopened)
+        assert result["status"] == "succeeded" and service.search("预算")
 
 
 def test_restore_text_task_checkpoint_and_cancel(tmp_path, monkeypatch):
@@ -410,16 +530,21 @@ def test_restore_text_task_checkpoint_and_cancel(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "complete", lambda *a, **kw: (_ for _ in ()).throw(OSError("退出")))
     args = dict(document_id=source["document_id"], expected_state=2, action="republish", reason="恢复")
     with identity_scope(user_id=OWNER), task_scope(task["task_id"]):
-        assert tool.execute(args).status == "error"
+        material = tool.execute(args).result
+        assert material["organization_required"]
+        pages = [dict(title="恢复资料", category="工程", blocks=[dict(content="预算42 dB。", sources=[dict(
+            document_id=source["document_id"], revision_id=source["revision_id"], parse_id=material["parse_id"], ordinal=0)])])]
+        assert tool.execute(dict(args, pages=pages)).status == "error"
         checkpoint = store.get(OWNER, task["task_id"])
-        assert checkpoint["source_action_checkpoint"]["candidate_id"]
-        assert checkpoint["source_candidates"] and not checkpoint["attachments"]
+        assert checkpoint["source_action_checkpoint"]["revision_id"] == source["revision_id"]
+        assert checkpoint["wiki_batch_id"] and not checkpoint["attachments"]
         monkeypatch.setattr(store, "complete", complete)
         store.retry(OWNER, task["task_id"], 1)
         store.claim(OWNER, task["task_id"])
         monkeypatch.setattr(SourceService, "parse", lambda *a: pytest.fail("恢复不得重解析"))
-        result = tool.execute(args)
-        assert result.status == "success" and result.result["searchable"]
+        from agent.tools.knowledge_ingest import resume_publication
+        result = resume_publication(store.get(OWNER, task["task_id"]), store)
+        assert result["status"] == "succeeded" and service.search("预算")
         assert store.get(OWNER, task["task_id"])["status"] == "succeeded"
         cancelled = store.submit(OWNER, "cancel-restore", {"text": "恢复"}, {"channel": "web"}, "cfg")
         store.claim(OWNER, cancelled["task_id"])

@@ -219,6 +219,11 @@ class MemoryManager:
         )
         logger.info(f"[MemoryManager] Keyword search found {len(keyword_results)} results for query: {query}")
 
+        # Wiki results must carry their block/source directory. Filesystem
+        # indexing (including old vector cache rows) cannot provide that mapping.
+        vector_results = [r for r in vector_results if not r.path.replace("\\", "/").startswith("knowledge/wiki/")]
+        keyword_results = [r for r in keyword_results if not r.path.replace("\\", "/").startswith("knowledge/wiki/")]
+
         # SourceService owns the publication index. Bridge it before ranking so
         # a committed source is queryable without a later filesystem reindex.
         source_root = getattr(self, "_publication_root", None)
@@ -229,7 +234,8 @@ class MemoryManager:
                 keyword_results.append(SearchResult(
                     path=ref["path"], start_line=1, end_line=1, score=1.0,
                     snippet=ref["text"] + "\n[source_reference] " + json.dumps({
-                        k: ref[k] for k in ("document_id", "revision_id", "parse_id", "publish_id", "ordinal", "location")
+                        k: ref[k] for k in ("document_id", "revision_id", "parse_id", "publish_id", "ordinal", "location",
+                                           "page_id", "page_version", "title", "category", "sources", "block_ordinal", "source_ordinals", "source_ordinal") if k in ref
                     }, ensure_ascii=False), source="knowledge"))
 
         # Merge results
