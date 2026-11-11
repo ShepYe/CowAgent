@@ -13,6 +13,7 @@ $pythonExe = Join-Path $repo '.venv\Scripts\python.exe'
 $desktop = Join-Path $repo 'desktop'
 $env:PYTHONUTF8 = '1'
 $env:PYTHONIOENCODING = 'utf-8'
+if ([string]::IsNullOrWhiteSpace($env:DEBUG)) { $env:DEBUG = 'true' }
 $OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 [Console]::OutputEncoding = $OutputEncoding
 
