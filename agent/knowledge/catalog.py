@@ -1,6 +1,7 @@
 """知识页组织元数据及只读发布历史；与内容版本独立提交。"""
 import json
 import re
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -67,18 +68,79 @@ def change(wiki, page_id, expected_version, expected_category_revision, category
 
 
 def catalog(wiki):
-    from agent.knowledge.wiki import refresh, _valid, _ref
+    from agent.knowledge.wiki import refresh
     with wiki.source.transaction() as db:
         refresh(db, wiki.source, project=False)
-        pages = []
-        for pub in db.execute('SELECT v.* FROM wiki_pages p JOIN wiki_publications v ON v.id=p.current'):
-            if _valid(db, wiki.source, pub):
-                ref = _ref(json.loads(pub['record']), db=db)
-                ref['path'] = Path(wiki.workspace / pub['path']).relative_to(wiki.knowledge).as_posix()
-                pages.append(ref)
-        pages.sort(key=lambda p: (p['category'], p['title'], p['page_id']))
+        pages = _current_pages(wiki, db)
         return dict(pages=pages, categories=sorted({p['category'] for p in pages}),
                     legacy_content=_index_legacy_content(wiki, db))
+
+
+def _current_pages(wiki, db):
+    from agent.knowledge.wiki import _valid, _ref
+    pages = []
+    for pub in db.execute('SELECT v.* FROM wiki_pages p JOIN wiki_publications v ON v.id=p.current'):
+        if _valid(db, wiki.source, pub):
+            ref = _ref(json.loads(pub['record']), db=db)
+            ref['path'] = Path(wiki.workspace / pub['path']).relative_to(wiki.knowledge).as_posix()
+            pages.append(ref)
+    pages.sort(key=lambda p: (p['category'], p['title'], p['page_id']))
+    return pages
+
+
+@contextmanager
+def browse_snapshot(knowledge_root):
+    """一次树/图遍历共享权威事务；不跨请求缓存来源有效性。"""
+    root = Path(knowledge_root).resolve()
+    if not (root.parent / '.personal_sources' / 'sources.sqlite3').exists():
+        yield None
+        return
+    from agent.knowledge.wiki import WikiService, refresh
+    wiki = WikiService(root.parent)
+    with wiki.source.transaction() as db:
+        # 保留原浏览守卫的失效检测及目录恢复，但每次遍历只做一次。
+        refresh(db, wiki.source)
+        yield _BrowseSnapshot(wiki, db)
+
+
+class _BrowseSnapshot:
+    def __init__(self, wiki, db):
+        self.wiki, self.db = wiki, db
+        self.pages = {p['path']: p for p in _current_pages(wiki, db)}
+
+    def guard(self, path):
+        """与单文件守卫相同的发布资格，复用本次事务及已核验目录。"""
+        from agent.knowledge.personal_assistant import guard_path
+        path = Path(path).resolve()
+        root = self.wiki.knowledge.resolve()
+        if ('.personal_sources' in path.parts or not path.is_relative_to(root)
+                or any(p.name == 'knowledge' for p in path.parents if p != root and p.is_relative_to(root))):
+            return guard_path(path)
+        rel = path.relative_to(root).as_posix()
+        if rel in self.pages:
+            return
+        registered = self.db.execute(
+            'SELECT 1 FROM wiki_publications WHERE path=?', ('knowledge/' + rel,)).fetchone()
+        pub = self.db.execute('SELECT * FROM publications WHERE path=?', (str(path),)).fetchone()
+        if pub and self.wiki.source._valid(self.wiki.source._document(self.db, pub['document']), pub, self.db):
+            return
+        if registered or pub or rel.split('/')[0] in {'wiki', 'managed'}:
+            raise SourceError('version_conflict', '托管页须通过来源发布入口处理；当前页无有效发布或禁止直接写入')
+
+    def presentation(self, path):
+        path = Path(path).resolve()
+        rel = path.relative_to(self.wiki.knowledge.resolve()).as_posix()
+        if rel in self.pages:
+            page = self.pages[rel]
+            return page['title'], page['category']
+        if rel.startswith('managed/'):
+            rows = self.db.execute(
+                'SELECT p.path,r.filename FROM publications p JOIN revisions r ON r.id=p.revision')
+            for row in rows:
+                if Path(row[0]).resolve() == path:
+                    return Path(row[1]).stem, '资料原文'
+            return '资料原文', '资料原文'
+        return None
 
 
 def _index_legacy_content(wiki, db):

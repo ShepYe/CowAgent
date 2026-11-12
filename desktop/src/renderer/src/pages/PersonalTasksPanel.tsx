@@ -13,7 +13,7 @@ export { personalTaskTitle, personalOutcomeLabel, personalKnowledgeFingerprint }
 type RunAction = (task: PersonalTask, name: string, source?: PersonalSourceAction, input?: string) => Promise<boolean>
 interface PanelProps {
   onOpenKnowledge?: (path: string, title: string) => void
-  onKnowledgeChanged?: () => void
+  onKnowledgeChanged?: (fingerprint: string) => boolean | Promise<boolean>
 }
 export default function PersonalTasksPanel({ onOpenKnowledge, onKnowledgeChanged }: PanelProps) {
   const [tasks, setTasks] = useState<PersonalTask[]>([])
@@ -32,6 +32,7 @@ export default function PersonalTasksPanel({ onOpenKnowledge, onKnowledgeChanged
   const resubmitRequestIds = useRef(new Map<string, string>())
   const fileInput = useRef<HTMLInputElement>(null)
   const fingerprint = useRef<string | null>(null)
+  const notifying = useRef(false)
   const changedCallback = useRef(onKnowledgeChanged)
   useEffect(() => { changedCallback.current = onKnowledgeChanged }, [onKnowledgeChanged])
   const load = useCallback(async () => {
@@ -40,8 +41,14 @@ export default function PersonalTasksPanel({ onOpenKnowledge, onKnowledgeChanged
       if (res.status !== 'success') throw new Error(res.message || '读取任务失败')
       setTasks(res.tasks)
       setMessage('')
+      setLoading(false)
       const next = personalKnowledgeFingerprint(res.tasks)
-      if (fingerprint.current !== next) { fingerprint.current = next; changedCallback.current?.() }
+      if (fingerprint.current !== next && !notifying.current) {
+        notifying.current = true
+        try {
+          if (await changedCallback.current?.(next) !== false) fingerprint.current = next
+        } finally { notifying.current = false }
+      }
     } catch (e) { setMessage(e instanceof Error ? e.message : '读取任务失败') }
     finally { setLoading(false) }
   }, [])

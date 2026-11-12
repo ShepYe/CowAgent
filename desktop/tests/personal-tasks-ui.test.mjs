@@ -13,14 +13,14 @@ const result = await build({
   plugins: [{ name: 'offline-ui', setup(builder) {
     builder.onResolve({ filter: /(?:api\/client|components\/(?:Markdown|Tooltip)|store\/confirmStore|i18n)$/ }, ({ path }) => ({ path, namespace: 'offline' }))
     builder.onLoad({ filter: /.*/, namespace: 'offline' }, ({ path }) => ({ contents: path.endsWith('api/client')
-      ? 'export default {personalOriginal: (task, attachment) => `/original/${task}/${attachment}`};'
+      ? 'export default {personalOriginal: (task, attachment) => `/original/${task}/${attachment}`, personalTasks: () => globalThis.__personalTasksForUi()};'
       : path.endsWith('Tooltip') ? 'export default function Tooltip({children}) { return children }'
       : 'export default function Stub() { return null }; export const askConfirm = async () => false; export const t = key => key;' }))
   } }],
 })
 const module = { exports: {} }
 new Function('require', 'module', 'exports', result.outputFiles[0].text)(createRequire(import.meta.url), module, module.exports)
-const { personalOutcomeLabel, personalKnowledgeFingerprint, personalTaskTitle, SourceControls, MaterialDetail, MaterialsLayout, TaskHistory, SourceManagementForm, SourceManager, PurposeSelect, KnowledgeResult } = module.exports
+const { default: PersonalTasksPanel, personalOutcomeLabel, personalKnowledgeFingerprint, personalTaskTitle, SourceControls, MaterialDetail, MaterialsLayout, TaskHistory, SourceManagementForm, SourceManager, PurposeSelect, KnowledgeResult } = module.exports
 const published = (...refs) => ({ outcome: 'published', result_refs: refs })
 
 const modelBuild = await build({ entryPoints: [fileURLToPath(new URL('../src/renderer/src/pages/personalMaterials.ts', import.meta.url))], bundle: true, write: false, platform: 'node', format: 'cjs' })
@@ -55,6 +55,23 @@ function nodes(element, predicate) {
   return found
 }
 const textOf = element => React.Children.toArray(element?.props?.children).map(child => typeof child === 'string' || typeof child === 'number' ? String(child) : React.isValidElement(child) ? textOf(child) : '').join('')
+
+test('资料轮询等待变更核验，失败后重试，成功后相同快照不重复刷新', async () => {
+  globalThis.__personalTasksForUi = async () => ({ status: 'success', tasks: [] })
+  let resolve, calls = 0
+  const pending = new Promise(done => { resolve = done })
+  const h = hooks(PersonalTasksPanel, { onKnowledgeChanged: () => ++calls === 1 ? pending : true })
+  const refresh = () => nodes(h.render(), n => n.props['aria-label'] === '刷新资料')[0].props.onClick()
+  const settle = () => new Promise(done => setImmediate(done))
+  refresh(); await settle()
+  refresh(); await settle()
+  assert.equal(calls, 1, '上次核验待返回时不能用轮询反复使其失效')
+  resolve(false); await settle()
+  refresh(); await settle()
+  assert.equal(calls, 2, '核验失败没有消耗同一指纹的重试机会')
+  refresh(); await settle()
+  assert.equal(calls, 2, '核验成功才确认指纹')
+})
 
 test('资料按可信document归并，多附件、同名和同哈希不同source不会误合并', () => {
   const data = buildMaterials([task('multi', { attachments: [attachment('a', 'A'), attachment('b', 'B')], result_refs: [page('merged', [source('A'), source('B')])] }),

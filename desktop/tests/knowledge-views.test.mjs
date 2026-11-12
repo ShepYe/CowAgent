@@ -13,7 +13,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 async function bundle(entry, extra = '', pageMode = false) {
   const filename = path.join(root, 'src/renderer/src', entry)
   const output = await build({ stdin: { contents: await readFile(filename, 'utf8') + extra, resolveDir: path.dirname(filename), loader: filename.endsWith('tsx') ? 'tsx' : 'ts' },
-    bundle: true, write: false, format: 'cjs', platform: 'node', external: ['react', 'react/jsx-runtime'], plugins: [{ name: 'offline-app', setup(b) {
+    bundle: true, write: false, format: 'cjs', platform: 'node', external: ['react', 'react/jsx-runtime'], loader: { '.css': 'empty' }, plugins: [{ name: 'offline-app', setup(b) {
       if (pageMode) {
         b.onResolve({ filter: /^(react-router-dom|.*(?:store\/(?:agentStore|docEditorStore|confirmStore)|components\/(?:KnowledgeGraph|AgentScopeSelect|DocEditor|Tooltip)|\.\/PersonalTasksPanel))$/ }, a => ({ path: a.path, namespace: 'page-stub' }))
         b.onLoad({ filter: /.*/, namespace: 'page-stub' }, a => {
@@ -213,7 +213,8 @@ globalThis.__knowledgeEditor = Object.assign(selector => selector(editorState), 
 })
 const knowledgePage = await bundle('pages/KnowledgePage.tsx', '', true)
 function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no }); return { promise, resolve, reject } }
-async function pageHarness() {
+let pageNumber = 0
+async function pageHarness(baseUrl = `offline-${++pageNumber}`) {
   globalThis.localStorage = { getItem: () => 'A', setItem() {} }
   globalThis.__knowledgeAgents = { multiAgent: true, defaultAgentId: 'A', agents: [{ id: 'A' }, { id: 'B' }] }
   editorState = { doc: null, content: '', loading: false, edit: null, readonly: null,
@@ -225,11 +226,172 @@ async function pageHarness() {
     getKnowledgeCatalog: async () => ({ status: 'success', pages: [page], categories: [page.category] }),
     getKnowledgeGraph: async () => ({ nodes: [], links: [] }),
   })
-  const h = harness(knowledgePage.default, { baseUrl: 'offline' })
+  const h = harness(knowledgePage.default, { baseUrl })
   h.render(); h.flushEffects(); await settle(); h.render(); h.flushEffects(); await settle(); h.render()
   return h
 }
 const findComponent = (tree, name) => nodes(tree).find(n => typeof n.type === 'function' && n.type.name === name)
+
+test('离开知识页再回来立即恢复文档和图谱，不重复读取目录', async () => {
+  const baseUrl = `return-${++pageNumber}`
+  const h = await pageHarness(baseUrl)
+  editorState.doc = { path: page.path, title: page.title, agentId: 'A' }
+  globalThis.__knowledgeApi.getKnowledgeGraph = async () => ({ nodes: [{ id: 'current' }], links: [] })
+  nodes(h.render()).find(n => n.props.label === 'knowledge_tab_graph').props.onClick()
+  await settle(); h.render(); h.flushEffects(); await settle(); h.render()
+  const expected = findComponent(h.tree, 'KnowledgeGraph').props.data
+  h.unmount()
+  const calls = []
+  globalThis.__knowledgeApi.getKnowledgeList = async () => { calls.push('list'); return new Promise(() => {}) }
+  globalThis.__knowledgeApi.getKnowledgeCatalog = async () => { calls.push('catalog'); return new Promise(() => {}) }
+  const returned = harness(knowledgePage.default, { baseUrl })
+  returned.render()
+  assert.doesNotMatch(text(returned.tree), /knowledge_loading/)
+  assert.deepEqual(findComponent(returned.tree, 'KnowledgeGraph')?.props.data, expected)
+  returned.flushEffects(); await settle(); returned.render()
+  assert.equal(editorState.doc?.path, page.path)
+  assert.deepEqual(calls, [])
+  returned.unmount()
+})
+
+test('资料首次读取和相同发布快照不会使已加载图谱失效，真实变化仍刷新', async () => {
+  const h = await pageHarness()
+  const calls = []
+  globalThis.__knowledgeApi.getKnowledgeGraph = async () => { calls.push('graph'); return { nodes: [{ id: 'current' }], links: [] } }
+  const switchTo = async label => {
+    nodes(h.render()).find(n => n.props.label === label).props.onClick()
+    await settle(); h.render(); h.flushEffects(); await settle(); h.render(); h.flushEffects(); await settle(); h.render()
+  }
+  await switchTo('knowledge_tab_graph')
+  await switchTo('资料')
+  findComponent(h.tree, 'PersonalTasksPanel').props.onKnowledgeChanged('same')
+  await settle(); h.render(); h.flushEffects(); await settle(); h.render()
+  await switchTo('knowledge_tab_graph')
+  assert.deepEqual(calls, ['graph'])
+  await switchTo('资料')
+  findComponent(h.tree, 'PersonalTasksPanel').props.onKnowledgeChanged('same')
+  await settle(); h.render(); h.flushEffects()
+  await switchTo('knowledge_tab_graph')
+  assert.deepEqual(calls, ['graph'])
+  await switchTo('资料')
+  globalThis.__knowledgeApi.getKnowledgeCatalog = async () => ({ status: 'success', pages: [{ ...page, page_version: 'new' }], categories: [page.category] })
+  findComponent(h.tree, 'PersonalTasksPanel').props.onKnowledgeChanged('changed')
+  await settle(); h.render(); h.flushEffects(); await settle(); h.render()
+  await switchTo('knowledge_tab_graph')
+  assert.deepEqual(calls, ['graph', 'graph'])
+  h.unmount()
+})
+
+test('缓存过期在后台核对目录，保持已显示图谱；更换后端不复用缓存', async () => {
+  const baseUrl = `expiry-${++pageNumber}`
+  const h = await pageHarness(baseUrl)
+  const expected = { nodes: [{ id: 'cached' }], links: [] }
+  globalThis.__knowledgeApi.getKnowledgeGraph = async () => expected
+  nodes(h.render()).find(n => n.props.label === 'knowledge_tab_graph').props.onClick()
+  await settle(); h.render(); h.flushEffects(); await settle(); h.render(); h.unmount()
+  const list = deferred(), catalog = deferred(), calls = []
+  globalThis.__knowledgeApi.getKnowledgeList = async () => { calls.push('list'); return list.promise }
+  globalThis.__knowledgeApi.getKnowledgeCatalog = async () => { calls.push('catalog'); return catalog.promise }
+  const now = Date.now
+  Date.now = () => now() + 31_000
+  const returned = harness(knowledgePage.default, { baseUrl })
+  try {
+    returned.render(); returned.flushEffects(); await settle(); returned.render()
+    assert.doesNotMatch(text(returned.tree), /knowledge_loading/)
+    assert.deepEqual(findComponent(returned.tree, 'KnowledgeGraph')?.props.data, expected)
+    assert.deepEqual(calls, ['list', 'catalog'])
+    list.resolve({ enabled: true, root_files: [{ name: 'index.md', title: '知识索引' }], tree: [], stats: { pages: 1, size: 1 } })
+    catalog.resolve({ status: 'success', pages: [page], categories: [page.category] })
+    await settle(); returned.render(); returned.flushEffects(); await settle(); returned.render()
+    assert.deepEqual(findComponent(returned.tree, 'KnowledgeGraph')?.props.data, expected)
+  } finally { Date.now = now; returned.unmount() }
+  const other = harness(knowledgePage.default, { baseUrl: `${baseUrl}-other` })
+  assert.match(text(other.render()), /knowledge_loading/)
+  assert.equal(findComponent(other.tree, 'KnowledgeGraph'), undefined)
+  other.unmount()
+})
+
+for (const superseded of [false, true]) test(`过期缓存刷新后清除已${superseded ? '替换' : '撤回'}的知识正文`, async () => {
+  const baseUrl = `invalidated-${++pageNumber}`
+  const h = await pageHarness(baseUrl)
+  editorState.doc = { path: page.path, title: page.title, agentId: 'A' }
+  editorState.content = '旧知识正文'
+  h.render(); h.unmount()
+  const current = { ...page, page_id: superseded ? page.page_id : 'other', path: 'wiki/new.md', page_version: 'new' }
+  globalThis.__knowledgeApi.getKnowledgeCatalog = async () => ({ status: 'success', pages: [current], categories: [current.category] })
+  const now = Date.now
+  Date.now = () => now() + 31_000
+  const returned = harness(knowledgePage.default, { baseUrl })
+  try {
+    returned.render(); returned.flushEffects(); await settle(); returned.render()
+    assert.equal(editorState.doc, null, '目录已不包含旧发布，不能继续显示为当前知识正文')
+  } finally { Date.now = now; returned.unmount() }
+})
+
+test('资料变更核验失败不确认指纹，相同快照可以重试', async () => {
+  const h = await pageHarness()
+  nodes(h.render()).find(n => n.props.label === '资料').props.onClick()
+  await settle(); h.render()
+  const readList = globalThis.__knowledgeApi.getKnowledgeList
+  let calls = 0
+  globalThis.__knowledgeApi.getKnowledgeList = async (...args) => {
+    if (++calls === 1) throw new Error('临时网络失败')
+    return readList(...args)
+  }
+  assert.equal(await findComponent(h.tree, 'PersonalTasksPanel').props.onKnowledgeChanged('new'), false)
+  h.render()
+  assert.equal(await findComponent(h.tree, 'PersonalTasksPanel').props.onKnowledgeChanged('new'), true)
+  assert.equal(calls, 2)
+  h.render(); h.unmount()
+})
+
+test('资料请求在离页后才完成，不能用已卸载页面触发新的目录读取', async () => {
+  const h = await pageHarness()
+  nodes(h.render()).find(n => n.props.label === '资料').props.onClick()
+  await settle(); h.render()
+  const notify = findComponent(h.tree, 'PersonalTasksPanel').props.onKnowledgeChanged
+  h.unmount()
+  let calls = 0
+  globalThis.__knowledgeApi.getKnowledgeList = async () => { calls++; return {} }
+  assert.equal(await notify('late'), false)
+  assert.equal(calls, 0)
+})
+
+test('切换Agent后迟到的资料回调不能重读旧范围或覆盖新目录', async () => {
+  const h = await pageHarness()
+  nodes(h.render()).find(n => n.props.label === '资料').props.onClick()
+  await settle(); h.render()
+  const notify = findComponent(h.tree, 'PersonalTasksPanel').props.onKnowledgeChanged
+  await findComponent(h.tree, 'AgentScopeSelect').props.onChange('B')
+  h.render(); h.flushEffects(); await settle(); h.render()
+  let calls = 0
+  globalThis.__knowledgeApi.getKnowledgeList = async () => { calls++; return {} }
+  assert.equal(await notify('A-late'), false)
+  assert.equal(calls, 0)
+  assert.equal(findComponent(h.tree, 'AgentScopeSelect').props.value, 'B')
+  h.unmount()
+})
+
+test('修改已成功但目录待返回时离页，返回会后台核验旧缓存', async () => {
+  const baseUrl = `pending-change-${++pageNumber}`
+  const h = await pageHarness(baseUrl)
+  editorState.doc = { path: page.path, title: page.title, agentId: 'A' }
+  const pending = deferred()
+  const readList = globalThis.__knowledgeApi.getKnowledgeList
+  globalThis.__knowledgeApi.knowledgeAction = async () => ({ status: 'success' })
+  globalThis.__knowledgeApi.getKnowledgeList = () => pending.promise
+  const change = findComponent(h.render(), 'KnowledgeCategoryMenu').props.onChange(page, '新分类')
+  await settle(); h.unmount()
+  let calls = 0
+  globalThis.__knowledgeApi.getKnowledgeList = async () => { calls++; return readList() }
+  globalThis.__knowledgeApi.getKnowledgeCatalog = async () => ({ status: 'success', pages: [{ ...page, category: '新分类' }], categories: ['新分类'] })
+  const returned = harness(knowledgePage.default, { baseUrl })
+  returned.render(); returned.flushEffects(); await settle(); returned.render()
+  assert.equal(calls, 1, '未核验的旧缓存必须重新读取，即使仍在30秒内')
+  assert.equal(findComponent(returned.tree, 'KnowledgeCategoryMenu').props.page.category, '新分类')
+  pending.resolve(await readList()); await change
+  returned.render(); returned.unmount()
+})
 
 test('分类冲突刷新后仍显示错误，弹窗保留并用最新双修订重试', async () => {
   const h = await pageHarness(); const actions = []; let metadata = page

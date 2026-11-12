@@ -666,8 +666,11 @@ class KnowledgeService:
             return {"tree": [], "stats": {"pages": 0, "size": 0}, "enabled": conf().get("knowledge", True)}
 
         stats = {"pages": 0, "size": 0}
-        root_files, tree = self._scan_dir(
-            self.knowledge_dir, stats, is_root=True, summaries=self._read_index_summaries())
+        from agent.knowledge.catalog import browse_snapshot
+        with browse_snapshot(self.knowledge_dir) as snapshot:
+            root_files, tree = self._scan_dir(
+                self.knowledge_dir, stats, is_root=True,
+                summaries=self._read_index_summaries(), snapshot=snapshot)
 
         return {
             "root_files": root_files,
@@ -676,7 +679,7 @@ class KnowledgeService:
             "enabled": conf().get("knowledge", True),
         }
 
-    def _scan_dir(self, dir_path: str, stats: dict, is_root: bool = False, *, summaries: dict) -> tuple:
+    def _scan_dir(self, dir_path: str, stats: dict, is_root: bool = False, *, summaries: dict, snapshot=None) -> tuple:
         """
         Recursively scan a directory.
 
@@ -692,11 +695,10 @@ class KnowledgeService:
             if os.path.islink(full):
                 continue
             if os.path.isdir(full):
-                sub_files, sub_children = self._scan_dir(full, stats, summaries=summaries)
+                sub_files, sub_children = self._scan_dir(full, stats, summaries=summaries, snapshot=snapshot)
                 children.append({"dir": name, "files": sub_files, "children": sub_children})
             elif name.lower().endswith(".md"):
-                from agent.knowledge.personal_assistant import readable
-                if not readable(full):
+                if not self._browse_readable(full, snapshot):
                     continue
                 size = os.path.getsize(full)
                 if not is_root:
@@ -712,7 +714,7 @@ class KnowledgeService:
                             title = first_line[2:].strip() or title
                     except Exception:
                         pass
-                title, category = self._presentation(Path(full), title)
+                title, category = self._presentation(Path(full), title, snapshot)
                 item = {"name": name, "title": title, "category": category, "size": size}
                 relative = Path(full).relative_to(Path(self.knowledge_dir)).as_posix()
                 if (relative.split('/')[0] not in ('wiki', 'managed')
@@ -721,11 +723,26 @@ class KnowledgeService:
                 files.append(item)
         return files, children
 
-    def _presentation(self, path: Path, title: str) -> tuple:
+    @staticmethod
+    def _browse_readable(path, snapshot):
+        import sqlite3
+        from agent.knowledge.personal_assistant import guard_path
+        from agent.knowledge.parser import SourceError
+        try:
+            snapshot.guard(path) if snapshot is not None else guard_path(path)
+            return True
+        except (SourceError, sqlite3.Error):
+            return False
+
+    def _presentation(self, path: Path, title: str, snapshot=None) -> tuple:
         """旧投影仅以真实原件名展示，避免将内部编号冒充知识标题。"""
         parts = path.relative_to(Path(self.knowledge_dir)).parts
         if len(parts) == 1 and parts[0] in self.PROTECTED_FILES:
             return {'index.md': '知识索引', 'log.md': '整理记录'}[parts[0]], '知识管理'
+        if snapshot is not None:
+            presentation = snapshot.presentation(path)
+            if presentation is not None:
+                return presentation
         if parts[0] == 'wiki':
             for page in self.catalog()['pages']:
                 if page['path'] == path.relative_to(Path(self.knowledge_dir)).as_posix():
@@ -815,6 +832,11 @@ class KnowledgeService:
                 ]
             }
         """
+        from agent.knowledge.catalog import browse_snapshot
+        with browse_snapshot(self.knowledge_dir) as snapshot:
+            return self._build_graph(snapshot)
+
+    def _build_graph(self, snapshot):
         knowledge_path = Path(self.knowledge_dir)
         if not knowledge_path.is_dir():
             return {"nodes": [], "links": []}
@@ -838,14 +860,14 @@ class KnowledgeService:
             try:
                 # utf-8-sig: files saved by Windows editors may carry a BOM,
                 # which would otherwise hide the "# " title line.
-                from agent.knowledge.personal_assistant import guard_path
-                guard_path(md_file)
+                if not self._browse_readable(md_file, snapshot):
+                    continue
                 content = md_file.read_text(encoding="utf-8-sig")
                 first_line = content.strip().split("\n")[0]
                 if first_line.startswith("# "):
                     title = first_line[2:].strip()
                 hrefs[rel] = link_re.findall(content)
-                title, display_category = self._presentation(md_file, title)
+                title, display_category = self._presentation(md_file, title, snapshot)
                 if parts[0] in {'wiki', 'managed'}:
                     category = display_category
             except Exception:
@@ -869,13 +891,21 @@ class KnowledgeService:
                     links.append({"source": rel, "target": target_rel})
 
         # 相关页关系独立于正文出处元数据，图谱从有效发布记录补充连线。
-        if any(rel.startswith('wiki/') for rel in nodes):
+        if snapshot is not None:
+            records = list(snapshot.pages.values())
+        elif any(rel.startswith('wiki/') for rel in nodes):
             from agent.knowledge.wiki import WikiService
             wiki = WikiService(self.workspace_root)
             with wiki.source.transaction() as db:
                 records = [json.loads(row[0]) for row in db.execute(
                     'SELECT v.record FROM wiki_pages p JOIN wiki_publications v ON v.id=p.current')]
-            paths = {r['page_id']: r['path'].removeprefix('knowledge/') for r in records}
+        else:
+            records = []
+        if records:
+            paths = {
+                r['page_id']: r['path'] if snapshot is not None else r['path'].removeprefix('knowledge/')
+                for r in records
+            }
             for record in records:
                 source = paths[record['page_id']]
                 for page_id in record.get('related_page_ids', []):

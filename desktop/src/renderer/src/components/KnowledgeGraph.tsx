@@ -19,6 +19,23 @@ interface KnowledgeGraphProps {
   onSelect: (id: string, label: string) => void
 }
 
+interface GraphLayout {
+  nodes: SimNode[]
+  links: { key: number; a: SimNode; b: SimNode }[]
+  adjacency: Map<string, Set<string>>
+  categories: string[]
+  colorOf: (category: string) => string
+  byId: Map<string, SimNode>
+  initialized: boolean
+  alpha: number
+  view: { k: number; x: number; y: number }
+  autoFit: boolean
+}
+
+// 数据快照释放后，布局也可回收；同一快照的路由/标签重挂保留布局和视图。
+const layouts = new WeakMap<KnowledgeGraphData, GraphLayout>()
+const ALPHA_MIN = 0.005
+
 // d3.schemeTableau10 — keep the web client's palette for visual parity.
 const TABLEAU10 = [
   '#4e79a7',
@@ -50,14 +67,10 @@ const KnowledgeGraph: React.FC<KnowledgeGraphProps> = ({ data, onSelect }) => {
   // rebuilding the model, preserving current node positions.
   const [warmTick, setWarmTick] = useState(0)
 
-  // View transform (pan + zoom).
-  const viewRef = useRef({ k: 1, x: 0, y: 0 })
-  // The view follows the graph until the user zooms, pans or drags a node;
-  // after that it stays where they put it.
-  const autoFitRef = useRef(true)
-
-  // Build the immutable model once per data change.
+  // 以快照对象为键复用模型；新数据对象独立建模。
   const model = useMemo(() => {
+    const cached = layouts.get(data)
+    if (cached) return cached
     const degree = new Map<string, number>()
     data.links.forEach((l) => {
       degree.set(l.source, (degree.get(l.source) || 0) + 1)
@@ -104,7 +117,12 @@ const KnowledgeGraph: React.FC<KnowledgeGraphProps> = ({ data, onSelect }) => {
       adjacency.get(l.source)!.add(l.target)
       adjacency.get(l.target)!.add(l.source)
     })
-    return { nodes, links, adjacency, categories, colorOf, byId }
+    const layout: GraphLayout = {
+      nodes, links, adjacency, categories, colorOf, byId,
+      initialized: false, alpha: 1, view: { k: 1, x: 0, y: 0 }, autoFit: true,
+    }
+    layouts.set(data, layout)
+    return layout
   }, [data])
 
   // DOM refs for imperative position updates.
@@ -129,7 +147,7 @@ const KnowledgeGraph: React.FC<KnowledgeGraphProps> = ({ data, onSelect }) => {
 
   // Apply the view transform imperatively (no re-render needed).
   const applyView = () => {
-    const v = viewRef.current
+    const v = model.view
     if (rootRef.current) rootRef.current.setAttribute('transform', `translate(${v.x},${v.y}) scale(${v.k})`)
   }
 
@@ -155,10 +173,10 @@ const KnowledgeGraph: React.FC<KnowledgeGraphProps> = ({ data, onSelect }) => {
       0.2,
       Math.min(1, (w - pad * 2) / Math.max(1, maxX - minX), (h - pad * 2) / Math.max(1, maxY - minY)),
     )
-    viewRef.current = { k, x: w / 2 - ((minX + maxX) / 2) * k, y: h / 2 - ((minY + maxY) / 2) * k }
+    model.view = { k, x: w / 2 - ((minX + maxX) / 2) * k, y: h / 2 - ((minY + maxY) / 2) * k }
     applyView()
   }
-  // The resize observer is bound once; it reaches the current model through this.
+  // Resize 回调读取当前渲染的适配逻辑。
   const fitViewRef = useRef(fitView)
   fitViewRef.current = fitView
 
@@ -169,42 +187,47 @@ const KnowledgeGraph: React.FC<KnowledgeGraphProps> = ({ data, onSelect }) => {
     if (!el) return
     const apply = () => {
       sizeRef.current = { w: el.clientWidth || 800, h: el.clientHeight || 560 }
-      if (autoFitRef.current) fitViewRef.current()
+      if (model.initialized && model.autoFit) fitViewRef.current()
     }
     apply()
     const ro = new ResizeObserver(apply)
     ro.observe(el)
     return () => ro.disconnect()
-  }, [])
+  }, [model])
 
   // Seed a ring around the pane's centre before the first paint, so the graph
   // doesn't start off-centre and drift over.
   useLayoutEffect(() => {
     const { nodes } = model
-    const { w, h } = sizeRef.current
-    const radius = Math.min(w, h) * 0.32
-    nodes.forEach((node, i) => {
-      const angle = (i / nodes.length) * Math.PI * 2
-      node.x = w / 2 + Math.cos(angle) * radius
-      node.y = h / 2 + Math.sin(angle) * radius
-    })
+    if (!model.initialized) {
+      const { w, h } = sizeRef.current
+      const radius = Math.min(w, h) * 0.32
+      nodes.forEach((node, i) => {
+        const angle = (i / nodes.length) * Math.PI * 2
+        node.x = w / 2 + Math.cos(angle) * radius
+        node.y = h / 2 + Math.sin(angle) * radius
+      })
+      model.initialized = true
+      fitView()
+    }
     paint()
-    autoFitRef.current = true
-    fitView()
+    applyView()
+    return () => {
+      // 离页可能发生在 pointerup 前，不能把拖拽中的固定点带入下一次挂载。
+      nodes.forEach(node => { node.fx = null; node.fy = null })
+      dragRef.current = null
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [model])
 
-  // Physics loop. Restarts only when the model (data) changes. Writes to DOM.
-  // Uses d3-style alpha cooling so it always settles and stops the rAF.
+  // 保留快照的冷却进度；重挂只接续未收敛布局，拖拽时显式重新加热。
   useEffect(() => {
     const { nodes, links } = model
-    if (nodes.length === 0) return
+    if (nodes.length === 0 || (model.alpha <= ALPHA_MIN && !nodes.some(node => node.fx != null))) return
     let raf = 0
     let alive = true
     // Global cooling factor; decays toward 0 and scales how far nodes move.
-    let alpha = 1
     const alphaDecay = 0.018
-    const alphaMin = 0.005
 
     const step = () => {
       if (!alive) return
@@ -274,8 +297,8 @@ const KnowledgeGraph: React.FC<KnowledgeGraphProps> = ({ data, onSelect }) => {
           node.y = node.fy as number
           return
         }
-        let dx = node.vx * alpha
-        let dy = node.vy * alpha
+        let dx = node.vx * model.alpha
+        let dy = node.vy * model.alpha
         const m = Math.hypot(dx, dy)
         if (m > maxStep) {
           dx = (dx / m) * maxStep
@@ -286,10 +309,10 @@ const KnowledgeGraph: React.FC<KnowledgeGraphProps> = ({ data, onSelect }) => {
       })
 
       paint()
-      if (autoFitRef.current) fitView()
-      alpha += (0 - alpha) * alphaDecay
+      if (model.autoFit) fitView()
+      model.alpha += (0 - model.alpha) * alphaDecay
       // Keep running while cooling, or while a node is being dragged.
-      if (alpha > alphaMin || dragging) {
+      if (model.alpha > ALPHA_MIN || dragging) {
         raf = requestAnimationFrame(step)
       }
     }
@@ -308,7 +331,7 @@ const KnowledgeGraph: React.FC<KnowledgeGraphProps> = ({ data, onSelect }) => {
   // Convert a pointer event to graph (pre-transform) coordinates.
   const toGraph = (clientX: number, clientY: number) => {
     const rect = svgRef.current!.getBoundingClientRect()
-    const v = viewRef.current
+    const v = model.view
     return { x: (clientX - rect.left - v.x) / v.k, y: (clientY - rect.top - v.y) / v.k }
   }
 
@@ -321,19 +344,19 @@ const KnowledgeGraph: React.FC<KnowledgeGraphProps> = ({ data, onSelect }) => {
     if (!svg) return
     const onWheel = (e: WheelEvent) => {
       e.preventDefault()
-      autoFitRef.current = false
-      const v = viewRef.current
+      model.autoFit = false
+      const v = model.view
       const rect = svg.getBoundingClientRect()
       const px = e.clientX - rect.left
       const py = e.clientY - rect.top
       const factor = Math.exp(-e.deltaY * 0.0015)
       const k = Math.min(5, Math.max(0.2, v.k * factor))
-      viewRef.current = { k, x: px - ((px - v.x) / v.k) * k, y: py - ((py - v.y) / v.k) * k }
+      model.view = { k, x: px - ((px - v.x) / v.k) * k, y: py - ((py - v.y) / v.k) * k }
       applyView()
     }
     svg.addEventListener('wheel', onWheel, { passive: false })
     return () => svg.removeEventListener('wheel', onWheel)
-  }, [])
+  }, [model])
 
   // Drag: on a node moves the node, on background pans the canvas.
   const dragRef = useRef<
@@ -341,12 +364,12 @@ const KnowledgeGraph: React.FC<KnowledgeGraphProps> = ({ data, onSelect }) => {
     | { mode: 'pan'; startX: number; startY: number; ox: number; oy: number }
     | null
   >(null)
-  const kick = () => setWarmTick((v) => v + 1)
+  const kick = () => { model.alpha = 1; setWarmTick((v) => v + 1) }
 
   const onPointerDownNode = (e: React.PointerEvent, node: SimNode) => {
     e.stopPropagation()
     ;(e.currentTarget as Element).setPointerCapture(e.pointerId)
-    autoFitRef.current = false
+    model.autoFit = false
     const p = toGraph(e.clientX, e.clientY)
     node.fx = p.x
     node.fy = p.y
@@ -356,7 +379,7 @@ const KnowledgeGraph: React.FC<KnowledgeGraphProps> = ({ data, onSelect }) => {
 
   const onPointerDownBg = (e: React.PointerEvent) => {
     ;(e.currentTarget as Element).setPointerCapture(e.pointerId)
-    const v = viewRef.current
+    const v = model.view
     dragRef.current = { mode: 'pan', startX: e.clientX, startY: e.clientY, ox: v.x, oy: v.y }
   }
 
@@ -367,13 +390,15 @@ const KnowledgeGraph: React.FC<KnowledgeGraphProps> = ({ data, onSelect }) => {
       const p = toGraph(e.clientX, e.clientY)
       drag.node.fx = p.x
       drag.node.fy = p.y
+      drag.node.x = p.x
+      drag.node.y = p.y
       drag.moved = true
       // Keep the loop warm for live dragging.
       const el = groupEls.current.get(drag.node.id)
       if (el) el.setAttribute('transform', `translate(${p.x},${p.y})`)
     } else {
-      autoFitRef.current = false
-      viewRef.current = { k: viewRef.current.k, x: drag.ox + (e.clientX - drag.startX), y: drag.oy + (e.clientY - drag.startY) }
+      model.autoFit = false
+      model.view = { k: model.view.k, x: drag.ox + (e.clientX - drag.startX), y: drag.oy + (e.clientY - drag.startY) }
       applyView()
     }
   }

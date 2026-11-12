@@ -1,6 +1,9 @@
 import React, { useMemo, useRef, useCallback } from 'react'
 import MarkdownIt from 'markdown-it'
 import hljs from 'highlight.js'
+import 'katex/dist/katex.min.css'
+import '../lib/markdownMath.css'
+import { markdownMath } from '../lib/markdownMath'
 import { t } from '../i18n'
 import apiClient from '../api/client'
 import { workspaceHrefOf } from '../lib/fileKind'
@@ -9,9 +12,7 @@ import { useLightboxStore } from './Lightbox'
 import { headingAnchor, isInternalDocumentLink } from '../lib/knowledgeNavigation'
 
 /**
- * Markdown renderer aligned 1:1 with the web console (markdown-it + highlight.js
- * + GitHub themes). Using the same engine guarantees identical line-break,
- * linkify and code-highlight behavior across web and desktop.
+ * 与 web console 使用相同 Markdown 基础引擎，桌面端另支持 TeX 公式。
  */
 
 const md: MarkdownIt = new MarkdownIt({
@@ -34,6 +35,8 @@ const md: MarkdownIt = new MarkdownIt({
     }
   },
 })
+
+md.use(markdownMath)
 
 const defaultHeadingOpen = md.renderer.rules.heading_open
 md.renderer.rules.heading_open = (tokens, idx, options, env, renderer) => {

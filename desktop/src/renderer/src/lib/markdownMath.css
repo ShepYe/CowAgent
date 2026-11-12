@@ -1,0 +1,11 @@
+.msg-content .katex-display {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.25em 0;
+}
+
+.msg-content .math-fallback {
+  white-space: pre-wrap;
+}

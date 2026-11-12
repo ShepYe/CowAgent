@@ -52,6 +52,24 @@ interface KnowledgePageProps {
 
 type Tab = 'docs' | 'graph' | 'personal'
 
+interface KnowledgeSession {
+  scope: string
+  loadedAt: number
+  data: KnowledgeList | null
+  catalog: KnowledgeCatalog | null
+  catalogError: string
+  graph: KnowledgeGraphData | null
+  tab: Tab
+  search: string
+  historyPublishId: string | null
+  personalFingerprint: string | null
+}
+
+// 只保留最近访问的知识库；路由切换不会丢失目录、文档位置和图谱。
+let retainedSession: KnowledgeSession | null = null
+let editorScope: string | null = null
+const SESSION_FRESH_MS = 30_000
+
 const KNOWLEDGE_IMPORT_MAX_FILES = 100
 const KNOWLEDGE_IMPORT_MAX_FILE_SIZE = 10 * 1024 * 1024
 const KNOWLEDGE_IMPORT_MAX_TOTAL_SIZE = 200 * 1024 * 1024
@@ -223,23 +241,6 @@ function findTitle(list: KnowledgeList, path: string, knownTitle?: string): stri
 
 const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
   const navigate = useNavigate()
-  const [tab, setTab] = useState<Tab>('docs')
-  const [data, setData] = useState<KnowledgeList | null>(null)
-  const [catalog, setCatalog] = useState<KnowledgeCatalog | null>(null)
-  const [catalogError, setCatalogError] = useState('')
-  const [knowledgeRevision, setKnowledgeRevision] = useState(0)
-  const [historyPublishId, setHistoryPublishId] = useState<string | null>(null)
-  const [pendingAnchor, setPendingAnchor] = useState<{ path: string; anchor: string } | null>(null)
-  const viewerRef = useRef<HTMLDivElement>(null)
-  const loadSequence = useRef(0)
-  const loadedScope = useRef<string | null>(null)
-  const navigationSequence = useRef(0)
-  const [loading, setLoading] = useState(true)
-  const [search, setSearch] = useState('')
-
-  // Which Agent's knowledge base is shown. The first visit shows the default
-  // Agent; the last choice is remembered across visits (and dropped if that
-  // Agent no longer exists). Empty in single-Agent mode (legacy path).
   const multiAgent = useAgentStore(selectMultiAgent)
   const defaultAgentId = useAgentStore((s) => s.defaultAgentId)
   const agents = useAgentStore((s) => s.agents)
@@ -248,6 +249,27 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
   )
   const remembered = agents.some((a) => a.id === scopeAgentId) ? scopeAgentId : ''
   const viewingAgentId = multiAgent ? remembered || defaultAgentId : ''
+  const scope = JSON.stringify([baseUrl, viewingAgentId])
+  const liveScope = useRef(scope)
+  liveScope.current = scope
+  const cached = retainedSession?.scope === scope ? retainedSession : null
+  const [tab, setTab] = useState<Tab>(cached?.tab || 'docs')
+  const [data, setData] = useState<KnowledgeList | null>(cached?.data || null)
+  const [catalog, setCatalog] = useState<KnowledgeCatalog | null>(cached?.catalog || null)
+  const [catalogError, setCatalogError] = useState(cached?.catalogError || '')
+  const [knowledgeRevision, setKnowledgeRevision] = useState(0)
+  const [historyPublishId, setHistoryPublishId] = useState<string | null>(cached?.historyPublishId || null)
+  const [pendingAnchor, setPendingAnchor] = useState<{ path: string; anchor: string } | null>(null)
+  const viewerRef = useRef<HTMLDivElement>(null)
+  const loadSequence = useRef(0)
+  const loadedScope = useRef<string | null>(cached?.data ? scope : null)
+  const loadedAt = useRef(cached?.loadedAt || 0)
+  const knowledgeSignature = useRef(cached ? JSON.stringify([cached.data, cached.catalog]) : '')
+  const personalFingerprint = useRef<string | null>(cached?.personalFingerprint || null)
+  const catalogReady = useRef(!!cached?.catalog)
+  const navigationSequence = useRef(0)
+  const [loading, setLoading] = useState(!cached?.data)
+  const [search, setSearch] = useState(cached?.search || '')
 
   // The open document lives in the editor store, so an unsaved edit is not tied
   // to this component being mounted.
@@ -264,7 +286,7 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
   const docTitle = currentPage?.title || (doc ? (data ? findTitle(data, doc.path, doc.title) : doc.title) : '')
   const legacyTree = useMemo(() => data ? legacyKnowledgeTree(data) : null, [data])
 
-  const [graph, setGraph] = useState<KnowledgeGraphData | null>(null)
+  const [graph, setGraph] = useState<KnowledgeGraphData | null>(cached?.graph || null)
   const [graphLoading, setGraphLoading] = useState(false)
   const graphSequence = useRef(0)
   const invalidateGraph = useCallback(() => {
@@ -280,8 +302,22 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
   const [dragOver, setDragOver] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const statusTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const sessionRef = useRef<KnowledgeSession | null>(null)
+  const pageMounted = useRef(false)
+  sessionRef.current = { scope, loadedAt: loadedAt.current, data, catalog, catalogError, graph, tab, search,
+    historyPublishId, personalFingerprint: personalFingerprint.current }
+  useEffect(() => {
+    pageMounted.current = true
+    return () => {
+      pageMounted.current = false
+      const session = sessionRef.current
+      if (session?.data && session.scope === loadedScope.current) retainedSession = session
+      if (statusTimer.current) clearTimeout(statusTimer.current)
+    }
+  }, [])
 
   const showStatus = useCallback((text: string, error = false, sticky = false) => {
+    if (!pageMounted.current) return
     if (statusTimer.current) clearTimeout(statusTimer.current)
     setStatus({ text, error })
     if (!sticky) {
@@ -344,29 +380,45 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
     return () => clearTimeout(timer)
   }, [docLoading, activePath, content, pendingAnchor, historyPublishId, showStatus])
 
-  const loadKnowledge = useCallback(async () => {
+  const loadKnowledge = useCallback(async (forceGraph = true) => {
+    if (!pageMounted.current || liveScope.current !== scope) return null
     const sequence = ++loadSequence.current
     const [fresh, result] = await Promise.all([
       apiClient.getKnowledgeList(viewingAgentId || undefined),
       apiClient.getKnowledgeCatalog(viewingAgentId || undefined).catch(() => null),
     ])
-    if (sequence !== loadSequence.current) return null
-    loadedScope.current = `${baseUrl}:${viewingAgentId}`
+    if (!pageMounted.current || liveScope.current !== scope || sequence !== loadSequence.current) return null
+    loadedScope.current = scope
+    loadedAt.current = Date.now()
+    const nextCatalog = result?.status === 'success' ? result : null
+    catalogReady.current = !!nextCatalog
+    const signature = JSON.stringify([fresh, nextCatalog])
+    const changed = signature !== knowledgeSignature.current
+    knowledgeSignature.current = signature
     setData(fresh)
-    setCatalog(result?.status === 'success' ? result : null)
+    setCatalog(nextCatalog)
     setCatalogError(result?.status === 'success' ? '' : result?.message || '当前目录读取失败，请刷新重试')
     setKnowledgeRevision(v => v + 1)
-    invalidateGraph()
+    if (forceGraph || changed) invalidateGraph()
+    const current = knowledgeEditor.getState()
+    // 缓存只负责立即展示；权威目录排除的托管发布不能继续作为当前正文显示。
+    if (nextCatalog && current.doc?.agentId === viewingAgentId && current.doc.path.startsWith('wiki/')
+        && !nextCatalog.pages.some(page => page.searchable && page.path === current.doc?.path)) {
+      current.forget()
+    }
     return fresh
-  }, [baseUrl, viewingAgentId, invalidateGraph])
+  }, [scope, viewingAgentId, invalidateGraph])
 
   // Reload the tree. When targetPath is given, open it; null means the open doc
   // no longer exists, so fall back to the first one; otherwise keep the
   // currently open doc (or open the first one on the initial load).
   const refresh = useCallback(
-    async (targetPath?: string | null) => {
+    async (targetPath?: string | null, forceGraph = true) => {
+      // 写入已完成但刷新未完成时离页，下一次进入仍须核验，不能复用旧的新鲜时间。
+      loadedAt.current = 0
+      if (sessionRef.current) sessionRef.current.loadedAt = 0
       try {
-        const fresh = await loadKnowledge()
+        const fresh = await loadKnowledge(forceGraph)
         if (!fresh) return null
         if (targetPath) {
           openDoc(targetPath, findTitle(fresh, targetPath))
@@ -387,20 +439,54 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
     apiClient.setBaseUrl(baseUrl)
     let cancelled = false
     ;(async () => {
-      setLoading(true)
+      const saved = retainedSession?.scope === scope ? retainedSession : null
+      setLoading(!saved?.data)
       // Switching the viewed Agent shows a different base, so drop the open doc
       // and its graph and reopen the first file of the new base. Anything
       // unsaved was already asked about by setScope, which is the only way in.
-      knowledgeEditor.getState().forget()
+      const resetEditor = editorScope !== scope
+      if (resetEditor) knowledgeEditor.getState().forget()
+      editorScope = scope
       navigationSequence.current++
-      setHistoryPublishId(null)
-      setCatalog(null)
-      invalidateGraph()
+      if (saved) {
+        loadedScope.current = scope
+        loadedAt.current = saved.loadedAt
+        knowledgeSignature.current = JSON.stringify([saved.data, saved.catalog])
+        personalFingerprint.current = saved.personalFingerprint
+        catalogReady.current = !!saved.catalog
+        setData(saved.data)
+        setCatalog(saved.catalog)
+        setCatalogError(saved.catalogError)
+        graphSequence.current++
+        setGraph(saved.graph)
+        setGraphLoading(false)
+        setTab(saved.tab)
+        setSearch(saved.search)
+        setHistoryPublishId(saved.historyPublishId)
+        if (resetEditor && saved.data) {
+          const first = firstFile(saved.data)
+          if (first) openDoc(first.path, first.title)
+        }
+      } else {
+        loadedScope.current = null
+        loadedAt.current = 0
+        setHistoryPublishId(null)
+        setData(null)
+        setCatalog(null)
+        setCatalogError('')
+        personalFingerprint.current = null
+        catalogReady.current = false
+        knowledgeSignature.current = ''
+        invalidateGraph()
+      }
+      if (saved?.data && saved.catalog?.status === 'success' && Date.now() - saved.loadedAt < SESSION_FRESH_MS) return
       try {
-        const fresh = await loadKnowledge()
+        const fresh = await loadKnowledge(false)
         if (cancelled || !fresh) return
-        const first = firstFile(fresh)
-        if (first) openDoc(first.path, first.title)
+        if (!saved) {
+          const first = firstFile(fresh)
+          if (first) openDoc(first.path, first.title)
+        }
       } catch (e) {
         if (!cancelled) showStatus('知识目录读取失败，请重试', true)
       } finally {
@@ -452,7 +538,7 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
   )
 
   const loadGraph = useCallback(async () => {
-    if (graph || loadedScope.current !== `${baseUrl}:${viewingAgentId}`) return
+    if (graph || loadedScope.current !== scope) return
     const mine = ++graphSequence.current
     setGraphLoading(true)
     try {
@@ -465,15 +551,19 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
     } finally {
       if (mine === graphSequence.current) setGraphLoading(false)
     }
-  }, [baseUrl, graph, viewingAgentId])
+  }, [scope, graph, viewingAgentId])
 
   useEffect(() => { if (tab === 'graph' && !loading && !graph && !graphLoading) void loadGraph() }, [tab, loading, knowledgeRevision, graph, graphLoading, loadGraph])
 
-  const onPersonalKnowledgeChanged = useCallback(() => {
-    // 任务发布版本或有效性变化后刷新统计，并让图谱下次打开时读取新数据。
-    invalidateGraph()
-    void refresh()
-  }, [refresh, invalidateGraph])
+  const onPersonalKnowledgeChanged = useCallback(async (fingerprint: string) => {
+    if (!pageMounted.current || liveScope.current !== scope) return false
+    if (personalFingerprint.current === fingerprint) return true
+    // 首次资料快照只核对目录；确认发布或有效性变化后才丢弃图谱。
+    const fresh = await refresh(undefined, false)
+    if (!fresh || !catalogReady.current) return false
+    personalFingerprint.current = fingerprint
+    return true
+  }, [scope, refresh])
 
   const switchTab = async (next: Tab) => {
     if (next === tab) return
