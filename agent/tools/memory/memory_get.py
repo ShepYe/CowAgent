@@ -134,6 +134,8 @@ class MemoryGetTool(BaseTool):
                 from agent.knowledge.purpose import note_source_evidence
                 note_source_evidence()
             content = file_path.read_text(encoding='utf-8')
+            from agent.memory.projection import filter_memory_text
+            content = filter_memory_text(workspace_dir, file_path, content)
             lines = content.split('\n')
             
             # Handle line range

@@ -40,8 +40,8 @@ interface MemoryRef {
 const memoryEditor = createDocEditorStore<MemoryRef, WorkspaceReadResult & ApiResult>({
   keyOf: (doc) => `${doc.category}:${doc.filename}`,
   read: (doc) => apiClient.workspaceRead(doc.relPath),
-  write: (doc, content, expectedMtime) =>
-    apiClient.workspaceWrite({ path: doc.relPath, content, expectedMtime }),
+  write: (doc, content, expectedMtime, expectedHash) =>
+    apiClient.workspaceWrite({ path: doc.relPath, content, expectedMtime, expectedHash }),
 })
 
 const formatSize = (bytes: number): string => {

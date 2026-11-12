@@ -51,7 +51,7 @@ const IconButton: React.FC<{ onClick: () => void; title: string; children: React
 const WorkspacePanel: React.FC = () => {
   const navigate = useNavigate()
   const { isMac } = usePlatform()
-  const { open, tab, width, current, previewError, edit, editNotice } = useWorkspaceStore()
+  const { open, tab, width, current, previewError, edit, editNotice, projectionPending, unverified } = useWorkspaceStore()
   const dismissEditNotice = useWorkspaceStore((s) => s.dismissEditNotice)
   const setTab = useWorkspaceStore((s) => s.setTab)
   const setWidth = useWorkspaceStore((s) => s.setWidth)
@@ -232,6 +232,8 @@ const WorkspacePanel: React.FC = () => {
           {current && (
             <div className="shrink-0 px-3 py-2 text-[11px] font-mono text-content-tertiary border-b border-default break-all">
               {current.path}
+              {unverified && <span role="status" className="ml-2 text-amber-600" title={unverified}>未核验</span>}
+              {projectionPending && <span role="status" className="ml-2 text-amber-600" title="已接受保存，文件投影待完成">投影待完成</span>}
               {edit?.dirty && <span className="text-accent" title={t('ws_edit_unsaved')}> •</span>}
             </div>
           )}

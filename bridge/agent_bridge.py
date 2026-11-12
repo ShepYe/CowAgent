@@ -1658,7 +1658,6 @@ class AgentBridge:
                 self._sync_shared_transcript(agent, session_id, resolved_agent_id)
 
             from common.personal_tasks import current_task_id, personal_enabled
-            from agent.knowledge.purpose import mark_messages
             personal_task_id = current_task_id()
             if personal_enabled() and hasattr(agent, "messages"):
                 from agent.knowledge.purpose import refresh_evidence_context
@@ -1729,13 +1728,38 @@ class AgentBridge:
             # the user switches away or refreshes before the reply finishes.
             # The reply (assistant/tool messages) is appended step by step as
             # the run goes; later writes skip this already-stored user turn.
+            input_message = self._memory_input_message(
+                query, session_id, context, resolved_agent_id
+            )
+            if getattr(agent, "workspace_dir", None):
+                try:
+                    from agent.memory.ledger import MemoryLedger
+                    ledger = MemoryLedger(agent.workspace_dir, store=self.get_conversation_store(resolved_agent_id))
+                    ledger.capture([input_message], session_id=session_id,
+                                   origin=input_message["extras"]["memory_trace"]["origin"])
+                except Exception as exc:
+                    logger.warning(f"[AgentBridge] 原话依据留档失败，继续保存会话: {exc}")
             pre_persisted = self._pre_persist_user_message(
-                session_id, query, context, clear_history, resolved_agent_id
+                session_id, query, context, clear_history, resolved_agent_id,
+                message=input_message,
             )
 
             channel_type = (context.get("channel_type") or "") if context else ""
 
             def write_reply(messages: list):
+                from agent.memory.message_trace import ensure_trace
+                from common.runtime_identity import current_identity
+                identity = current_identity()
+                for message in messages:
+                    blocks = message.get("content")
+                    is_tool = message.get("role") == "tool" or (
+                        isinstance(blocks, list) and any(
+                            isinstance(block, dict) and block.get("type") == "tool_result"
+                            for block in blocks))
+                    ensure_trace(message, agent_id=resolved_agent_id,
+                                 user_id=identity.user_id or "", session_id=session_id or "",
+                                 origin="tool" if is_tool else (
+                                     "assistant" if message.get("role") == "assistant" else "internal"))
                 # Stamp every reply with its author, the owner's included. In a
                 # shared conversation a guest reconstructs "who said what" from
                 # this stamp; if the owner's turns went unstamped they would read
@@ -1755,6 +1779,12 @@ class AgentBridge:
                         raise RuntimeError("conversation write failed; step remains pending")
 
             writer = StepWriter(write_reply, skip_query=pre_persisted) if session_id else None
+
+            def bind_executor(executor):
+                # 执行器须在创建当前 user 消息时沿用此身份，先于 trim/capture。
+                executor._memory_input_message = input_message
+                if writer is not None:
+                    writer.bind(executor)
 
             def on_run_event(event):
                 # Store the step before announcing it: a listener hearing
@@ -1787,7 +1817,7 @@ class AgentBridge:
                     # waiting on this run, so an empty answer stays empty and
                     # the scheduler sends no message at all.
                     allow_empty_response=bool(context and context.get("is_scheduled_task")),
-                    on_executor=writer.bind if writer is not None else None,
+                    on_executor=bind_executor,
                 )
             except Exception:
                 # Keep the steps finished before the failure.
@@ -1828,8 +1858,11 @@ class AgentBridge:
             if writer is not None:
                 if personal_task_id:
                     with agent.messages_lock:
-                        agent.messages[:] = [message if id(message) in personal_message_ids
-                            else mark_messages([message], personal_task_id)[0] for message in agent.messages]
+                        for message in agent.messages:
+                            if id(message) not in personal_message_ids:
+                                message["personal_task_id"] = personal_task_id
+                                message.setdefault("extras", {}).update(
+                                    personal_task_id=personal_task_id, archive_only=True)
                 new_messages = list(getattr(agent, '_last_run_new_messages', []))
                 # The leading user turn was already persisted eagerly above;
                 # drop it here so it isn't stored twice.
@@ -2081,6 +2114,31 @@ class AgentBridge:
             except Exception as e:
                 logger.warning(f"[AgentBridge] Failed to sync API keys: {e}")
     
+    @staticmethod
+    def _memory_input_message(query, session_id, context, agent_id):
+        from agent.memory.message_trace import ensure_trace
+        from common.runtime_identity import current_identity
+        from common.personal_tasks import current_task_id
+
+        internal = bool(
+            context is None or (session_id or "").startswith("scheduler_") or context and any(
+                context.get(key) for key in (
+                    "is_scheduled_task", "is_delegated_task", "is_subagent",
+                    "is_replay", "is_internal", "parent_run_id",
+                )
+            )
+        )
+        message = {"role": "user", "content": [{"type": "text", "text": query}], "extras": {}}
+        if context and context.get("display"):
+            message["extras"]["display"] = context.get("display")
+        task_id = current_task_id()
+        if task_id:
+            message["personal_task_id"] = task_id
+            message["extras"].update(personal_task_id=task_id, archive_only=True)
+        ensure_trace(message, agent_id=agent_id or "", user_id=current_identity().user_id or "",
+                     session_id=session_id or "", origin="internal" if internal else "human")
+        return message
+
     def _pre_persist_user_message(
         self,
         session_id: str,
@@ -2088,6 +2146,7 @@ class AgentBridge:
         context: Context,
         clear_history: bool,
         agent_id: str = None,
+        message: dict = None,
     ) -> bool:
         """Persist the user's message before the agent runs.
 
@@ -2115,15 +2174,9 @@ class AgentBridge:
             if clear_history:
                 store.clear_session(session_id)
             channel_type = (context.get("channel_type") or "") if context else ""
-            user_msg = {
-                "role": "user",
-                "content": [{"type": "text", "text": query}],
-            }
-            display = context.get("display") if context else None
-            if display:
-                user_msg["extras"] = {"display": display}
-            store.append_messages(session_id, [user_msg], channel_type=channel_type)
-            return True
+            user_msg = message if message is not None else self._memory_input_message(
+                query, session_id, context, agent_id)
+            return bool(store.append_messages(session_id, [user_msg], channel_type=channel_type))
         except Exception as e:
             logger.warning(
                 f"[AgentBridge] Failed to pre-persist user message for session={session_id}: {e}"
@@ -2176,8 +2229,11 @@ class AgentBridge:
         if not thinking_enabled:
             messages_to_store = self._strip_thinking_blocks(new_messages)
         from common.personal_tasks import current_task_id
-        from agent.knowledge.purpose import mark_messages
-        messages_to_store = mark_messages(messages_to_store, current_task_id())
+        task_id = current_task_id()
+        if task_id:
+            messages_to_store = [dict(message, personal_task_id=task_id, extras={
+                **(message.get("extras") or {}), "personal_task_id": task_id, "archive_only": True,
+            }) for message in messages_to_store]
 
         stored = False
         try:

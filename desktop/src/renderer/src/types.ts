@@ -273,6 +273,9 @@ export interface WorkspaceEntry {
 
 /** Response of GET /api/workspace/read: the editor's initial content. */
 export interface WorkspaceReadResult {
+  memory_status?: string
+  diagnostic?: string
+  sha256?: string | null
   path: string
   content: string
   /** The read stopped at the size cap, so the tail is missing. */
@@ -288,6 +291,10 @@ export interface WorkspaceReadResult {
 
 /** Response of POST /api/workspace/write. */
 export interface WorkspaceWriteResult {
+  sha256?: string | null
+  memory_status?: string
+  pending_projection?: boolean
+  projected?: boolean
   path?: string
   size?: number
   mtime?: number

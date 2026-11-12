@@ -9,9 +9,15 @@ from agent.memory.manager import MemoryManager
 from agent.memory.storage import SearchResult
 
 
-def manager_with(hits):
+def manager_with(hits, workspace):
+    for item in hits:
+        path = item.path.replace("\\", "/")
+        if path.startswith("memory/"):
+            target = workspace / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(item.snippet, encoding="utf-8")
     manager = MemoryManager.__new__(MemoryManager)
-    manager.config = SimpleNamespace(max_results=10, min_score=0, sync_on_search=False,
+    manager.config = SimpleNamespace(get_workspace=lambda: workspace, max_results=10, min_score=0, sync_on_search=False,
                                      vector_weight=0.7, keyword_weight=0.3)
     manager.embedding_provider = None
     manager.reranker = None
@@ -25,11 +31,11 @@ def hit(path):
 
 
 @pytest.mark.parametrize("paths", [[], ["memory/shared/note.md"]])
-def test_memory_only_search_does_not_resolve_knowledge(paths, monkeypatch):
+def test_memory_only_search_does_not_resolve_knowledge(paths, monkeypatch, tmp_path):
     from common import state_dir
     resolve = Mock(side_effect=AssertionError("memory search consulted registry"))
     monkeypatch.setattr(state_dir, "knowledge_dir", resolve)
-    manager = manager_with([hit(path) for path in paths])
+    manager = manager_with([hit(path) for path in paths], tmp_path)
     assert [r.path for r in asyncio.run(manager.search("budget"))] == paths
     resolve.assert_not_called()
 
@@ -39,7 +45,7 @@ def test_knowledge_filter_resolves_once_and_keeps_memory(tmp_path, monkeypatch, 
     from common import state_dir
     from agent.knowledge import personal_assistant
     paths = ["memory/shared/note.md", "knowledge/managed/stale.md", "knowledge/notes/current.md"]
-    manager = manager_with([hit(path.replace("/", separator)) for path in paths])
+    manager = manager_with([hit(path.replace("/", separator)) for path in paths], tmp_path)
     manager.config.get_workspace = lambda: tmp_path
     resolve = Mock(return_value=tmp_path / "knowledge")
     monkeypatch.setattr(state_dir, "knowledge_dir", resolve)
@@ -54,10 +60,10 @@ def test_knowledge_filter_resolves_once_and_keeps_memory(tmp_path, monkeypatch, 
     resolve.assert_called_once_with(base=tmp_path)
 
 
-def test_below_threshold_knowledge_does_not_resolve_root(monkeypatch):
+def test_below_threshold_knowledge_does_not_resolve_root(monkeypatch, tmp_path):
     from common import state_dir
     monkeypatch.setattr(state_dir, "knowledge_dir", Mock(side_effect=AssertionError("below cutoff")))
-    manager = manager_with([hit("knowledge/managed/stale.md")])
+    manager = manager_with([hit("knowledge/managed/stale.md")], tmp_path)
     assert asyncio.run(manager.search("budget", min_score=1.1)) == []
 
 

@@ -13,6 +13,8 @@ indication that a threshold had been applied.
 import asyncio
 import os
 import sys
+import tempfile
+from pathlib import Path
 import unittest
 from types import SimpleNamespace
 
@@ -35,14 +37,18 @@ def _result(label):
     )
 
 
-def _manager(keyword_hits, max_results=10, min_score=0.4):
-    # search() only reaches the config, the storage and the reranker hook, so a
-    # bare instance avoids opening a real MemoryStorage/embedding provider.
+def _manager(workspace, keyword_hits, max_results=10, min_score=0.4):
+    # 以真实正文通过准入，裸实例避免加载存储和 embedding provider。
+    for hit in keyword_hits:
+        target = workspace / hit.path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(hit.snippet, encoding="utf-8")
     manager = MemoryManager.__new__(MemoryManager)
     manager.reranker = None
     manager.embedding_provider = None
     manager._dirty = False
     manager.config = SimpleNamespace(
+        get_workspace=lambda: workspace,
         max_results=max_results,
         min_score=min_score,
         sync_on_search=False,
@@ -56,12 +62,17 @@ def _manager(keyword_hits, max_results=10, min_score=0.4):
 class TestSearchHonoursExplicitThresholds(unittest.TestCase):
     """An override the caller passed is used verbatim, including when it is 0."""
 
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.workspace = Path(temporary.name)
+
     def test_zero_min_score_keeps_hits_below_the_configured_default(self):
         # Four keyword-only hits rank-normalize to 1.0 / 0.75 / 0.5 / 0.25, so
         # the configured 0.4 default cuts the last one. min_score=0 asks for
         # everything, and "everything" must include that hit.
         hits = [_result(label) for label in ("a", "b", "c", "d")]
-        manager = _manager(hits)
+        manager = _manager(self.workspace, hits)
 
         results = asyncio.run(manager.search("query", min_score=0.0))
 
@@ -70,7 +81,7 @@ class TestSearchHonoursExplicitThresholds(unittest.TestCase):
 
     def test_the_configured_default_still_applies_when_no_override_is_given(self):
         hits = [_result(label) for label in ("a", "b", "c", "d")]
-        manager = _manager(hits)
+        manager = _manager(self.workspace, hits)
 
         results = asyncio.run(manager.search("query"))
 
@@ -82,7 +93,7 @@ class TestSearchHonoursExplicitThresholds(unittest.TestCase):
 
     def test_a_nonzero_override_still_wins_over_the_default(self):
         hits = [_result(label) for label in ("a", "b", "c", "d")]
-        manager = _manager(hits)
+        manager = _manager(self.workspace, hits)
 
         results = asyncio.run(manager.search("query", min_score=0.9))
 
@@ -90,7 +101,7 @@ class TestSearchHonoursExplicitThresholds(unittest.TestCase):
 
     def test_the_configured_cap_still_applies_when_no_override_is_given(self):
         hits = [_result(label) for label in ("a", "b", "c", "d")]
-        manager = _manager(hits, max_results=2)
+        manager = _manager(self.workspace, hits, max_results=2)
 
         results = asyncio.run(manager.search("query"))
 

@@ -1142,6 +1142,14 @@ class Read(BaseTool):
             with open(absolute_path, 'r', encoding='utf-8-sig') as f:
                 content = f.read()
 
+            from agent.memory.projection import filter_memory_text
+            from common import state_dir
+            try:
+                workspace = self.config.get('workspace_root') or state_dir.state_root()
+            except (KeyError, ValueError, state_dir.StateDirError):
+                workspace = self.cwd
+            content = filter_memory_text(workspace, absolute_path, content)
+
             result, error = self._paginate(
                 split_lines(content), offset, limit, display_path
             )

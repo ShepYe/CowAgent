@@ -124,6 +124,21 @@ def build_agent_system_prompt(
         The full system prompt.
     """
     sections = []
+    # 记忆必须按权威状态核验完整原文后再用于 prompt；机器标记不进入模型。
+    if workspace_dir:
+        from pathlib import Path
+        from agent.memory.projection import filter_memory_text, read_memory_text
+        context_files = [ContextFile(file.path, filter_memory_text(workspace_dir, file.path, file.content))
+                         for file in (context_files or [])]
+        import hashlib
+        from common.runtime_identity import current_identity
+        user_id = current_identity().user_id or ""
+        suffix = "-" + hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:20] if user_id else ""
+        path = Path(workspace_dir) / "memory" / ("routed" + suffix + ".md")
+        if path.exists():
+            content = read_memory_text(workspace_dir, path)
+            if content:
+                context_files.append(ContextFile(str(path), content))
 
     # 1. Tooling (most important, goes first)
     if tools:
@@ -233,6 +248,7 @@ def _build_tooling_section(tools: List[Any], language: str) -> List[str]:
             "browser": "control the browser (screenshot key results or send to the user when help is needed)",
             "memory_search": "search memory",
             "memory_get": "read memory content",
+            "memory_record": "record independent facts with verifiable evidence",
             "env_config": "manage API keys and skill config",
             "time": "get the current date and time",
             "scheduler": "manage scheduled tasks and reminders",
@@ -254,6 +270,7 @@ def _build_tooling_section(tools: List[Any], language: str) -> List[str]:
             "browser": "控制浏览器（关键结果或需要协助可截图发送给用户）",
             "memory_search": "搜索记忆",
             "memory_get": "读取记忆内容",
+            "memory_record": "引用原话提交独立事实及用途决定",
             "env_config": "管理API密钥和技能配置",
             "time": "获取当前日期和时间",
             "scheduler": "管理定时任务和提醒",
@@ -267,7 +284,7 @@ def _build_tooling_section(tools: List[Any], language: str) -> List[str]:
         "read", "write", "edit", "ls", "search_files",
         "bash", "terminal",
         "web_search", "web_fetch", "browser",
-        "memory_search", "memory_get",
+        "memory_search", "memory_get", "memory_record",
         "env_config", "time", "scheduler", "send", "vision", "subagent",
     ]
 
@@ -474,7 +491,7 @@ def _build_memory_section(
     has_memory_tools = False
     if tools:
         tool_names = [tool.name if hasattr(tool, 'name') else str(tool) for tool in tools]
-        has_memory_tools = any(name in ['memory_search', 'memory_get'] for name in tool_names)
+        has_memory_tools = any(name in ['memory_search', 'memory_get', 'memory_record'] for name in tool_names)
 
     if not has_memory_tools:
         return []
@@ -502,20 +519,11 @@ def _build_memory_section(
             "",
             "### Writing memory",
             "",
-            "In the following cases, **proactively** write info to memory files (no need to tell the user):",
-            "",
-            "- The user asks you to remember something, or uses words like \"remember\", \"from now on\", \"always\", \"never\", \"prefer\"",
-            "- The user shares important personal preferences, habits or decisions",
-            "- The conversation produces an important conclusion, plan or agreement",
-            "- A complex task is completed and the key steps and results are worth recording",
-            "",
-        "**Storage rules**:",
-        f"- Long-term core info → `{mem_md}`",
-        f"- Today's events/progress → `{mem_dir}/{today_file}`",
-        f"- Structured knowledge → `{kb_dir}/` (see the knowledge system)",
-            "- Append → `edit` tool with empty oldText",
-            "- Modify → `edit` tool with oldText set to the text to replace",
-            "- **Never write sensitive info** (API keys, tokens, etc.)",
+            "Proactively use `memory_record(request_id, entries)` for valuable independent facts; decide from meaning and context.",
+            "Each entry requires content/disposition/basis/reason. Cite Memory evidence message_id/block_index/start/end/sha256; keep candidate_id when resolving a pending candidate.",
+            "Split mixed messages into actual spans. Personal facts need real human evidence; tests and simulations stay archive_only, source-derived facts use sourced_knowledge and knowledge_ingest, uncertainty stays undecided.",
+            "Inspect remembered/pending_projection/archive_only/requires_knowledge_ingest/undecided/failed receipts; searchable is separate. Use supersedes for corrections.",
+            "Memory files are ledger projections. Use memory_record to change them. Never store API keys or tokens.",
             "",
             "**Principle**: use memory naturally, as if you simply knew it; don't bring it up unless asked.",
             "",
@@ -540,20 +548,11 @@ def _build_memory_section(
             "",
             "### 写入记忆",
             "",
-            "遇到以下情况时，**主动**将信息写入记忆文件（无需告知用户）：",
-            "",
-            "- 用户要求记住某些信息，或使用了「记住」「以后」「总是」「不要」「偏好」等表达",
-            "- 用户分享了重要的个人偏好、习惯、决策",
-            "- 对话中产生了重要的结论、方案、约定",
-            "- 完成了复杂任务，值得记录关键步骤和结果",
-            "",
-            "**存储规则**:",
-            f"- 长期核心信息 → `{mem_md}`",
-            f"- 当天事件/进展 → `{mem_dir}/{today_file}`",
-            f"- 结构化知识 → `{kb_dir}/`（见知识系统）",
-            "- 追加 → `edit` 工具，oldText 留空",
-            "- 修改 → `edit` 工具，oldText 填写要替换的文本",
-            "- **禁止写入敏感信息**（API密钥、令牌等）",
+            "根据语义与必要前文，主动用 `memory_record(request_id, entries)` 提交有价值的独立事实，无需例行询问。",
+            "每条包含 content/disposition/basis/reason；从 Memory evidence 引用 message_id/block_index/start/end/sha256，补判待处理候选时沿用 candidate_id。",
+            "混合消息分别引用实际片段：真实偏好可记，测试及模拟只留档 archive_only，资料原文及复述/指代为 sourced_knowledge 并继续 knowledge_ingest，不确定为 undecided。",
+            "按回执区分 remembered/pending_projection/archive_only/requires_knowledge_ingest/undecided/failed；是否可检索看 searchable。更正使用 supersedes。",
+            "记忆文件由台账投影，修改记忆使用 memory_record。禁止记 API 密钥、令牌。",
             "",
             "**使用原则**: 自然使用记忆，就像你本来就知道；不用刻意提起，除非用户问起。",
             "",

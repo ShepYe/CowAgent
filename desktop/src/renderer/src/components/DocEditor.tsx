@@ -277,8 +277,12 @@ const DocBtn: React.FC<{
 /** The reason an edit was refused, or a read that failed. */
 export function DocNotice<D>({ store }: { store: DocEditorStore<D> }): React.ReactElement | null {
   const notice = store((s) => s.notice)
+  const projectionPending = store((s) => s.projectionPending)
+  const unverified = store((s) => s.unverified)
   const dismissNotice = store((s) => s.dismissNotice)
 
+  if (!notice && unverified) return <div role="status" className="shrink-0 px-6 py-2 text-[12px] text-amber-600" title={unverified}>未核验{projectionPending ? ' · 投影待完成' : ''}</div>
+  if (!notice && projectionPending) return <div role="status" className="shrink-0 px-6 py-2 text-[12px] text-amber-600" title="已接受保存，文件投影待完成">投影待完成</div>
   if (!notice) return null
 
   return (

@@ -614,6 +614,7 @@ class ApiClient {
     content: string
     session?: string
     expectedMtime?: number | null
+    expectedHash?: string | null
   }): Promise<WorkspaceWriteResult & ApiResult> {
     return this.request('/api/workspace/write', {
       method: 'POST',
@@ -622,6 +623,7 @@ class ApiClient {
         content: args.content,
         session: args.session || '',
         expected_mtime: args.expectedMtime ?? null,
+        expected_hash: args.expectedHash ?? null,
       }),
     })
   }

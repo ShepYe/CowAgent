@@ -117,13 +117,18 @@ def test_rerank_failure_keeps_fused_order(reranker):
     assert _manager_with(reranker)._rerank("query", results) is results
 
 
-def test_search_applies_min_score_before_rerank():
+def test_search_applies_min_score_before_rerank(tmp_path):
     keyword_hits = [_result(label) for label in ("a", "b", "c", "d")]
     reranker = ScriptedReranker(
         {"snippet a": 0.1, "snippet b": 0.5, "snippet c": 0.9, "snippet d": 0.99}
     )
     manager = _manager_with(reranker)
+    for hit in keyword_hits:
+        target = tmp_path / hit.path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(hit.snippet, encoding="utf-8")
     manager.config = SimpleNamespace(
+        get_workspace=lambda: tmp_path,
         max_results=10,
         min_score=0.4,
         sync_on_search=False,

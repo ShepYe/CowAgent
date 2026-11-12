@@ -28,6 +28,20 @@ from common.i18n import t as _t
 def compress_turn_to_text_only(turn):
     """压缩仍保留非敏感阅读标识；重新读取须由服务重新校验并创建引用。"""
     compressed = _compress_turn_to_text_only(turn)
+    from agent.memory.projection import mark_context_message
+    for message in compressed.get("messages", []):
+        if message.get("role") != "user":
+            continue
+        original = next((m for m in turn.get("messages", []) if m.get("role") == "user"
+                         and not any(b.get("type") == "tool_result" for b in m.get("content", [])
+                                     if isinstance(b, dict))), None)
+        if original:
+            message["extras"] = copy.deepcopy(original.get("extras") or {})
+            message["message_id"] = original.get("message_id")
+            if message.get("content") == original.get("content"):
+                continue
+            message["extras"]["context_original"] = copy.deepcopy(original)
+            mark_context_message(message)
     reading_ids = []
     for msg in turn.get("messages", []):
         content = msg.get("content")
@@ -1008,6 +1022,9 @@ class AgentStreamExecutor:
                 }
             ]
         }
+        if getattr(self, "_memory_input_message", None) is not None:
+            import copy
+            self.run_user_message = copy.deepcopy(self._memory_input_message)
         self.messages.append(self.run_user_message)
         self._run_images = None
         self._run_images_disabled = False
@@ -1763,6 +1780,13 @@ class AgentStreamExecutor:
         # except Exception:
         #     pass
 
+        # 当前消息身份先落盘，再把可引用片段与待判断候选复用于本次推理。
+        evidence_prompt = ""
+        if getattr(self.agent, "workspace_dir", None):
+            self.system_prompt = self.agent.get_full_system_prompt(skill_filter=getattr(self, "_prompt_skill_filter", None))
+        prompt_builder = getattr(self.agent, "memory_request_prompt", None)
+        if callable(prompt_builder):
+            evidence_prompt = prompt_builder(self.messages)
         # Create request
         request = LLMRequest(
             messages=messages,
@@ -1770,7 +1794,7 @@ class AgentStreamExecutor:
             stream=True,
             tools=tools_schema,
             max_tokens=self._catalog_max_output_tokens(),
-            system=self.system_prompt  # Pass system prompt separately for Claude API
+            system=self.system_prompt + evidence_prompt
         )
 
         self._emit_event("message_start", {"role": "assistant"})
@@ -1994,13 +2018,17 @@ class AgentStreamExecutor:
                 error_type = "context overflow" if is_context_overflow else "message format error"
                 logger.error(f"💥 {error_type} detected: {e}")
 
+                if not self._capture_memory_context():
+                    raise RuntimeError("原话未能保存，停止压缩并保留当前上下文") from e
                 # Flush memory before trimming to preserve context that will be lost
                 if is_context_overflow and self.agent.memory_manager:
                     user_id = getattr(self.agent, '_current_user_id', None)
-                    self.agent.memory_manager.flush_memory(
+                    saved = self.agent.memory_manager.flush_memory(
                         messages=self.messages, user_id=user_id,
                         reason="overflow", max_messages=0
                     )
+                    if saved is False:
+                        raise RuntimeError("记忆候选未保存，停止压缩并保留当前上下文") from e
 
                 # Smart-compaction recovery — reuse the same strategy as the
                 # proactive _trim_messages (discard the older half + inject an
@@ -2508,6 +2536,19 @@ class AgentStreamExecutor:
                 raise ValueError(self._build_tool_not_found_message(tool_name))
 
             # Set tool context
+            if tool_name == "memory_record":
+                from common.personal_tasks import current_task_id
+                from common.runtime_identity import current_identity
+                identity = current_identity()
+                tool.agent = self.agent
+                tool._memory_record_trusted = bool(
+                    self.agent is not None and not current_task_id()
+                    and not any(getattr(self.agent, flag, False)
+                                for flag in ("_is_subagent", "_is_replay", "_is_internal"))
+                    and identity.session_id
+                    and getattr(self.agent, "_current_session_id", None) == identity.session_id
+                    and getattr(self.agent, "_current_agent_id", None) == identity.agent_id
+                )
             tool.model = self.model
             tool.context = self.agent
             tool.cancel_event = self.cancel_event
@@ -2526,6 +2567,13 @@ class AgentStreamExecutor:
             start_time = time.time()
             try:
                 result: ToolResult = tool.execute_tool(arguments)
+                if tool_name == "memory_record" and isinstance(result.result, dict):
+                    receipt = result.result
+                    successful = any(item.get("status") != "failed" for item in receipt.get("results", []))
+                    snapshot = getattr(self.agent, "_memory_request_revisions", {}).get(identity.run_id)
+                    if successful and snapshot is not None:
+                        # 只跟随本次提交的修订，不能追上别人并发更正后的全局值。
+                        snapshot["revision"] = receipt["revision"]
             finally:
                 tool.progress_callback = None
                 tool.cancel_event = None
@@ -2790,6 +2838,8 @@ class AgentStreamExecutor:
         """
         COMPRESS_THRESHOLD = 5
 
+        if not self._capture_memory_context():
+            return False
         input_budget = self._overflow_input_budget(error_str)
         original_count = len(self.messages)
 
@@ -2826,11 +2876,13 @@ class AgentStreamExecutor:
                     if discarded_messages:
                         user_id = getattr(self.agent, "_current_user_id", None)
                         cb = self._build_context_summary_callback(discarded_turns, kept_turns)
-                        self.agent.memory_manager.flush_memory(
+                        saved = self.agent.memory_manager.flush_memory(
                             messages=discarded_messages, user_id=user_id,
                             reason="overflow", max_messages=0,
                             context_summary_callback=cb,
                         )
+                        if saved is False:
+                            return False
                 turns = kept_turns
             else:
                 # Few turns: compress all to text-only. If that still doesn't
@@ -2871,37 +2923,58 @@ class AgentStreamExecutor:
         )
         return True
 
-    def _build_context_summary_callback(self, discarded_turns: list, kept_turns: list):
-        """
-        Build a callback that injects an LLM summary into the first user
-        message of *kept_turns*. Returns None if no valid injection target.
+    def _capture_memory_context(self):
+        workspace = getattr(self.agent, "workspace_dir", None)
+        if not workspace:
+            return True
+        try:
+            from agent.memory.ledger import MemoryLedger
+            MemoryLedger(workspace).capture(self.messages)
+            return True
+        except Exception as exc:
+            logger.warning(f"[Agent] 原话未能保存，保留当前上下文: {exc}")
+            return False
 
-        The callback is passed to flush_from_messages so that the same LLM
-        call that writes daily memory also provides the in-context summary.
-        """
+    def _build_context_summary_callback(self, discarded_turns: list, kept_turns: list):
         if not kept_turns:
             return None
-
-        # Find the first user text block in kept_turns as injection target
-        target_block = find_first_user_text_block(kept_turns)
-        if not target_block:
+        target = find_first_user_text_block(kept_turns)
+        if not target:
             return None
-
+        owner = next(message for turn in kept_turns for message in turn["messages"]
+                     if any(block is target for block in message.get("content", []) if isinstance(block, dict)))
+        original = target["text"]
         turn_count = len(discarded_turns)
-        original_text = target_block["text"]
+        from common.runtime_identity import current_identity
+        identity = current_identity()
+        context_messages = self.messages
+        epoch = getattr(self.agent, "_memory_context_epoch", 0)
+        workspace = getattr(self.agent, "workspace_dir", None)
+        revision = None
+        if workspace:
+            from agent.memory.ledger import MemoryLedger
+            revision = MemoryLedger(workspace).revision()
 
-        def _on_summary_ready(summary: str):
-            if not summary or not summary.strip():
+        def ready(summary):
+            if not summary or target.get("text") != original or current_identity() != identity:
                 return
-            target_block["text"] = build_compaction_summary_text(
-                summary, turn_count, original_text
-            )
-            logger.info(
-                f"📝 Context summary injected "
-                f"({len(summary)} chars, {turn_count} turns)"
-            )
-
-        return _on_summary_ready
+            if getattr(self.agent, "_memory_context_epoch", 0) != epoch:
+                return
+            # 已不在当前消息链的迟到回调不再改写任何上下文。
+            if self.messages is not context_messages and not any(message is owner for message in self.messages):
+                return
+            snapshot = None
+            expected = getattr(ready, "_memory_expected_revision", revision)
+            if revision is not None:
+                from agent.memory.ledger import MemoryLedger
+                snapshot = MemoryLedger(workspace).context_snapshot()
+                if snapshot["revision"] != expected:
+                    return
+            from agent.memory.projection import mark_context_message
+            mark_context_message(owner, revision=expected, snapshot=snapshot)
+            target["text"] = build_compaction_summary_text(summary, turn_count, original)
+        ready._memory_expected_revision = revision
+        return ready
 
     def _token_budget_trim(self, turns: List[Dict], budget: int) -> Tuple[List[Dict], List[Dict]]:
         """
@@ -2938,6 +3011,8 @@ class AgentStreamExecutor:
         if not self.messages or not self.agent:
             return
 
+        if not self._capture_memory_context():
+            return
         # Step 0: Truncate large tool results in historical turns (30K -> 10K)
         self._truncate_historical_tool_results()
 
@@ -3067,11 +3142,13 @@ class AgentStreamExecutor:
             if discarded_messages:
                 user_id = getattr(self.agent, '_current_user_id', None)
                 cb = self._build_context_summary_callback(discarded_turns, kept_turns)
-                self.agent.memory_manager.flush_memory(
+                saved = self.agent.memory_manager.flush_memory(
                     messages=discarded_messages, user_id=user_id,
                     reason="trim", max_messages=0,
                     context_summary_callback=cb,
                 )
+                if saved is False:
+                    return
 
         # Reconstruct message list from kept turns
         new_messages = []
@@ -3103,6 +3180,11 @@ class AgentStreamExecutor:
         not as a message. The AgentLLMModel will handle this.
         """
         # Don't add system message here - it will be handled separately by the LLM adapter
+        workspace = getattr(self.agent, "workspace_dir", None)
+        if workspace:
+            from agent.memory.ledger import MemoryLedger
+            from agent.memory.projection import refresh_context_messages
+            refresh_context_messages(self.messages, MemoryLedger(workspace))
         images = self._run_image_blocks()
         self._images_in_request = False
         if "vision" not in (self.tools or {}):

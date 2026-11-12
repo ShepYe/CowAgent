@@ -78,6 +78,25 @@ def read_evidence(env, reader='read'):
     return result
 
 
+def accepted_preference(env, text='喜欢简洁回答'):
+    """原真人依据先经主 Agent 准入，再验证摘要候选复用已有决定。"""
+    from agent.memory.ledger import MemoryLedger
+    ledger = MemoryLedger(env.root)
+    message = {'role': 'user', 'content': text}
+    ledger.capture([message], origin='human')
+    evidence = ledger.evidence([message])[0]
+    evidence.pop('text')
+    evidence.pop('origin')
+    entry = dict(content=text, disposition='conversation_memory', reason='独立真实用户偏好', basis=[evidence])
+    first = ledger.record('main-' + text, [entry], trusted=True)
+    assert first['results'][0]['status'] == 'remembered'
+    summary = ledger.record('summary-' + text, [entry], trusted=False)
+    assert summary['results'][0]['status'] == 'remembered'
+    assert summary['results'][0]['candidate_id'] == first['results'][0]['candidate_id']
+    assert [item['content'] for item in ledger.active_entries()] == [text]
+    return ledger
+
+
 def draft(env, **changes):
     page = dict(summary='说明本页知识的主题及适用范围。', title='预算派生结论', category='工程', blocks=[dict(
         content='derived_budget_4720：设计预算为42 dB', sources=[copy.deepcopy(env.evidence)])],
@@ -109,8 +128,11 @@ def test_summary_excludes_derived_answer_after_tool_messages_are_trimmed(derivat
     with identity_scope(user_id=OWNER, session_id='trimmed-session'):
         read_evidence(env)
         messages = [{'role': 'user', 'content': '解释预算'}, {'role': 'assistant', 'content': '预算为42 dB'}]
-        assert purpose.durable_messages(messages) == []
-        assert env.manager.flush_manager._format_conversation_for_summary(messages) == ''
+        assert purpose.durable_messages(messages) == messages
+        # 来源承接消息仍可供候选模型判断，不能因整会话过滤而丢普通新事实。
+        assert env.manager.flush_manager._format_conversation_for_summary(messages)
+        ledger = accepted_preference(env)
+        assert '预算为42 dB' not in str(ledger.active_entries())
         assert not env.manager.flush_manager.write_daily_summary('预算为42 dB')
 
 
@@ -120,7 +142,7 @@ def test_persisted_evidence_excludes_background_summary_and_restores_write_guard
     messages = [{'role': 'tool', 'content': marker}, {'role': 'assistant', 'content': '预算为42 dB'}]
     with identity_scope(user_id=OWNER, session_id='restored-session'):
         # 不依赖进程内已读标记，模拟重启后加载的持久消息。
-        assert purpose.durable_messages(messages) == []
+        assert purpose.durable_messages(messages) == [messages[1]]
         agent = SimpleNamespace(workspace_dir=str(env.root), messages=messages, messages_lock=threading.RLock())
         purpose.refresh_evidence_context(agent)
         assert Write(env.config).execute({'path': 'MEMORY.md', 'content': '预算为42 dB'}).status == 'error'
@@ -134,9 +156,10 @@ def test_other_ordinary_session_remains_writable_and_summarizable(derivation):
     with identity_scope(user_id=OWNER, session_id='independent-session'):
         messages = [{'role': 'user', 'content': '喜欢简洁回答'}]
         assert purpose.durable_messages(messages) == messages
-        assert Write(env.config).execute({'path': 'knowledge/concepts/ordinary.md', 'content': '普通笔记'}).status == 'success'
-        assert env.manager.flush_manager.write_daily_summary('用户喜欢简洁回答')
-        assert '用户喜欢简洁回答' in env.manager.flush_manager.get_today_memory_file().read_text(encoding='utf-8')
+        blocked = Write(env.config).execute({'path': 'knowledge/concepts/ordinary.md', 'content': '普通笔记'})
+        assert blocked.status == 'error' and 'memory_record' in blocked.result
+        assert not env.manager.flush_manager.write_daily_summary('用户喜欢简洁回答')
+        accepted_preference(env)
     with identity_scope(user_id=OWNER, session_id='source-session'):
         assert not env.manager.flush_manager.write_daily_summary('预算为42 dB')
 
@@ -239,7 +262,8 @@ def test_sessionless_read_does_not_mark_other_ordinary_sessions(derivation):
         assert not purpose.source_derived_context()
     with identity_scope(user_id=OWNER, session_id='later-independent-session'):
         assert not purpose.source_derived_context()
-        assert env.manager.flush_manager.write_daily_summary('普通会话笔记')
+        assert not env.manager.flush_manager.write_daily_summary('普通会话笔记')
+        accepted_preference(env, '普通交流形成的沟通约定：先给结论')
 
 
 def test_synthesis_recovery_keeps_verified_revision_after_runtime_normalization(derivation, monkeypatch):

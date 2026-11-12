@@ -802,7 +802,9 @@ class ToolManager:
 
             # Apply configuration if available
             if hasattr(self, 'tool_configs') and name in self.tool_configs:
-                tool_instance.config = self.tool_configs[name]
+                tool_instance.config = dict(self.tool_configs[name])
+            if name == "memory_record":
+                tool_instance.config["workspace_root"] = self.workspace_root
 
             return tool_instance
 

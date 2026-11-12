@@ -13,8 +13,10 @@ from :meth:`dispatch`, so remote transports keep the read-only surface.
 """
 
 import base64
+import hashlib
 import mimetypes
 import os
+import re
 import tempfile
 import threading
 import time
@@ -383,6 +385,21 @@ class WorkspaceService:
         size = snapshot.st_size
         truncated = size > len(raw)
         content, lossy = _decode_utf8(raw)
+        from agent.memory.projection import is_memory_path, filter_memory_text
+        memory_status = None
+        if is_memory_path(self.root, full) and not truncated and not lossy:
+            filtered = filter_memory_text(self.root, full, content)
+            try:
+                from agent.memory.ledger import MemoryLedger
+                verified = MemoryLedger(self.root).file_status(full, raw) != 'unverified'
+            except Exception:
+                verified = False
+            if not verified:
+                # 人工编辑器展示原文；自动记忆读取仍由权威过滤拒绝。
+                memory_status = 'unverified'
+                content = re.sub(r'<!-- /?cow-[^\n]*?-->\s*', '', content)
+            else:
+                content = filtered
         return {
             "path": self.to_rel(full),
             "content": content,
@@ -390,6 +407,9 @@ class WorkspaceService:
             "lossy": lossy,
             "size": size,
             "mtime": snapshot.st_mtime,
+            "sha256": hashlib.sha256(raw).hexdigest() if not truncated else None,
+            **({"memory_status": memory_status, "diagnostic": "文件与记忆台账不一致，自动覆盖已停止"}
+               if memory_status else {}),
             # Neither a partial read nor a lossy decode may be edited: saving
             # would truncate the tail in the first case and write replacement
             # characters over every undecodable byte in the second.
@@ -397,7 +417,7 @@ class WorkspaceService:
         }
 
     def write_text(self, rel_path: str, content: str,
-                   expected_mtime: Optional[float] = None) -> Dict:
+                   expected_mtime: Optional[float] = None, expected_hash: Optional[str] = None) -> Dict:
         """
         Overwrite an existing text file with `content`.
 
@@ -415,11 +435,13 @@ class WorkspaceService:
         # Extra collisions on case-sensitive filesystems only serialize saves.
         key = unicodedata.normalize("NFC", os.path.normcase(full)).casefold()
         with _WRITE_LOCKS[hash(key) % len(_WRITE_LOCKS)]:
-            return self._write_text_locked(full, content, expected_mtime)
+            return self._write_text_locked(full, content, expected_mtime, expected_hash)
 
     def _write_text_locked(self, full: str, content: str,
-                           expected_mtime: Optional[float]) -> Dict:
+                           expected_mtime: Optional[float], expected_hash: Optional[str] = None) -> Dict:
         """Check the editor version and publish under the same process lock."""
+        from agent.knowledge.personal_assistant import guard_path
+        guard_path(full, write=True)
         kind = classify_kind(full)
         if not is_editable(kind):
             raise ValueError(f"Not an editable text file: {self.to_rel(full)}")
@@ -438,6 +460,9 @@ class WorkspaceService:
             raise ValueError(f"File too large to edit: {size} bytes")
         with open(full, "rb") as f:
             existing = f.read()
+        baseline = hashlib.sha256(existing).hexdigest()
+        if expected_hash is not None and baseline != expected_hash:
+            raise WorkspaceConflictError(f"File changed on disk since it was read: {self.to_rel(full)}")
         if _decode_utf8(existing)[1]:
             raise ValueError(f"Not a UTF-8 text file: {self.to_rel(full)}")
 
@@ -451,8 +476,24 @@ class WorkspaceService:
         if len(encoded) > MAX_TEXT_BYTES:
             raise ValueError(f"Content too large: {len(encoded)} bytes")
 
-        self._replace_atomically(full, encoded)
+        rel = self.to_rel(full)
+        receipt = {}
+        if rel.casefold() == "memory.md" or rel.casefold().startswith("memory/"):
+            from agent.memory.ledger import MemoryLedger, MemoryError
+            try:
+                receipt = MemoryLedger(self.root).human_edit(full, data, expected_hash=baseline)
+            except MemoryError as exc:
+                if exc.code == "version_conflict":
+                    raise WorkspaceConflictError(str(exc)) from exc
+                raise
+        else:
+            self._replace_atomically(full, encoded)
+        with open(full, "rb") as saved:
+            opened = saved.read()
         return {
+            **receipt,
+            "sha256": hashlib.sha256(opened).hexdigest(),
+            **({"message": "投影待完成"} if receipt.get("projected") is False else {}),
             "path": self.to_rel(full),
             "size": os.path.getsize(full),
             "mtime": os.path.getmtime(full),

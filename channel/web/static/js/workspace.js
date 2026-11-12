@@ -18,6 +18,9 @@ let wsCurrentFile = null;
 let wsEditing = false;
 let wsEditBaseline = '';
 let wsEditBaseMtime = null;
+let wsEditBaseHash = null;
+let wsProjectionPending = false;
+let wsUnverified = null;
 let wsSaving = false;
 // Set once the user closes the panel by hand: from then on we stop
 // auto-opening artifacts for the rest of the page session.
@@ -278,6 +281,8 @@ async function openInPreview(target) {
     }
 
     wsCurrentFile = meta;
+    wsProjectionPending = false;
+    wsUnverified = null;
     wsEditing = false;
     openWorkspacePanel('preview');
     switchWorkspaceTab('preview');
@@ -295,7 +300,8 @@ function wsRenderPreviewTitle() {
         return;
     }
     const name = wsCurrentFile.path || wsCurrentFile.file_name || wsCurrentFile.name || '';
-    title.textContent = wsEditorDirty() ? `${name} •` : name;
+    title.textContent = (wsEditorDirty() ? `${name} •` : name) + (wsProjectionPending ? ' · 投影待完成' : '') + (wsUnverified ? ' · 未核验' : '');
+    title.title = [wsProjectionPending ? '已接受保存，文件投影待完成' : '', wsUnverified].filter(Boolean).join('；');
     title.classList.remove('hidden');
 }
 
@@ -455,6 +461,7 @@ function wsDiscardEditState() {
     wsEditing = false;
     wsEditBaseline = '';
     wsEditBaseMtime = null;
+    wsEditBaseHash = null;
 }
 
 /**
@@ -517,6 +524,8 @@ async function startPreviewEdit() {
 
     wsEditing = true;
     wsEditBaseMtime = data.mtime;
+    wsEditBaseHash = data.sha256;
+    wsUnverified = data.memory_status === 'unverified' ? data.diagnostic || '原文尚未核验' : null;
     // Read the baseline back out of the text area rather than using the response
     // text: a text area normalizes CRLF to LF in its value, so a CRLF file would
     // compare as modified from the moment it loaded.
@@ -590,6 +599,12 @@ async function savePreviewEdit(opts) {
     wsSaving = true;
     btn?.classList.add('ws-btn-busy');
     try {
+        let baselineHash = wsEditBaseHash;
+        if (force && baselineHash != null) {
+            const latest = await wsApi(`/api/workspace/read?path=${encodeURIComponent(wsEditTargetPath(target))}`);
+            if (!latest.editable || !latest.sha256) throw new Error(latest.message || '重新读取失败');
+            baselineHash = latest.sha256;
+        }
         const res = await fetch('/api/workspace/write', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -598,6 +613,7 @@ async function savePreviewEdit(opts) {
                 content: content,
                 session: (typeof sessionId !== 'undefined') ? sessionId : '',
                 expected_mtime: force ? null : wsEditBaseMtime,
+                expected_hash: baselineHash,
             }),
         });
         const data = await res.json();
@@ -614,9 +630,12 @@ async function savePreviewEdit(opts) {
 
         wsEditBaseline = content;
         wsEditBaseMtime = data.mtime;
+        wsEditBaseHash = data.sha256;
+        wsUnverified = data.memory_status === 'unverified' ? data.diagnostic || '原文尚未核验' : null;
         target.size = data.size;
         target.mtime = data.mtime;
-        _wsToast(t('ws_edit_saved'));
+        wsProjectionPending = data.memory_status === 'pending_projection' || data.pending_projection === true || data.projected === false;
+        _wsToast(wsProjectionPending ? '投影待完成' : t('ws_edit_saved'));
         if (keepEditing) {
             wsRenderPreviewTitle();
         } else {

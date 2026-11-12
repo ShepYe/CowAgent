@@ -19,6 +19,8 @@ def test_keyword_only_manager_finds_unicode_memory(tmp_path, query, fts_availabl
         if not fts_available:
             manager.storage.fts5_available = False
             manager.storage.trigram_fts5_available = False
+        (tmp_path / "memory").mkdir(exist_ok=True)
+        (tmp_path / "memory/note.md").write_text(f"{query}: details to remember", encoding="utf-8")
         manager.storage.save_chunk(MemoryChunk(
             id="note", user_id=None, scope="shared", source="memory", path="memory/note.md",
             start_line=1, end_line=1, text=f"{query}: details to remember", embedding=None, hash="note-hash",
@@ -36,6 +38,8 @@ def test_trigram_query_keeps_unicode_term_next_to_cjk(tmp_path):
         if not manager.storage.trigram_fts5_available:
             pytest.skip("SQLite has no trigram FTS5")
         for name, text in [("match", "中文教程 договор"), ("decoy", "中文教程 unrelated")]:
+            (tmp_path / "memory").mkdir(exist_ok=True)
+            (tmp_path / f"memory/{name}.md").write_text(text, encoding="utf-8")
             manager.storage.save_chunk(MemoryChunk(
                 id=name, user_id=None, scope="shared", source="memory", path=f"memory/{name}.md",
                 start_line=1, end_line=1, text=text, embedding=None, hash=name,

@@ -76,7 +76,16 @@ class Write(BaseTool):
             from agent.knowledge.personal_assistant import guard_path
             guard_path(absolute_path, write=True)
             from agent.knowledge.purpose import guard_memory_write
-            guard_memory_write(absolute_path, self.config.get("workspace_root") or self.cwd)
+            from common import state_dir
+            roots = {str(self.cwd)}
+            try:
+                roots.add(str(self.config.get("workspace_root") or state_dir.state_root()))
+            except (KeyError, ValueError, state_dir.StateDirError):
+                pass  # 独立工作文件工具可在尚未注册的 Agent 身份下运行。
+            if self.memory_manager:
+                roots.add(str(self.memory_manager.config.get_workspace()))
+            for root in roots:
+                guard_memory_write(absolute_path, root)
 
             # Create parent directory (if needed)
             parent_dir = os.path.dirname(absolute_path)

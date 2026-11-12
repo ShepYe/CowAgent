@@ -325,7 +325,11 @@ def _post_edit_under_state_root(tmp_path, rel_path, manager):
 
     agent = SimpleNamespace(memory_manager=manager)
     bridge = MagicMock()
-    bridge.return_value.get_agent_bridge.return_value.get_agent.return_value = agent
+    import threading
+    cached = SimpleNamespace(_resolve_agent_id=lambda value: value or 'default',
+                             _agents_lock=threading.RLock(), _agent_instances={('default', 'chat'): agent},
+                             _default_agents={})
+    bridge.return_value._agent_bridge = cached
     with patch("channel.web.api.workspace._get_workspace_root", return_value=str(tmp_path)), \
          patch("common.state_dir.state_root_str", return_value=str(tmp_path)), \
          patch("bridge.bridge.Bridge", bridge):

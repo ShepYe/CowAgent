@@ -77,6 +77,9 @@ function createDocEditor(cfg) {
     let editing = false;
     let baseline = '';
     let baseMtime = null;
+    let baseHash = null;
+    let projectionPending = false;
+    let unverified = null;
     let saving = false;
 
     function textarea() {
@@ -94,15 +97,18 @@ function createDocEditor(cfg) {
         edit?.classList.toggle('hidden', !canEdit || editing);
         saveBtn?.classList.toggle('hidden', !editing);
         cancelBtn?.classList.toggle('hidden', !editing);
-        cfg.onState?.({ editing: editing, dirty: isDirty() });
+        cfg.onState?.({ editing: editing, dirty: isDirty(), projectionPending: projectionPending, unverified: unverified });
     }
 
     /** Adopt a freshly opened document and draw it read-only. */
     function open(next) {
         doc = next;
+        projectionPending = false;
+        unverified = null;
         editing = false;
         baseline = '';
         baseMtime = null;
+        baseHash = null;
         cfg.render(doc);
         sync();
     }
@@ -110,9 +116,12 @@ function createDocEditor(cfg) {
     /** Drop all state without touching what is on screen. */
     function forget() {
         doc = null;
+        projectionPending = false;
+        unverified = null;
         editing = false;
         baseline = '';
         baseMtime = null;
+        baseHash = null;
         sync();
     }
 
@@ -172,6 +181,8 @@ function createDocEditor(cfg) {
         target.content = data.content;
         editing = true;
         baseMtime = data.mtime;
+        baseHash = data.sha256;
+        unverified = data.memory_status === 'unverified' ? data.diagnostic || '原文尚未核验' : null;
         // Read the baseline back out of the text area rather than using the
         // response text: a text area normalizes CRLF to LF in its value, so a
         // CRLF file would compare as modified from the moment it loaded.
@@ -257,7 +268,13 @@ function createDocEditor(cfg) {
         saving = true;
         btn?.classList.add('doc-btn-busy');
         try {
-            const data = await cfg.write(target, content, force ? null : baseMtime);
+            let baselineHash = baseHash;
+            if (force && baselineHash != null) {
+                const latest = await cfg.read(target);
+                if (!latest.editable || !latest.sha256) throw new Error(latest.message || '重新读取失败');
+                baselineHash = latest.sha256;
+            }
+            const data = await cfg.write(target, content, force ? null : baseMtime, baselineHash);
             if (data.code === 'conflict') {
                 showConfirmDialog({
                     title: t('ws_edit_conflict_title'),
@@ -271,8 +288,11 @@ function createDocEditor(cfg) {
 
             baseline = content;
             baseMtime = data.mtime;
+            baseHash = data.sha256;
+            unverified = data.memory_status === 'unverified' ? data.diagnostic || '原文尚未核验' : null;
             target.content = content;
-            _wsToast(t('ws_edit_saved'));
+            projectionPending = data.memory_status === 'pending_projection' || data.pending_projection === true || data.projected === false;
+            _wsToast(projectionPending ? '投影待完成' : t('ws_edit_saved'));
             if (keepEditing) sync();
             else exit();
         } catch (e) {
@@ -300,6 +320,7 @@ function createDocEditor(cfg) {
         editing = false;
         baseline = '';
         baseMtime = null;
+        baseHash = null;
         if (doc) cfg.render(doc);
         if (body) _docApplyScrollRatio(body, ratio);
         sync();

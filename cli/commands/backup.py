@@ -38,10 +38,11 @@ def _team():
 BACKUP_FORMAT = "cowagent-backup"
 # v2 only describes the multi-Agent layout. A single-workspace archive is
 # structurally identical to what v1 produced, so it keeps declaring v1 and
-# stays restorable by older CowAgent versions.
+# stays restorable by older CowAgent versions. Complete archives use v3;
+# archives with the independent memory ledger use v4 to reject old restorers.
 BACKUP_VERSION = 2
 _SINGLE_WORKSPACE_VERSION = 1
-_SUPPORTED_BACKUP_VERSIONS = {_SINGLE_WORKSPACE_VERSION, BACKUP_VERSION, 3}
+_SUPPORTED_BACKUP_VERSIONS = {_SINGLE_WORKSPACE_VERSION, BACKUP_VERSION, 3, 4}
 _AGENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _SKIP_DIRS = {".git", "__pycache__", "tmp"}
 _SKIP_FILES = {".DS_Store", ".personal-backend.pid", ".cow.pid"}
@@ -283,6 +284,14 @@ def create_backup_archive(
                     with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as src:
                         with closing(sqlite3.connect(snapshot)) as dst:
                             src.backup(dst)
+                            from agent.memory.ledger import _TABLES
+                            tables = {r[0] for r in dst.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                            if tables.intersection(_TABLES):
+                                if not complete:
+                                    raise ValueError("记忆台账必须使用完整离线备份（complete=True）")
+                                # v3 恢复器忽略新增约束，必须以新格式阻止旧程序恢复。
+                                manifest["version"] = 4
+                                manifest["memory_schema_version"] = 1
                     try:
                         archive.write(snapshot, name)
                     finally:
@@ -369,7 +378,9 @@ def _validate_archive(archive: zipfile.ZipFile) -> dict:
     ):
         raise ValueError("unsupported CowAgent backup format or version")
 
-    if version == 3:
+    if version == 4 and manifest.get("memory_schema_version") != 1:
+        raise ValueError("unsupported memory backup schema")
+    if version >= 3:
         if manifest.get("schema_version") != 1:
             raise ValueError("unsupported backup schema_version")
         files = manifest.get("files")
@@ -538,6 +549,173 @@ def _multi_agent_destinations(
     return archived_registry, destinations
 
 
+def _validate_memory_ledger(db, tables):
+    """只读核验独立台账及历史引用；不以初始化器修补损坏快照。"""
+    from agent.memory.ledger import MemoryLedger, _TABLES
+
+    if not tables.intersection(_TABLES):
+        return False
+    try:
+        MemoryLedger._check_schema(None, db)
+        scopes = {(a, u): (w, r) for a, u, w, r in db.execute('SELECT * FROM memory_scopes')}
+        if any(not w or type(r) is not int or r < 0 for w, r in scopes.values()):
+            raise ValueError('invalid memory scope')
+        records = {}
+        for table in _TABLES:
+            if table in ('memory_schema', 'memory_scopes', 'memory_legacy_exclusions'):
+                continue
+            columns = [r[1] for r in db.execute(f'PRAGMA table_info({table})')]
+            records[table] = [dict(zip(columns, row)) for row in db.execute(f'SELECT * FROM {table}')]
+            for row in records[table]:
+                row['record'] = json.loads(row['record'])
+                if not isinstance(row['record'], dict):
+                    raise ValueError('invalid memory record')
+                if 'agent_id' in row and (row['agent_id'], row['user_id']) not in scopes:
+                    raise ValueError('missing memory scope')
+        entries = {r['entry_id']: r for r in records['memory_entries']}
+        candidates = {r['candidate_id']: r for r in records['memory_candidates']}
+        decisions = {r['decision_id']: r for r in records['memory_decisions']}
+        evidence = {r['message_id']: r for r in records['memory_evidence']}
+        operations = {(r['agent_id'], r['user_id'], r['session_id'], r['request_id']) for r in records['memory_operations']}
+
+        def reference(rows, key, scope, session=None):
+            target = rows[key]
+            if (target['agent_id'], target['user_id']) != scope or (session is not None and target['session_id'] != session):
+                raise ValueError('cross-scope memory reference')
+            return target['record']
+
+        def basis(refs, scope, session=None):
+            if not isinstance(refs, list) or not refs:
+                raise ValueError('missing memory basis')
+            for ref in refs:
+                if ref.get('type') == 'human_edit':
+                    safe_path(ref['path'])
+                elif 'entry_id' in ref:
+                    target = reference(entries, ref['entry_id'], scope)
+                    # 排除/更正会提升当前修订，历史依据仍须能定位。
+                    versions = [target] + [r['record'] for r in records['memory_history'] if r['entry_id'] == ref['entry_id']]
+                    if not any(v['revision'] == ref['revision'] for v in versions):
+                        raise ValueError('missing memory revision')
+                else:
+                    msg = reference(evidence, ref['message_id'], scope, session)
+                    content = msg['content']
+                    text = content if isinstance(content, str) else content[ref['block_index']]['text']
+                    if hashlib.sha256(text.encode('utf-8')).hexdigest() != ref['sha256'] or not 0 <= ref['start'] < ref['end'] <= len(text):
+                        raise ValueError('invalid memory evidence span')
+
+        def safe_path(value):
+            path = PurePosixPath(value)
+            if not value or path.is_absolute() or '..' in path.parts or PureWindowsPath(value).drive or '\\' in value or ':' in value:
+                raise ValueError('invalid memory relative path')
+
+        for row in evidence.values():
+            scope = row['agent_id'], row['user_id']
+            trace = row['record']['extras']['memory_trace']
+            if (trace['workspace_id'], trace['agent_id'], trace['user_id'], trace['session_id'], trace['message_id']) != (scopes[scope][0], *scope, row['session_id'], row['message_id']):
+                raise ValueError('invalid memory evidence identity')
+        for row in candidates.values():
+            scope = row['agent_id'], row['user_id']
+            record = row['record']
+            basis(record['basis'], scope, row['session_id'])
+            if record['candidate_id'] != row['candidate_id']:
+                raise ValueError('invalid memory candidate identity')
+            if record.get('entry_id'):
+                reference(entries, record['entry_id'], scope)
+            if record.get('decision'):
+                decision = decisions[record['decision']['decision_id']]
+                if decision['candidate_id'] != row['candidate_id'] or decision['record'] != record['decision']:
+                    raise ValueError('invalid memory decision')
+        for row in decisions.values():
+            if row['candidate_id'] not in candidates:
+                raise ValueError('missing memory candidate')
+        for row in entries.values():
+            scope = row['agent_id'], row['user_id']
+            record = row['record']
+            if (record['entry_id'], record['revision'], record['state']) != (row['entry_id'], row['revision'], row['state']) or row['revision'] > scopes[scope][1]:
+                raise ValueError('invalid memory entry revision')
+            basis(record['basis'], scope)
+            for eid in record.get('inputs', []):
+                reference(entries, eid, scope)
+            for cid in record.get('candidate_ids', []):
+                reference(candidates, cid, scope)
+            for op in record.get('operation_ids', []):
+                if (*scope, op['session_id'], op['request_id']) not in operations:
+                    raise ValueError('missing memory operation')
+        for row in records['memory_operations']:
+            scope = row['agent_id'], row['user_id']
+            if not isinstance(json.loads(row['payload']), list):
+                raise ValueError('invalid memory operation payload')
+            for result in row['record']['results']:
+                for key, target in (('entry_id', entries), ('candidate_id', candidates)):
+                    if result.get(key):
+                        reference(target, result[key], scope)
+        for row in records['memory_history']:
+            if row['entry_id'].startswith('human_edit:'):
+                safe_path(row['record']['path'])
+            elif row['entry_id'] not in entries:
+                raise ValueError('missing memory history entry')
+        for row in records['memory_files']:
+            safe_path(row['path'])
+            scope = row['agent_id'], row['user_id']
+            for eid in row['record'].get('entry_ids', []) + row['record'].get('planned_entry_ids', []):
+                reference(entries, eid, scope)
+        for a, u, path, *_ in db.execute('SELECT * FROM memory_legacy_exclusions'):
+            safe_path(path)
+            if (a, u) not in scopes:
+                raise ValueError('missing memory legacy scope')
+    except (ValueError, TypeError, KeyError, IndexError, AttributeError, sqlite3.DatabaseError) as exc:
+        raise ValueError(f'invalid memory ledger: {exc}') from exc
+    return True
+
+
+def _restore_memory_projections(staging, manifest):
+    """在发布前的隔离副本重建投影，保留外部改动并返回诊断。"""
+    from types import SimpleNamespace
+    from agent.memory.ledger import MemoryLedger
+    from common.runtime_identity import RuntimeIdentity, use_identity
+
+    roots = {item['id']: staging / item['archive_root'] for item in manifest.get('agents', [])}
+    config = _read_config(staging / 'data')
+    default = roots.get(config.get('default_agent_id'), staging / 'workspace')
+    diagnostics = []
+    for path in list(_iter_workspace_files(staging, set(), complete=True)):
+        if path.name.endswith(('-wal', '-shm')):
+            continue
+        with path.open('rb') as handle:
+            if handle.read(16) != b'SQLite format 3\0':
+                continue
+        with closing(sqlite3.connect(path)) as db:
+            tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if 'memory_scopes' not in tables:
+                continue
+            if manifest.get('version') != 4:
+                raise ValueError('memory ledger requires backup version 4')
+            scopes = db.execute('SELECT agent_id,user_id FROM memory_scopes').fetchall()
+        for agent, user in scopes:
+            workspace = roots.get(agent, default if not agent else None)
+            if workspace is None:
+                raise ValueError(f'missing memory workspace: {agent}')
+            with use_identity(RuntimeIdentity(agent_id=agent, user_id=user)):
+                ledger = MemoryLedger(workspace, store=SimpleNamespace(_db_path=path, _agent_id=agent))
+                with closing(sqlite3.connect(path)) as db:
+                    files = db.execute('SELECT path,hash,record FROM memory_files WHERE agent_id=? AND user_id=?', (agent, user)).fetchall()
+                for relative, digest, record in files:
+                    target = workspace / relative
+                    if not _is_within(target, workspace):
+                        raise ValueError('unsafe memory projection path')
+                    if target.exists() and hashlib.sha256(target.read_bytes()).hexdigest() != digest:
+                        diagnostics.append(dict(agent_id=agent, user_id=user, path=relative, status='projection_preserved', reason='记忆文件存在外部改动，已保留原文件'))
+                    elif not target.exists() and json.loads(record).get('kind') != 'projection':
+                        diagnostics.append(dict(agent_id=agent, user_id=user, path=relative, status='projection_missing', reason='人工记忆文件缺失，权威条目已保留'))
+                if not ledger.project():
+                    if not any(d['agent_id'] == agent and d['user_id'] == user for d in diagnostics):
+                        diagnostics.append(dict(agent_id=agent, user_id=user, status='projection_preserved', reason='记忆投影无法重建，已保留原文件'))
+        with closing(sqlite3.connect(path)) as db:
+            db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+            db.execute('PRAGMA journal_mode=DELETE')
+    return diagnostics
+
+
 def _validate_schemas(root: Path) -> None:
     for path in _iter_workspace_files(root, set(), complete=True):
         if path.suffix == ".json":
@@ -575,6 +753,7 @@ def _validate_schemas(root: Path) -> None:
                     raise ValueError(f"unsupported SQLite schema: {path.name}")
                 if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                     raise ValueError(f"invalid SQLite snapshot: {path.name}")
+                _validate_memory_ledger(db, tables)
                 for (table,) in db.execute("SELECT name FROM sqlite_master WHERE type='table'"):
                     quoted = '"' + table.replace('"', '""') + '"'
                     columns = [row[1] for row in db.execute(f"PRAGMA table_info({quoted})")]
@@ -742,7 +921,7 @@ def restore_backup_archive(
                 raise ValueError("archived config.json must contain an object")
             archived_config = value
 
-        if manifest.get("version") == 3:
+        if manifest.get("version", 1) >= 3:
             _require_personal_stopped(data_root)
             _validate_schemas(temp_dir)
         restored_config = dict(archived_config)
@@ -781,7 +960,7 @@ def restore_backup_archive(
                 # Do not trust an archive-controlled absolute destination on a
                 # fresh machine. Portable restores default to ~/cow unless the
                 # operator supplies --workspace.
-                target_workspace = data_root / "workspace" if manifest.get("version") == 3 else Path("~/cow").expanduser().resolve()
+                target_workspace = data_root / "workspace" if manifest.get("version", 1) >= 3 else Path("~/cow").expanduser().resolve()
             if restored_config:
                 restored_config["agent_workspace"] = str(target_workspace)
 
@@ -793,7 +972,7 @@ def restore_backup_archive(
                     # Keep legacy user data under the selected data root
                     # instead of writing to an archive-controlled path.
                     restored_config["appdata_dir"] = ""
-        if manifest.get("version") == 3:
+        if manifest.get("version", 1) >= 3:
             _validate_schemas(data_root)
             for target in (list(destinations.values()) if multi_agent else [target_workspace]):
                 _validate_schemas(target)
@@ -809,12 +988,16 @@ def restore_backup_archive(
                     if name.startswith(prefix) and not _is_within(target / name[len(prefix):], target):
                         raise ValueError("unsafe restore destination")
 
-        if manifest.get("version") == 3:
+        if manifest.get("version", 1) >= 3:
             _relocate_personal_databases(temp_dir, manifest, data_root, target_workspace, destinations)
             _validate_schemas(temp_dir)
 
+        memory_diagnostics = []
+        if manifest.get("version", 1) >= 3:
+            memory_diagnostics = _restore_memory_projections(temp_dir, manifest)
+
         recovery_point = None
-        if manifest.get("version") == 3:
+        if manifest.get("version", 1) >= 3:
             # Stop the backend before calling restore. Preserve every current byte
             # before a downgrade/restore, including data a compatible old point lacks.
             if data_root.exists() or target_workspace.exists():
@@ -829,7 +1012,7 @@ def restore_backup_archive(
                 source_root = temp_dir.joinpath(*PurePosixPath(archive_root).parts)
                 agent_files = 0
                 if source_root.is_dir():
-                    for source in _iter_workspace_files(source_root, set(), complete=manifest.get("version") == 3):
+                    for source in _iter_workspace_files(source_root, set(), complete=manifest.get("version", 1) >= 3):
                         relative = source.relative_to(source_root)
                         destination = target / relative
                         if not _is_within(destination, target):
@@ -845,7 +1028,7 @@ def restore_backup_archive(
         else:
             source_root = temp_dir / "workspace"
             if source_root.is_dir():
-                for source in _iter_workspace_files(source_root, set(), complete=manifest.get("version") == 3):
+                for source in _iter_workspace_files(source_root, set(), complete=manifest.get("version", 1) >= 3):
                     relative = source.relative_to(source_root)
                     destination = target_workspace / relative
                     if not _is_within(destination, target_workspace):
@@ -854,7 +1037,7 @@ def restore_backup_archive(
                     restored_files += 1
 
         instance_source = temp_dir / "data" / "instance"
-        if manifest.get("version") == 3 and instance_source.is_dir():
+        if manifest.get("version", 1) >= 3 and instance_source.is_dir():
             for source in _iter_workspace_files(instance_source, set(), complete=True):
                 destination = data_root / source.relative_to(instance_source)
                 if not _is_within(destination, data_root):
@@ -904,6 +1087,7 @@ def restore_backup_archive(
             publish(point, data_root / "recovery-point.json", private=True)
         return {
             "manifest": manifest,
+            "memory_diagnostics": memory_diagnostics,
             "recovery_point": recovery_point,
             "workspace": str(target_workspace),
             "workspace_files": restored_files,
@@ -1004,3 +1188,5 @@ def restore_command(archive: Path, workspace: Optional[Path], yes: bool):
     if result["agents"]:
         click.echo(f"  Agent workspaces: {len(result['agents'])}")
     click.echo(f"  Restored files: {result['workspace_files']}")
+    for diagnostic in result.get("memory_diagnostics", []):
+        click.echo(f"  {diagnostic.get('path', 'memory')}: {diagnostic['reason']}")

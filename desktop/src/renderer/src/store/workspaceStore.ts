@@ -35,6 +35,7 @@ export interface EditState {
    */
   baseline: string
   /** mtime the edit started from; a stale one is rejected by the backend. */
+  baseHash?: string | null
   baseMtime: number
   dirty: boolean
   saving: boolean
@@ -69,6 +70,8 @@ interface WorkspaceState {
    * Shown as a banner over the preview rather than replacing it, so a file that
    * can be read but not edited is still readable.
    */
+  unverified: string | null
+  projectionPending: boolean
   editNotice: string | null
   dismissEditNotice: () => void
 
@@ -147,6 +150,8 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   browseSeq: 0,
   sessionId: '',
   edit: null,
+  unverified: null,
+  projectionPending: false,
   editNotice: null,
 
   dismissEditNotice: () => set({ editNotice: null }),
@@ -194,6 +199,8 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       turnArtifacts: [],
       browseDir: null,
       edit: null,
+      unverified: null,
+      projectionPending: false,
     })
     // If open on the files tab, reload the new session's root immediately.
     if (s.open && s.tab === 'files') {
@@ -214,6 +221,8 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       browseDir: '',
       browseSeq: get().browseSeq + 1,
       edit: null,
+      unverified: null,
+      projectionPending: false,
     })
   },
 
@@ -271,7 +280,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     }
 
     if (entry && opts?.origin) entry = { ...entry, origin: opts.origin }
-    set({ open: true, tab: 'preview', current: entry, previewError: null, edit: null })
+    set({ open: true, tab: 'preview', current: entry, previewError: null, edit: null, projectionPending: false, unverified: null })
   },
 
   /**
@@ -385,11 +394,13 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       tab: 'preview',
       previewError: null,
       editNotice: null,
+      unverified: res.memory_status === 'unverified' ? res.diagnostic || '原文尚未核验' : null,
       edit: {
         file: current,
         loaded: content,
         baseline: content,
         baseMtime: res.mtime,
+        baseHash: res.sha256,
         dirty: false,
         saving: false,
         error: null,
@@ -415,11 +426,18 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
 
     set({ edit: { ...edit, saving: true, error: null } })
     try {
+      let baselineHash = edit.baseHash
+      if (force && baselineHash != null) {
+        const latest = await apiClient.workspaceRead(edit.file.abs_path || edit.file.path, sessionId)
+        if (latest.status !== 'success' || !latest.editable || !latest.sha256) throw new Error(latest.message || '重新读取失败')
+        baselineHash = latest.sha256
+      }
       const res = await apiClient.workspaceWrite({
         path: edit.file.abs_path || edit.file.path,
         content,
         session: sessionId,
         expectedMtime: force ? null : edit.baseMtime,
+        expectedHash: baselineHash,
       })
       // A save that landed after the user moved on must not revive the editor.
       if (get().edit?.file.path !== edit.file.path) return
@@ -438,6 +456,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
 
       // Keep the entry's metadata in step so a later edit starts from the
       // mtime we just wrote rather than a stale one.
+      set({ unverified: null, projectionPending: res.memory_status === 'pending_projection' || res.pending_projection === true || res.projected === false })
       const file = { ...edit.file, size: res.size ?? edit.file.size, mtime: res.mtime ?? edit.file.mtime }
       if (keepEditing) {
         set({
@@ -449,6 +468,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
             // rewriting it would be a no-op here anyway.
             baseline: content,
             baseMtime: res.mtime ?? edit.baseMtime,
+            baseHash: res.sha256,
             dirty: false,
             saving: false,
           },

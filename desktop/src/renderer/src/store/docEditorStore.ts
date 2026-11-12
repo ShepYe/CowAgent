@@ -8,9 +8,12 @@ import { askConfirm } from './confirmStore'
  * skills one already answer in this shape.
  */
 export interface DocReadResult {
+  memory_status?: string
+  diagnostic?: string
   status: string
   message?: string
   content: string
+  sha256?: string | null
   mtime: number
   /** Whether saving would be accepted at all; the server decides. */
   editable: boolean
@@ -20,6 +23,10 @@ export interface DocReadResult {
 }
 
 export interface DocWriteResult {
+  sha256?: string | null
+  memory_status?: string
+  pending_projection?: boolean
+  projected?: boolean
   status: string
   message?: string
   /** `conflict` when the file changed since the mtime the edit started from. */
@@ -46,6 +53,7 @@ export interface DocEdit<D> {
    */
   baseline: string
   /** mtime the edit started from; a stale one is rejected by the backend. */
+  baseHash?: string | null
   baseMtime: number
   dirty: boolean
   saving: boolean
@@ -66,6 +74,8 @@ export interface DocEditorState<D> {
   readonly: string | null
   edit: DocEdit<D> | null
   /** Transient failure to report at the top of the page. */
+  unverified: string | null
+  projectionPending: boolean
   notice: string | null
 
   dismissNotice: () => void
@@ -95,7 +105,7 @@ export type DocEditorStore<D> = UseBoundStore<StoreApi<DocEditorState<D>>>
  */
 interface DocEditorConfig<D, R extends DocReadResult> {
   read: (doc: D) => Promise<R>
-  write: (doc: D, content: string, expectedMtime: number | null) => Promise<DocWriteResult>
+  write: (doc: D, content: string, expectedMtime: number | null, expectedHash?: string | null) => Promise<DocWriteResult>
   /** Stable identity, so a response that lands late can tell it is stale. */
   keyOf: (doc: D) => string
   /**
@@ -145,6 +155,8 @@ export function createDocEditorStore<D, R extends DocReadResult>(
     loading: false,
     readonly: null,
     edit: null,
+    unverified: null,
+    projectionPending: false,
     notice: null,
 
     dismissNotice: () => set({ notice: null }),
@@ -152,13 +164,14 @@ export function createDocEditorStore<D, R extends DocReadResult>(
     open: async (doc) => {
       if (!(await get().guard())) return
       const mine = ++seq
-      set({ doc, content: '', loading: true, readonly: null, edit: null, notice: null })
+      set({ doc, content: '', loading: true, readonly: null, edit: null, notice: null, projectionPending: false, unverified: null })
       try {
         const res = await cfg.read(doc)
         if (mine !== seq) return
         if (res.status !== 'success') throw new Error(res.message || t('ws_edit_load_failed'))
         set({
           content: res.content,
+          unverified: res.memory_status === 'unverified' ? res.diagnostic || '原文尚未核验' : null,
           loading: false,
           readonly: res.editable ? null : refusalOf(res),
         })
@@ -180,7 +193,7 @@ export function createDocEditorStore<D, R extends DocReadResult>(
 
     forget: () => {
       seq++
-      set({ doc: null, content: '', loading: false, readonly: null, edit: null, notice: null })
+      set({ doc: null, content: '', loading: false, readonly: null, edit: null, notice: null, projectionPending: false, unverified: null })
     },
 
     startEdit: async () => {
@@ -209,12 +222,14 @@ export function createDocEditorStore<D, R extends DocReadResult>(
       const content = res.content.replace(/\r\n/g, '\n')
       set({
         content,
+        unverified: res.memory_status === 'unverified' ? res.diagnostic || '原文尚未核验' : null,
         notice: null,
         edit: {
           doc,
           loaded: content,
           baseline: content,
           baseMtime: res.mtime,
+          baseHash: res.sha256,
           dirty: false,
           saving: false,
           error: null,
@@ -241,7 +256,13 @@ export function createDocEditorStore<D, R extends DocReadResult>(
       const key = cfg.keyOf(edit.doc)
       set({ edit: { ...edit, saving: true, error: null } })
       try {
-        const res = await cfg.write(edit.doc, content, force ? null : edit.baseMtime)
+        let baselineHash = edit.baseHash
+        if (force && baselineHash != null) {
+          const latest = await cfg.read(edit.doc)
+          if (latest.status !== 'success' || !latest.editable || !latest.sha256) throw new Error(latest.message || '重新读取失败')
+          baselineHash = latest.sha256
+        }
+        const res = await cfg.write(edit.doc, content, force ? null : edit.baseMtime, baselineHash)
         // A save that landed after the user moved on must not revive the editor.
         const live = get().edit
         if (!live || cfg.keyOf(live.doc) !== key) return
@@ -260,7 +281,7 @@ export function createDocEditorStore<D, R extends DocReadResult>(
 
         // The viewer reads `content`, so it has to move with the file whether or
         // not the editor is staying open.
-        set({ content })
+        set({ content, unverified: null, projectionPending: res.memory_status === 'pending_projection' || res.pending_projection === true || res.projected === false })
         if (keepEditing) {
           set((s) =>
             s.edit
@@ -271,6 +292,7 @@ export function createDocEditorStore<D, R extends DocReadResult>(
                     // rewriting it would be a no-op here anyway.
                     baseline: content,
                     baseMtime: res.mtime ?? s.edit.baseMtime,
+                    baseHash: res.sha256,
                     dirty: false,
                     saving: false,
                   },

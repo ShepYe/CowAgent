@@ -1,22 +1,9 @@
 # encoding:utf-8
-"""Regression tests: writes/edits the memory index scans must mark it dirty.
+"""Protected agent writes are rejected; human saves still notify the memory index.
 
-The write and edit tools used to decide this with ``'memory/' in path`` — a
-substring test against the raw argument. That missed three cases:
-
-1. **``knowledge/`` is never matched**, so knowledge writes left the index
-   stale. Retrieval only re-syncs when the manager is dirty, so freshly written
-   knowledge stayed invisible to search until something else happened to dirty
-   the index (#3176).
-2. On Windows the tool may receive ``memory\\note.md``; the ``memory/`` needle
-   never matches a backslash-separated path.
-3. The substring matches anywhere in the path, so an unrelated file such as
-   ``src/memory/cache.py`` was (harmlessly but wrongly) treated as a memory
-   file.
-
-``MEMORY.md`` at the workspace root is scanned too, and was missed for the same
-reason. The check now resolves the path and compares segments against the
-workspace, so all of these behave correctly.
+The console dirty-path checks retain the original knowledge, memory, Windows
+separator and unrelated-path coverage. Agent write/edit checks now assert the
+admission contract, including unchanged files and no index notification.
 """
 
 import json
@@ -38,7 +25,7 @@ class _DirtyRecorder:
     """Minimal stand-in for MemoryManager that records mark_dirty() calls."""
 
     def __init__(self, workspace_root):
-        self.config = SimpleNamespace(workspace_root=workspace_root)
+        self.config = SimpleNamespace(workspace_root=workspace_root, get_workspace=lambda: workspace_root)
         self.dirty_calls = 0
 
     def mark_dirty(self):
@@ -47,7 +34,9 @@ class _DirtyRecorder:
 
 class TestMemoryPathMarksDirty(unittest.TestCase):
     def setUp(self):
-        self.work = tempfile.mkdtemp()
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.work = temporary.name
         # A real workspace has both; without a local knowledge/ the lookup
         # falls back to the shared one, which needs an Agent registry.
         os.makedirs(os.path.join(self.work, "memory"))
@@ -65,45 +54,47 @@ class TestMemoryPathMarksDirty(unittest.TestCase):
             f.write("one\ntwo\n")
         return target
 
+    def _assert_blocked(self, result, path, original=None):
+        self.assertEqual(result.status, "error", result.result)
+        self.assertIn("memory_record", str(result.result))
+        self.assertEqual(self.memory_manager.dirty_calls, 0)
+        target = os.path.join(self.work, path)
+        if original is None:
+            self.assertFalse(os.path.exists(target))
+        else:
+            with open(target, encoding="utf-8") as stream:
+                self.assertEqual(stream.read(), original)
+
     # ---------------------------------------------------------------- write
-    def test_write_to_knowledge_marks_dirty(self):
-        """The bug: knowledge/ writes never dirtied the index."""
+    def test_write_to_knowledge_is_rejected(self):
         result = Write(self._tool_config()).execute(
             {"path": "knowledge/note.md", "content": "# note\nbody\n"}
         )
-        self.assertEqual(result.status, "success", result.result)
-        self.assertEqual(self.memory_manager.dirty_calls, 1)
+        self._assert_blocked(result, 'knowledge/note.md')
 
-    def test_write_to_memory_marks_dirty(self):
-        """The original behaviour must keep working."""
+    def test_write_to_memory_is_rejected(self):
         result = Write(self._tool_config()).execute(
             {"path": "memory/2026-09-18.md", "content": "note\n"}
         )
-        self.assertEqual(result.status, "success", result.result)
-        self.assertEqual(self.memory_manager.dirty_calls, 1)
+        self._assert_blocked(result, 'memory/2026-09-18.md')
 
-    def test_write_to_user_memory_marks_dirty(self):
-        """Per-user memory sits deeper in the tree but is scanned all the same."""
+    def test_write_to_user_memory_is_rejected(self):
         result = Write(self._tool_config()).execute(
             {"path": "memory/users/alice/2026-09-18.md", "content": "note\n"}
         )
-        self.assertEqual(result.status, "success", result.result)
-        self.assertEqual(self.memory_manager.dirty_calls, 1)
+        self._assert_blocked(result, 'memory/users/alice/2026-09-18.md')
 
-    def test_write_to_memory_file_marks_dirty(self):
-        """MEMORY.md is indexed too, and contains no 'memory/' substring."""
+    def test_write_to_memory_file_is_rejected(self):
         result = Write(self._tool_config()).execute(
             {"path": "MEMORY.md", "content": "# memory\n"}
         )
-        self.assertEqual(result.status, "success", result.result)
-        self.assertEqual(self.memory_manager.dirty_calls, 1)
+        self._assert_blocked(result, 'MEMORY.md')
 
-    def test_write_absolute_path_marks_dirty(self):
+    def test_write_absolute_path_is_rejected(self):
         result = Write(self._tool_config()).execute(
             {"path": os.path.join(self.work, "knowledge", "abs.md"), "content": "x\n"}
         )
-        self.assertEqual(result.status, "success", result.result)
-        self.assertEqual(self.memory_manager.dirty_calls, 1)
+        self._assert_blocked(result, 'knowledge/abs.md')
 
     def test_write_to_unrelated_path_does_not_mark_dirty(self):
         result = Write(self._tool_config()).execute(
@@ -122,31 +113,26 @@ class TestMemoryPathMarksDirty(unittest.TestCase):
         self.assertEqual(self.memory_manager.dirty_calls, 0)
 
     @unittest.skipUnless(os.name == "nt", "backslash is only a separator on Windows")
-    def test_write_backslash_separated_memory_path_marks_dirty(self):
-        """'memory\\note.md' must match too. Elsewhere that is a single file
-        name, not a path into memory/, and must not mark dirty."""
+    def test_write_backslash_separated_memory_path_is_rejected(self):
         result = Write(self._tool_config()).execute(
             {"path": "memory\\note.md", "content": "note\n"}
         )
-        self.assertEqual(result.status, "success", result.result)
-        self.assertEqual(self.memory_manager.dirty_calls, 1)
+        self._assert_blocked(result, 'memory\\note.md')
 
     # ----------------------------------------------------------------- edit
-    def test_edit_knowledge_marks_dirty(self):
+    def test_edit_knowledge_is_rejected(self):
         self._seed("knowledge", "note.md")
         result = Edit(self._tool_config()).execute(
             {"path": "knowledge/note.md", "oldText": "one", "newText": "ONE"}
         )
-        self.assertEqual(result.status, "success", result.result)
-        self.assertEqual(self.memory_manager.dirty_calls, 1)
+        self._assert_blocked(result, 'knowledge/note.md', "one\ntwo\n")
 
-    def test_edit_memory_marks_dirty(self):
+    def test_edit_memory_is_rejected(self):
         self._seed("memory", "2026-09-18.md")
         result = Edit(self._tool_config()).execute(
             {"path": "memory/2026-09-18.md", "oldText": "one", "newText": "ONE"}
         )
-        self.assertEqual(result.status, "success", result.result)
-        self.assertEqual(self.memory_manager.dirty_calls, 1)
+        self._assert_blocked(result, 'memory/2026-09-18.md', "one\ntwo\n")
 
     def test_edit_unrelated_path_does_not_mark_dirty(self):
         self._seed("plain.txt")
@@ -172,7 +158,7 @@ class TestConsoleEditsMarkMemoryDirty(unittest.TestCase):
         self.dirty = []
         self.service = SimpleNamespace(write_text=self._record_write)
 
-    def _record_write(self, rel, content, expected_mtime=None):
+    def _record_write(self, rel, content, expected_mtime=None, expected_hash=None):
         self.written.append(rel)
         return {"path": rel, "size": len(content), "mtime": 1.0}
 

@@ -48,7 +48,10 @@ class MemoryContentHandler:
                 return json.dumps({"status": "error", "message": "filename required"})
             workspace_root = _get_workspace_root(agent_id=_request_agent_id(params))
             service = MemoryService(workspace_root)
-            result = service.get_content(params.filename, category=params.category)
+            from common.runtime_identity import identity_scope
+            from common.personal_tasks import OWNER, personal_enabled
+            with identity_scope(agent_id=_request_agent_id(params), user_id=OWNER if personal_enabled() else None):
+                result = service.get_content(params.filename, category=params.category)
             return json.dumps({"status": "success", **result}, ensure_ascii=False)
         except ValueError:
             return json.dumps({"status": "error", "message": "invalid filename"})

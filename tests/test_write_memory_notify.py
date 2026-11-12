@@ -1,21 +1,25 @@
 from pathlib import Path
 from agent.tools.write.write import Write
 
-def test_saved_memory_file_reports_success_when_notification_fails(tmp_path):
+def test_protected_memory_write_is_rejected_before_notification(tmp_path):
     class Config:
         def get_workspace(self):
             return Path(tmp_path)
     class Memory:
         config = Config()
         def mark_dirty(self):
-            raise RuntimeError("index unavailable")
+            raise AssertionError("rejected write must not notify")
     result = Write({"cwd": str(tmp_path), "memory_manager": Memory()}).execute({"path": "MEMORY.md", "content": "saved fact"})
-    assert (tmp_path / "MEMORY.md").read_text() == "saved fact"
-    assert result.status == "success", result.result
-    assert "notification failed" in result.result["warning"]
+    assert not (tmp_path / "MEMORY.md").exists()
+    assert result.status == "error", result.result
+    assert "memory_record" in str(result.result)
 
 def test_nonmemory_write_does_not_notify(tmp_path):
+    class Config:
+        def get_workspace(self):
+            return Path(tmp_path)
     class Memory:
+        config = Config()
         def mark_dirty(self):
             raise AssertionError("unexpected notification")
     result = Write({"cwd": str(tmp_path), "memory_manager": Memory()}).execute({"path": "notes.txt", "content": "saved"})

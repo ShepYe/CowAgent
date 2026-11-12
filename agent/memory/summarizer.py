@@ -1,165 +1,32 @@
-"""
-Memory flush manager with Deep Dream distillation
-
-Handles memory persistence when conversation context is trimmed or overflows:
-- Uses LLM to summarize discarded messages into concise daily records
-- Writes to daily memory files (lazy creation)
-- Deduplicates trim flushes to avoid repeated writes
-- Runs summarization asynchronously to avoid blocking normal replies
-- Deep Dream: periodically distills daily memories → refined MEMORY.md + dream diary
-"""
-
+"""上下文摘要与持久候选分离；长期内容仅通过记忆台账提交。"""
+import copy
+import hashlib
+import json
 import threading
-from typing import Optional, Callable, Any, List, Dict
+from typing import Optional, Any
 from pathlib import Path
 from datetime import datetime
-from common.atomic_write import write_text_atomic
 from common.log import logger
+from common.runtime_identity import identity_scope
 
 
-SUMMARIZE_SYSTEM_PROMPT_ZH = """你是一个对话记录助手。请将对话内容归纳为当天的日常记录。
-
-## 要求
-
-按「事件」维度归纳发生的事，不要按对话轮次逐条记录：
-- 每条一行，用 "- " 开头
-- 合并同一件事的多轮对话
-- 只记录有意义的事件，忽略闲聊和问候
-- 保留关键的决策、结论和待办事项
-
-当对话没有任何记录价值（仅含问候或无意义内容），直接回复"无"。"""
-
-SUMMARIZE_SYSTEM_PROMPT_EN = """You are a conversation-logging assistant. Summarize the conversation into a daily record.
-
-## Requirements
-
-Summarize by "event", not turn by turn:
-- One item per line, starting with "- "
-- Merge multiple turns about the same thing
-- Only record meaningful events; ignore small talk and greetings
-- Keep key decisions, conclusions and to-dos
-
-If the conversation has no record value (only greetings or meaningless content), reply with exactly "None"."""
-
-SUMMARIZE_USER_PROMPT_ZH = """请归纳以下对话的日常记录：
-
-{conversation}"""
-
-SUMMARIZE_USER_PROMPT_EN = """Summarize the daily record of the following conversation:
-
-{conversation}"""
-
-# ---------------------------------------------------------------------------
-# Deep Dream prompts — distill daily memories → MEMORY.md + dream diary
-# ---------------------------------------------------------------------------
-
-DREAM_SYSTEM_PROMPT_ZH = """你是一个记忆整理助手，负责定期整理用户的长期记忆。
-
-你将收到两份材料：
-1. **当前长期记忆** — MEMORY.md 的全部现有内容
-2. **今日日记** — 当天的日常记录
-
-MEMORY.md 会注入每次对话的系统提示词中，因此必须保持精炼，只存放有价值和值得记忆的内容。
-
-**重要：只能基于提供的材料进行整理，严禁编造、推测或添加材料中不存在的信息。**
-
-## 任务
-
-### Part 1: 更新后的长期记忆（[MEMORY]）
-
-在现有记忆基础上进行整理和提炼，输出完整的更新后内容：
-- **合并提炼**：将含义相近的多条合并为一条高密度表述，而非简单罗列
-- **新增萃取**：从今日日记中提取值得永久记住的新信息（偏好、决策、人物、规则、经验）
-- **冲突更新**：当新信息与旧条目矛盾时，以新信息为准，替换旧条目
-- **清理无效**：删除临时性记录、空白条目、格式残留、无意义、重复内容等
-- **删除冗余**：已被更精炼表述涵盖的旧条目应删除，避免信息重复
-- 每条一行，用 "- " 开头，不带日期前缀
-- 可用 "## 标题" 对相关条目分组，使结构更清晰
-- 目标：控制在 50 条以内，每条尽量一句话概括
-
-### Part 2: 梦境日记（[DREAM]）
-
-用简洁的叙事风格写一篇短日记，记录这次整理的发现，保持格式美观易读：
-- 发现了哪些重复或矛盾
-- 从日记中提取了什么新洞察
-- 做了哪些清理和优化
-- 整体感受和观察
-
-## 输出格式（严格遵守）
-
-```
-[MEMORY]
-- 记忆条目1
-- 记忆条目2
-...
-
-[DREAM]
-梦境日记内容...
-```"""
-
-DREAM_SYSTEM_PROMPT_EN = """You are a memory-curation assistant that periodically organizes the user's long-term memory.
-
-You will receive two inputs:
-1. **Current long-term memory** — the full existing content of MEMORY.md
-2. **Today's diary** — the daily records
-
-MEMORY.md is injected into the system prompt of every conversation, so it must stay concise and hold only valuable, memory-worthy content.
-
-**Important: organize strictly based on the provided material. Never fabricate, infer, or add information not present in it.**
-
-## Tasks
-
-### Part 1: Updated long-term memory ([MEMORY])
-
-Organize and distill on top of the existing memory, and output the complete updated content:
-- **Merge & distill**: combine semantically similar items into one dense statement rather than listing them
-- **Extract new**: pull memory-worthy new info from today's diary (preferences, decisions, people, rules, lessons)
-- **Resolve conflicts**: when new info contradicts an old item, prefer the new and replace the old
-- **Clean invalid**: remove temporary notes, blank items, formatting residue, meaningless or duplicate content
-- **Drop redundancy**: delete old items already covered by a more concise statement
-- One item per line, starting with "- ", without a date prefix
-- You may group related items under "## headings" for clarity
-- Goal: keep under 50 items, each ideally a single sentence
-
-### Part 2: Dream diary ([DREAM])
-
-Write a short diary in a concise narrative style recording what this curation found, keep it clean and readable:
-- Which duplicates or conflicts were found
-- What new insights were extracted from the diary
-- What cleanup and optimization was done
-- Overall feelings and observations
-
-## Output format (follow strictly)
-
-```
-[MEMORY]
-- memory item 1
-- memory item 2
-...
-
-[DREAM]
-dream diary content...
-```"""
-
-DREAM_USER_PROMPT_ZH = """## 当前长期记忆（MEMORY.md）
-
-{memory_content}
-
-## 近期日记（最近 {days} 天）
-
-{daily_content}"""
-
-DREAM_USER_PROMPT_EN = """## Current long-term memory (MEMORY.md)
-
-{memory_content}
-
-## Recent diary (last {days} days)
-
-{daily_content}"""
+SUMMARIZE_SYSTEM_PROMPT_ZH = """你是对话压缩助手。只返回 JSON：
+{"context_summary":"供当前任务继续推理的摘要", "entries":[{"content":"一个独立事实", "disposition":"conversation_memory|sourced_knowledge|archive_only|undecided", "basis":[{"message_id":"原话ID", "block_index":null, "start":0, "end":1, "sha256":"原始整块文本的SHA-256"}], "reason":"简短原因"}]}
+context_summary 可保留测试、临时任务和资料内容以维持上下文，但不是可写入日记的事实。
+entries 只是候选，不能自报批准；只提出有价值的独立事实，没候选时返回 []。
+依据取自提供的 evidence；block_index 为原始文本块下标（字符串正文为 null），start/end 为 Unicode 码点区间，sha256 沿用原始整块哈希。
+同一句中真实偏好与测试数值分别引用片段；资料原文、复述与跨轮指代走 sourced_knowledge；测试、模拟及其过程走 archive_only；不足以判断走 undecided。
+role=user 包装的工具结果、重放和压缩摘要不是真人原话。助手的猜测不能成为本人事实。不得仅因会话读过资料而删除独立普通交流。"""
+SUMMARIZE_SYSTEM_PROMPT_EN = SUMMARIZE_SYSTEM_PROMPT_ZH
+SUMMARIZE_USER_PROMPT_ZH = "请压缩以下带原话依据的当前上下文：\n{conversation}"
+SUMMARIZE_USER_PROMPT_EN = "Compress this context with evidence:\n{conversation}"
+DREAM_SYSTEM_PROMPT_ZH = """你是记忆整理助手。只基于给出的当前有效条目合并相近内容，不新增事实，不从旧日记或原始留档推测。
+返回 JSON：{"merges":[{"content":"合并正文", "input_ids":["输入entry_id", "另一个entry_id"]}]}。
+每次合并至少两个条目，保留所有输入身份，分组不重叠。相互独立的事实不要强行合并，不能解决的冲突留给主 Agent 判断；无合并则 merges=[]。不输出梦境日记。"""
+DREAM_SYSTEM_PROMPT_EN = DREAM_SYSTEM_PROMPT_ZH
 
 
-def _is_en() -> bool:
-    """True when the resolved UI language is English."""
+def _is_en():
     try:
         from common import i18n
         return i18n.get_language() == "en"
@@ -167,604 +34,257 @@ def _is_en() -> bool:
         return False
 
 
-def _summarize_system_prompt() -> str:
+def _summarize_system_prompt():
     return SUMMARIZE_SYSTEM_PROMPT_EN if _is_en() else SUMMARIZE_SYSTEM_PROMPT_ZH
 
 
-def _summarize_user_prompt() -> str:
+def _summarize_user_prompt():
     return SUMMARIZE_USER_PROMPT_EN if _is_en() else SUMMARIZE_USER_PROMPT_ZH
 
 
-def _dream_system_prompt() -> str:
-    return DREAM_SYSTEM_PROMPT_EN if _is_en() else DREAM_SYSTEM_PROMPT_ZH
+def _is_empty_sentinel(text):
+    return not text or text.strip().lower() in ("", "无", "none")
 
 
-def _dream_user_prompt() -> str:
-    return DREAM_USER_PROMPT_EN if _is_en() else DREAM_USER_PROMPT_ZH
+def _json_object(raw):
+    if isinstance(raw, dict):
+        return raw
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+    try:
+        value = json.loads(text)
+        return value if isinstance(value, dict) else None
+    except (ValueError, TypeError):
+        return None
 
 
-def _is_empty_sentinel(text: str) -> bool:
-    """Match the "no record value" sentinel in both zh ("无") and en ("None")."""
-    if not text:
-        return True
-    s = text.strip()
-    return s == "" or s == "无" or s.lower() == "none"
+def _digest(value):
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _message_key(ledger, messages):
+    # 依赖程序消息身份，不能因台账回填 candidate/decision 元数据重复计费。
+    return _digest(dict(scope=ledger.scope, messages=[dict(message_id=m.get("message_id"),
+                         content=m.get("content"), archive_only=(m.get("extras") or {}).get("archive_only"),
+                         purpose=m.get("purpose"), personal_task_id=m.get("personal_task_id")) for m in messages]))
 
 
 class MemoryFlushManager:
-    """
-    Manages memory flush operations.
-    
-    Flush is triggered by agent_stream in two scenarios:
-    1. Context trim: _trim_messages discards old turns → flush discarded content
-    2. Context overflow: API rejects request → emergency flush before clearing
-    
-    Additionally, create_daily_summary() can be called by scheduler for end-of-day summaries.
-    """
-    
-    def __init__(
-        self,
-        workspace_dir: Path,
-        llm_model: Optional[Any] = None,
-    ):
-        self.workspace_dir = workspace_dir
+    def __init__(self, workspace_dir: Path, llm_model: Optional[Any] = None):
+        self.workspace_dir = Path(workspace_dir)
         self.llm_model = llm_model
-        
-        self.memory_dir = workspace_dir / "memory"
+        self.memory_dir = self.workspace_dir / "memory"
         self.memory_dir.mkdir(parents=True, exist_ok=True)
-        
-        self.last_flush_timestamp: Optional[datetime] = None
-        self._trim_flushed_hashes: set = set()  # Content hashes of already-flushed messages
-        self._trim_inflight_hashes: set = set()  # Content hashes dispatched but not yet settled
-        self._flush_hashes_lock = threading.Lock()  # Guards both hash sets
-        self._last_flushed_content_hash: str = ""  # Content hash at last flush, for daily dedup
-        self._daily_flushed_hashes: set = set()  # Day-level hashes that have landed
-        self._daily_inflight_hashes: set = set()  # Day-level hashes dispatched, not yet settled
-        self._last_dream_input_hash: str = ""  # "{date}:{daily_hash}" of last dream, for dedup
-        self._last_flush_thread: Optional[threading.Thread] = None
-    
-    def get_today_memory_file(self, user_id: Optional[str] = None, ensure_exists: bool = False) -> Path:
-        """Get today's memory file path: memory/YYYY-MM-DD.md"""
-        today = datetime.now().strftime("%Y-%m-%d")
-        
-        if user_id:
-            user_dir = self.memory_dir / "users" / user_id
-            if ensure_exists:
-                user_dir.mkdir(parents=True, exist_ok=True)
-            today_file = user_dir / f"{today}.md"
-        else:
-            today_file = self.memory_dir / f"{today}.md"
-        
-        if ensure_exists and not today_file.exists():
-            today_file.parent.mkdir(parents=True, exist_ok=True)
-            today_file.write_text(f"# Daily Memory: {today}\n\n")
-        
-        return today_file
-    
-    def get_main_memory_file(self, user_id: Optional[str] = None) -> Path:
-        """Get main memory file path: MEMORY.md (workspace root)"""
-        if user_id:
-            user_dir = self.memory_dir / "users" / user_id
-            user_dir.mkdir(parents=True, exist_ok=True)
-            return user_dir / "MEMORY.md"
-        else:
-            return Path(self.workspace_dir) / "MEMORY.md"
-    
-    def get_status(self) -> dict:
-        return {
-            'last_flush_time': self.last_flush_timestamp.isoformat() if self.last_flush_timestamp else None,
-            'today_file': str(self.get_today_memory_file()),
-            'main_file': str(self.get_main_memory_file())
-        }
+        self.last_flush_timestamp = None
+        self._trim_flushed_hashes = set()
+        self._trim_inflight_hashes = set()
+        self._daily_flushed_hashes = set()
+        self._daily_inflight_hashes = set()
+        self._last_flushed_content_hash = ""
+        self._flush_hashes_lock = threading.Lock()
+        self._last_dream_input_hash = ""
+        self._last_flush_thread = None
+        self.last_receipt = None
 
-    # ---- Flush execution (called by agent_stream or scheduler) ----
-    
-    def flush_from_messages(
-        self,
-        messages: List[Dict],
-        user_id: Optional[str] = None,
-        reason: str = "trim",
-        max_messages: int = 0,
-        context_summary_callback: Optional[Callable[[str], None]] = None,
-        daily_content_hash: Optional[str] = None,
-    ) -> bool:
-        """
-        Asynchronously summarize and flush messages to daily memory.
+    def _ledger(self):
+        from agent.memory.ledger import MemoryLedger
+        return MemoryLedger(self.workspace_dir)
 
-        Deduplication runs synchronously, then LLM summarization + file write
-        run in a background thread so the main reply flow is never blocked.
+    def capture(self, messages):
+        """同步保存原话及身份；未知入口沿用 internal 缺省。"""
+        return self._ledger().capture(messages)
 
-        Messages are only recorded as flushed once their summary has actually
-        landed, so a flush that fails leaves them eligible for a later attempt.
-        While a flush is in flight its content hashes are claimed, which keeps a
-        second flush of the same messages from summarising them twice.
+    def get_today_memory_file(self, user_id=None, ensure_exists=False):
+        if ensure_exists:
+            return ensure_daily_memory_file(self.workspace_dir, user_id)
+        base = self.memory_dir / "users" / user_id if user_id else self.memory_dir
+        return base / f"{datetime.now():%Y-%m-%d}.md"
 
-        If *context_summary_callback* is provided, it is called with the
-        [DAILY] portion of the LLM summary once available. The caller can use
-        this to inject the summary into the live message list for context
-        continuity — one LLM call serves both disk persistence and in-context
-        injection.
-        """
-        claimed: list = []
+    def get_main_memory_file(self, user_id=None):
+        return (self.memory_dir / "users" / user_id / "MEMORY.md" if user_id
+                else self.workspace_dir / "MEMORY.md")
+
+    def get_status(self):
+        return dict(last_flush_time=self.last_flush_timestamp.isoformat() if self.last_flush_timestamp else None,
+                    today_file=str(self.get_today_memory_file()), main_file=str(self.get_main_memory_file()))
+
+    def summarize_and_record(self, messages, max_messages=0, *, with_revision=False):
+        """裁剪前完成原话和候选保存。模型失败只提供上下文 fallback。"""
+        ledger = self._ledger()
+        ledger.capture(messages)
+        revision = ledger.revision()
+        snapshot = copy.deepcopy(messages)
+        result = self._summarize_messages(snapshot, max_messages)
+        if result is None:
+            raise ValueError("摘要没有可用结果，请保留原话重试")
+        entries = result.get("entries", []) if isinstance(result, dict) else []
+        summary = self._clean_summary_output(result)
+        if entries:
+            request_id = "summary:" + _digest(dict(revision=revision, entries=entries))
+            receipt = ledger.record(request_id, entries, trusted=False, expected_revision=revision)
+            self.last_receipt = receipt
+            if any(item.get("status") == "failed" for item in receipt.get("results", [])):
+                raise ValueError("记忆候选提交失败，保留上下文以便重新核验")
+            revision = receipt["revision"]
+        # 无候选的摘要同样属于旧快照，不能越过更正屏障。
+        if ledger.revision() != revision:
+            raise ValueError("记忆已变更，丢弃迟到上下文摘要")
+        retryable = isinstance(result, dict) and result.get("_retryable", False)
+        return (summary, revision, retryable) if with_revision else summary
+
+    def flush_from_messages(self, messages, user_id=None, reason="trim", max_messages=0,
+                            context_summary_callback=None, daily_content_hash=None):
+        if not messages:
+            return False
+        key = None
+        claimed = False
         try:
-            # Strip scheduler-injected pairs before any further processing.
-            # These messages already serve as short-term context inside the
-            # receiver session; promoting them into long-term daily memory
-            # produces low-value flat logs (e.g. "11:28 price=1013, normal /
-            # 11:58 price=1013, normal / ...") and wastes summarisation tokens.
-            from agent.knowledge.purpose import durable_messages
-            messages = durable_messages(self._strip_scheduler_pairs(messages))
-            if not messages:
-                return False
-
-            import hashlib
-            deduped = []
+            with identity_scope(**({"user_id": user_id} if user_id is not None else {})):
+                self.capture(messages)
+                key = _message_key(self._ledger(), messages)
+                with self._flush_hashes_lock:
+                    if key in self._trim_flushed_hashes:
+                        if daily_content_hash:
+                            self._daily_flushed_hashes.add(daily_content_hash)
+                            self._last_flushed_content_hash = daily_content_hash
+                        return True
+                    if key in self._trim_inflight_hashes:
+                        return False
+                    self._trim_inflight_hashes.add(key)
+                    claimed = True
+                summary, revision, retryable = self.summarize_and_record(messages, max_messages, with_revision=True)
+                # 提交期间的用途更正也不能让旧摘要注回新上下文。
+                if self._ledger().revision() != revision:
+                    return False
+                if context_summary_callback and summary:
+                    if hasattr(context_summary_callback, "_memory_expected_revision"):
+                        context_summary_callback._memory_expected_revision = revision
+                    context_summary_callback(summary)
+                if revision != self._ledger().revision():
+                    return False
+                # 无模型的 fallback 不消耗之后重新提取候选的资格。
+                if not retryable:
+                    with self._flush_hashes_lock:
+                        self._trim_flushed_hashes.add(key)
+                        if daily_content_hash:
+                            self._daily_flushed_hashes.add(daily_content_hash)
+                            self._last_flushed_content_hash = daily_content_hash
+                self.last_flush_timestamp = datetime.now()
+                return True
+        except Exception as exc:
+            logger.warning(f"[MemoryFlush] 原话/候选未完成保存，保留上下文 (reason={reason}): {exc}")
+            return False
+        finally:
             with self._flush_hashes_lock:
-                for m in messages:
-                    text = self._extract_text_from_content(m.get("content", ""))
-                    if not text or not text.strip():
-                        continue
-                    h = hashlib.md5(text.encode("utf-8")).hexdigest()
-                    if h in self._trim_flushed_hashes or h in self._trim_inflight_hashes:
-                        continue
-                    self._trim_inflight_hashes.add(h)
-                    claimed.append(h)
-                    deduped.append(m)
-            if not deduped:
-                return False
+                if key and claimed:
+                    self._trim_inflight_hashes.discard(key)
+                if daily_content_hash:
+                    self._daily_inflight_hashes.discard(daily_content_hash)
 
-            import copy
-            snapshot = copy.deepcopy(deduped)
-            import contextvars
-            _ctx = contextvars.copy_context()
-            thread = threading.Thread(
-                target=lambda: _ctx.run(
-                    self._flush_worker,
-                    snapshot, user_id, reason, max_messages, context_summary_callback, claimed,
-                    daily_content_hash,
-                ),
-                daemon=True,
-            )
-            thread.start()
-            logger.info(f"[MemoryFlush] Async flush dispatched (reason={reason}, msgs={len(snapshot)})")
-            self._last_flush_thread = thread
-            return True
-
-        except Exception as e:
-            logger.warning(f"[MemoryFlush] Failed to dispatch flush (reason={reason}): {e}")
-            self._settle_flush_hashes(claimed, committed=False)
-            return False
-
-    def _settle_flush_hashes(self, hashes: List[str], committed: bool):
-        """Record a finished flush's hashes, or release them so a later flush retries."""
-        if not hashes:
-            return
-        with self._flush_hashes_lock:
-            self._trim_inflight_hashes.difference_update(hashes)
-            if committed:
-                self._trim_flushed_hashes.update(hashes)
-
-    def _flush_worker(
-        self,
-        messages: List[Dict],
-        user_id: Optional[str],
-        reason: str,
-        max_messages: int,
-        context_summary_callback: Optional[Callable[[str], None]] = None,
-        claimed_hashes: Optional[List[str]] = None,
-        daily_content_hash: Optional[str] = None,
-    ):
-        """Background worker: summarize with LLM, write daily memory file."""
-        claimed_hashes = claimed_hashes or []
-        try:
-            raw_summary = self._summarize_messages(messages, max_messages)
-            if raw_summary is None:
-                logger.warning(f"[MemoryFlush] Summary unavailable, flush kept retryable (reason={reason})")
-                self._settle_flush_hashes(claimed_hashes, committed=False)
-                self._settle_daily_hash(daily_content_hash, committed=False)
-                return
-            if _is_empty_sentinel(raw_summary):
-                logger.info(f"[MemoryFlush] No valuable content to flush (reason={reason})")
-                self._settle_flush_hashes(claimed_hashes, committed=True)
-                self._settle_daily_hash(daily_content_hash, committed=True)
-                return
-
-            # Strip legacy [DAILY]/[MEMORY] markers if model still outputs them
-            daily_part = self._clean_summary_output(raw_summary)
-            if not daily_part:
-                self._settle_flush_hashes(claimed_hashes, committed=True)
-                self._settle_daily_hash(daily_content_hash, committed=True)
-                return
-
-            # --- Write daily memory ---
-            if not self.write_daily_summary(daily_part, user_id=user_id, reason=reason):
-                self._settle_flush_hashes(claimed_hashes, committed=False)
-                self._settle_daily_hash(daily_content_hash, committed=False)
-                return
-
-            self._settle_flush_hashes(claimed_hashes, committed=True)
-            self._settle_daily_hash(daily_content_hash, committed=True)
-
-            # --- Inject context summary into live messages (if callback provided) ---
-            if context_summary_callback:
-                try:
-                    context_summary_callback(daily_part)
-                except Exception as e:
-                    logger.warning(f"[MemoryFlush] Context summary callback failed: {e}")
-
-            self.last_flush_timestamp = datetime.now()
-
-        except Exception as e:
-            logger.warning(f"[MemoryFlush] Async flush failed (reason={reason}): {e}")
-            self._settle_flush_hashes(claimed_hashes, committed=False)
-            self._settle_daily_hash(daily_content_hash, committed=False)
-
-    def write_daily_summary(
-        self,
-        summary: str,
-        user_id: Optional[str] = None,
-        reason: str = "trim",
-    ) -> bool:
-        """Append an already-produced summary to today's daily memory file.
-
-        Lets callers that summarized synchronously (e.g. the /compact command)
-        persist the same summary they inject into context, avoiding a second
-        LLM call just to write memory.
-
-        :param summary: Clean summary text (no [DAILY]/[MEMORY] markers).
-        :param user_id: Optional user scope for the daily file.
-        :param reason: "trim" | "overflow" | "daily_summary" | ... (picks header).
-        :return: True on success.
-        """
-        summary = (summary or "").strip()
-        from agent.knowledge.purpose import source_derived_context
-        if source_derived_context() or "[personal-task:" in summary:
-            return False
-        if not summary:
-            return False
-        try:
-            daily_file = ensure_daily_memory_file(self.workspace_dir, user_id)
-            headers = {
-                "overflow": f"## Context Overflow Recovery ({datetime.now().strftime('%H:%M')})",
-                "trim": f"## Trimmed Context ({datetime.now().strftime('%H:%M')})",
-                "daily_summary": f"## Daily Summary ({datetime.now().strftime('%H:%M')})",
-            }
-            header = headers.get(reason, f"## Session Notes ({datetime.now().strftime('%H:%M')})")
-            with open(daily_file, "a", encoding="utf-8") as f:
-                f.write(f"\n{header}\n\n{summary}\n")
-            logger.info(f"[MemoryFlush] Wrote daily memory to {daily_file.name} (reason={reason}, chars={len(summary)})")
-            self.last_flush_timestamp = datetime.now()
-            return True
-        except Exception as e:
-            logger.warning(f"[MemoryFlush] Failed to write daily summary (reason={reason}): {e}")
-            return False
+    def write_daily_summary(self, summary, user_id=None, reason="trim"):
+        """兼容旧调用方；任意摘要文本不再具有持久写入权限。"""
+        return False
 
     @staticmethod
-    def _clean_summary_output(raw: str) -> str:
-        """Strip legacy [DAILY]/[MEMORY] markers if present, return clean daily text."""
-        raw = raw.strip()
+    def _clean_summary_output(raw):
+        if isinstance(raw, dict):
+            return str(raw.get("context_summary") or "").strip()
+        value = _json_object(raw)
+        if value is not None:
+            return str(value.get("context_summary") or "").strip()
         if _is_empty_sentinel(raw):
             return ""
+        text = raw.strip()
+        if "[DAILY]" in text:
+            text = text.split("[DAILY]", 1)[1]
+        return text.split("[MEMORY]", 1)[0].replace("```", "").strip()
 
-        # Strip [DAILY] marker
-        if "[DAILY]" in raw:
-            start = raw.index("[DAILY]") + len("[DAILY]")
-            end = raw.index("[MEMORY]") if "[MEMORY]" in raw else len(raw)
-            raw = raw[start:end].strip()
-
-        # Remove stray [MEMORY] section entirely
-        if "[MEMORY]" in raw:
-            raw = raw[:raw.index("[MEMORY]")].strip()
-
-        # Remove markdown code fences
-        raw = raw.replace("```", "").strip()
-
-        return raw
-
-    def create_daily_summary(
-        self,
-        messages: List[Dict],
-        user_id: Optional[str] = None
-    ) -> bool:
-        """
-        Generate end-of-day summary. Called by daily timer.
-        Skips if messages haven't changed since last flush.
-
-        The day-level hash follows the same claim-then-commit rule the
-        per-message hashes use: it is claimed here so a second flush of the
-        same day cannot double-summarise, and committed by the worker only
-        once the summary has actually landed. Spending it on dispatch is what
-        made a failed flush lose the whole day -- the timer does not retry
-        within the day, and Deep Dream has nothing to distil from an empty
-        daily file.
-        """
-        import hashlib
-        content = "".join(
-            self._extract_text_from_content(m.get("content", ""))
-            for m in messages
-        )
-        content_hash = hashlib.md5(content.encode("utf-8")).hexdigest()
-        with self._flush_hashes_lock:
-            if content_hash in self._daily_flushed_hashes or content_hash in self._daily_inflight_hashes:
-                logger.debug("[MemoryFlush] Daily summary skipped: no new content since last flush")
-                return False
-            self._daily_inflight_hashes.add(content_hash)
-        dispatched = self.flush_from_messages(
-            messages=messages,
-            user_id=user_id,
-            reason="daily_summary",
-            max_messages=0,
-            daily_content_hash=content_hash,
-        )
-        if not dispatched:
-            self._settle_daily_hash(content_hash, committed=False)
-        return dispatched
-
-    def _settle_daily_hash(self, content_hash: Optional[str], committed: bool):
-        """Commit the day-level dedup hash, or release it so a retry can run."""
-        if not content_hash:
-            return
-        with self._flush_hashes_lock:
-            self._daily_inflight_hashes.discard(content_hash)
-            if committed:
-                self._daily_flushed_hashes.add(content_hash)
-                self._last_flushed_content_hash = content_hash
-
-    # ---- Deep Dream (memory distillation) ----
-
-    def deep_dream(self, user_id: Optional[str] = None, lookback_days: int = 1, force: bool = False) -> bool:
-        """
-        Distill recent daily memories into MEMORY.md and generate a dream diary.
-
-        Args:
-            lookback_days: How many days of daily files to read (default 1 for scheduled, 3 for manual)
-            force: Skip input-hash dedup check (used by manual /memory dream trigger)
-        """
-        # Config guard for scheduled runs. Manual trigger (force=True) always
-        # runs since it is an explicit user action.
-        if not force:
-            try:
-                from config import conf
-                if not conf().get("deep_dream_enabled", True):
-                    logger.info("[DeepDream] deep_dream_enabled=false, skipping")
+    def create_daily_summary(self, messages, user_id=None):
+        with identity_scope(**({"user_id": user_id} if user_id is not None else {})):
+            self.capture(messages)
+            key = _message_key(self._ledger(), messages)
+            with self._flush_hashes_lock:
+                if key in self._daily_flushed_hashes or key in self._daily_inflight_hashes:
                     return False
-            except Exception:
-                pass
+                self._daily_inflight_hashes.add(key)
+            return self.flush_from_messages(messages, user_id=user_id, reason="daily_summary", daily_content_hash=key)
 
+    def deep_dream(self, user_id=None, lookback_days=1, force=False):
+        if not force:
+            from config import conf
+            if not conf().get("deep_dream_enabled", True):
+                return False
         if not self.llm_model:
-            logger.warning("[DeepDream] No LLM model available, skipping")
             return False
-
-        logger.info(f"[DeepDream] Starting memory distillation (lookback={lookback_days} days)")
-
-        # Collect materials
-        memory_content = self._read_main_memory(user_id)
-        daily_content, has_content = self._read_recent_dailies(user_id, lookback_days)
-
-        if not has_content:
-            logger.info("[DeepDream] No recent daily records, skipping to preserve existing MEMORY.md")
-            return False
-
-        # Dedup: skip if same daily content already dreamed today.
-        # Note: only hash daily_content (not memory_content), because deep_dream
-        # itself rewrites MEMORY.md as a side effect, which would otherwise
-        # invalidate the hash on every subsequent call within the same window.
-        import hashlib
-        daily_hash = hashlib.md5(daily_content.encode("utf-8")).hexdigest()
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        dedup_key = f"{today_str}:{daily_hash}"
-        if not force and dedup_key == self._last_dream_input_hash:
-            logger.info("[DeepDream] Already dreamed today with same daily content, skipping")
-            return False
-
-        logger.info(
-            f"[DeepDream] Materials collected: "
-            f"MEMORY.md={len(memory_content)} chars, "
-            f"daily={len(daily_content)} chars"
-        )
-
-        # Call LLM for distillation, retrying transient errors (timeout /
-        # connection / rate limit / 5xx) and empty responses so a single
-        # hiccup doesn't lose the night's dream.
-        import time as _time
-
-        max_attempts = 3
-        retryable_errors = (
-            "timeout", "timed out", "connection", "network", "rate limit",
-            "overloaded", "unavailable", "busy", "retry",
-            "429", "500", "502", "503", "504", "512",
-        )
-        raw = ""
-        for attempt in range(1, max_attempts + 1):
-            t0 = _time.monotonic()
-            try:
-                user_msg = _dream_user_prompt().format(
-                    memory_content=memory_content or "(empty)",
-                    days=lookback_days,
-                    daily_content=daily_content or "(no recent daily records)",
-                )
-                from agent.protocol.models import LLMRequest
-                # No output cap: the prompt already keeps MEMORY.md concise (~50
-                # items), so a hard max_tokens would only risk truncating a
-                # large rewrite. Let the model use its default output budget.
-                request = LLMRequest(
-                    messages=[{"role": "user", "content": user_msg}],
-                    temperature=0.3,
-                    stream=False,
-                    system=_dream_system_prompt(),
-                )
-                raw = self._extract_response_text(self.llm_model.call(request)) or ""
-                elapsed = _time.monotonic() - t0
-                if raw.strip():
-                    logger.info(
-                        f"[DeepDream] LLM distillation completed "
-                        f"(attempt {attempt}/{max_attempts}, {elapsed:.1f}s, {len(raw)} chars)"
-                    )
-                    break
-                logger.warning(
-                    f"[DeepDream] LLM returned empty response "
-                    f"(attempt {attempt}/{max_attempts}, {elapsed:.1f}s)"
-                )
-            except Exception as e:
-                elapsed = _time.monotonic() - t0
-                logger.warning(
-                    f"[DeepDream] LLM call failed "
-                    f"(attempt {attempt}/{max_attempts}, {elapsed:.1f}s): {e}"
-                )
-                if not any(k in str(e).lower() for k in retryable_errors):
-                    break
-            if attempt < max_attempts:
-                _time.sleep(60)
-        if not raw.strip():
-            return False
-
-        # Parse [MEMORY] and [DREAM] sections
-        new_memory, dream_diary = self._parse_dream_output(raw)
-
-        if not new_memory:
-            logger.warning("[DeepDream] No [MEMORY] section in LLM output, skipping overwrite")
-            return False
-
-        # Overwrite MEMORY.md
         try:
-            main_file = self.get_main_memory_file(user_id)
-            old_size = len(memory_content)
-            write_text_atomic(main_file, new_memory + "\n")
-            logger.info(
-                f"[DeepDream] Updated MEMORY.md "
-                f"({old_size} → {len(new_memory)} chars)"
-            )
-        except Exception as e:
-            logger.warning(f"[DeepDream] Failed to write MEMORY.md: {e}")
+            with identity_scope(**({"user_id": user_id} if user_id is not None else {})):
+                ledger = self._ledger()
+                revision = ledger.revision()
+                entries = ledger.active_entries()
+                if len(entries) < 2:
+                    return False
+                fingerprint = _digest(entries)
+                if not force and fingerprint == self._last_dream_input_hash:
+                    return False
+                from agent.protocol.models import LLMRequest
+                request = LLMRequest(messages=[{"role": "user", "content": json.dumps(entries, ensure_ascii=False)}],
+                                     system=DREAM_SYSTEM_PROMPT_ZH, temperature=0.3, stream=False)
+                output = _json_object(self._extract_response_text(self.llm_model.call(request)))
+                if not output or not isinstance(output.get("merges"), list):
+                    return False
+                known = {entry["entry_id"] for entry in entries}
+                used = set()
+                merges = output["merges"]
+                for proposal in merges:
+                    ids = proposal.get("input_ids", [])
+                    if (not isinstance(ids, list) or len(set(ids)) < 2 or len(set(ids)) != len(ids)
+                            or not set(ids) <= known or used.intersection(ids)
+                            or not isinstance(proposal.get("content"), str) or not proposal["content"].strip()):
+                        return False
+                    used.update(ids)
+                changed = False
+                for proposal in merges:
+                    request_id = "dream:" + _digest(dict(revision=revision, **proposal))
+                    receipt = ledger.merge(request_id, proposal["content"], proposal["input_ids"], revision)
+                    if not receipt.get("results") or any(r.get("status") not in ("remembered", "pending_projection")
+                                                        for r in receipt["results"]):
+                        return False
+                    revision = receipt["revision"]
+                    changed = True
+                self._last_dream_input_hash = _digest(ledger.active_entries())
+                return changed
+        except Exception as exc:
+            logger.warning(f"[DeepDream] 台账合并未完成: {exc}")
             return False
 
-        # Write dream diary
-        if dream_diary:
+    def _read_main_memory(self, user_id=None):
+        from agent.memory.projection import read_memory_text
+        return read_memory_text(self.workspace_dir, self.get_main_memory_file(user_id))
+
+    def _write_dream_diary(self, content, user_id=None):
+        """梦境不能成为脱离台账依据的独立事实副本。"""
+        return False
+
+    def _summarize_messages(self, messages, max_messages=0):
+        conversation = self._format_conversation_for_summary(messages, max_messages)
+        if self.llm_model and conversation:
             try:
-                self._write_dream_diary(dream_diary, user_id)
-            except Exception as e:
-                logger.warning(f"[DeepDream] Failed to write dream diary: {e}")
+                raw = self._call_llm_for_summary(conversation)
+                value = _json_object(raw)
+                if (value is not None and isinstance(value.get("context_summary"), str)
+                        and isinstance(value.get("entries"), list)):
+                    return value
+                # 老模型/格式错误的正文最多用于当前上下文，不持久化。
+                return dict(context_summary=self._clean_summary_output(raw), entries=[])
+            except Exception as exc:
+                logger.warning(f"[MemoryFlush] 摘要模型不可用，仅保留上下文: {exc}")
+        return dict(context_summary=self._extract_summary_fallback(messages, max_messages), entries=[], _retryable=True)
 
-        logger.info("[DeepDream] ✅ Deep Dream completed successfully")
-        # Mark as dreamed only after a fully successful run, so a failed
-        # attempt remains retryable the same day.
-        self._last_dream_input_hash = dedup_key
-        return True
-
-    def _read_main_memory(self, user_id: Optional[str] = None) -> str:
-        """Read current MEMORY.md content."""
-        main_file = self.get_main_memory_file(user_id)
-        if main_file.exists():
-            return main_file.read_text(encoding="utf-8").strip()
-        return ""
-
-    def _read_recent_dailies(
-        self, user_id: Optional[str] = None, lookback_days: int = 1
-    ) -> tuple:
-        """
-        Read recent daily memory files.
-
-        Returns:
-            (combined_text, has_content) tuple
-        """
-        from datetime import timedelta
-
-        parts = []
-        has_content = False
-        today = datetime.now().date()
-
-        for offset in range(lookback_days):
-            day = today - timedelta(days=offset)
-            date_str = day.strftime("%Y-%m-%d")
-            if user_id:
-                daily_file = self.memory_dir / "users" / user_id / f"{date_str}.md"
-            else:
-                daily_file = self.memory_dir / f"{date_str}.md"
-
-            if daily_file.exists():
-                content = daily_file.read_text(encoding="utf-8").strip()
-                if content:
-                    parts.append(f"### {date_str}\n\n{content}")
-                    has_content = True
-            else:
-                parts.append(f"### {date_str}\n\n(no records)")
-
-        return "\n\n".join(parts), has_content
-
-    @staticmethod
-    def _parse_dream_output(raw: str) -> tuple:
-        """Parse LLM output into (new_memory, dream_diary)."""
-        raw = raw.strip().replace("```", "")
-        new_memory = ""
-        dream_diary = ""
-
-        if "[MEMORY]" in raw:
-            start = raw.index("[MEMORY]") + len("[MEMORY]")
-            end = raw.index("[DREAM]") if "[DREAM]" in raw else len(raw)
-            new_memory = raw[start:end].strip()
-
-        if "[DREAM]" in raw:
-            start = raw.index("[DREAM]") + len("[DREAM]")
-            dream_diary = raw[start:].strip()
-
-        return new_memory, dream_diary
-
-    def _write_dream_diary(self, content: str, user_id: Optional[str] = None):
-        """Write dream diary to memory/dreams/YYYY-MM-DD.md."""
-        dreams_dir = self.memory_dir / "dreams"
-        if user_id:
-            dreams_dir = self.memory_dir / "users" / user_id / "dreams"
-        dreams_dir.mkdir(parents=True, exist_ok=True)
-
-        today = datetime.now().strftime("%Y-%m-%d")
-        diary_file = dreams_dir / f"{today}.md"
-        write_text_atomic(diary_file, f"# Dream Diary: {today}\n\n{content}\n")
-        logger.info(f"[DeepDream] Wrote dream diary to {diary_file}")
-
-    # ---- Internal helpers ----
-    
-    def _summarize_messages(self, messages: List[Dict], max_messages: int = 0) -> Optional[str]:
-        """
-        Summarize conversation messages using LLM.
-        Returns empty string if LLM deems content not worth recording, and
-        ``None`` if the LLM call failed and the fallback had nothing either.
-        Rule-based fallback only used when LLM call raises an exception.
-        """
-        conversation_text = self._format_conversation_for_summary(messages, max_messages)
-        if not conversation_text.strip():
-            return ""
-        
-        if self.llm_model:
-            try:
-                summary = self._call_llm_for_summary(conversation_text)
-                if not _is_empty_sentinel(summary):
-                    return summary.strip()
-                logger.info("[MemoryFlush] LLM returned empty sentinel, skipping write")
-                return ""
-            except Exception as e:
-                logger.warning(f"[MemoryFlush] LLM summarization failed, using fallback: {e}")
-                return self._extract_summary_fallback(messages, max_messages) or None
-        else:
-            logger.info("[MemoryFlush] No LLM model available, using rule-based fallback")
-            return self._extract_summary_fallback(messages, max_messages)
-
-    def _format_conversation_for_summary(self, messages: List[Dict], max_messages: int = 0) -> str:
-        """Format messages into readable conversation text for LLM summarization."""
-        from agent.knowledge.purpose import durable_messages
-        messages = durable_messages(messages)
-        msgs = messages if max_messages == 0 else messages[-max_messages * 2:]
-        lines = []
-        for msg in msgs:
-            role = msg.get("role", "")
-            text = self._extract_text_from_content(msg.get("content", ""))
-            if not text or not text.strip():
-                continue
-            text = text.strip()
-            if role == "user":
-                lines.append(f"用户: {text[:500]}")
-            elif role == "assistant":
-                lines.append(f"助手: {text[:500]}")
-        return "\n".join(lines)
+    def _format_conversation_for_summary(self, messages, max_messages=0):
+        selected = messages if max_messages == 0 else messages[-max_messages * 2:]
+        evidence = self._ledger().evidence(selected)
+        return json.dumps(dict(messages=selected, evidence=evidence), ensure_ascii=False)
 
     @staticmethod
     def _extract_response_text(response) -> str:
@@ -812,124 +332,25 @@ class MemoryFlushManager:
 
         return ""
 
-    def _call_llm_for_summary(self, conversation_text: str) -> str:
-        """Call LLM to generate a concise summary of the conversation."""
+    def _call_llm_for_summary(self, conversation_text):
         from agent.protocol.models import LLMRequest
-        
-        request = LLMRequest(
+        return self._extract_response_text(self.llm_model.call(LLMRequest(
             messages=[{"role": "user", "content": _summarize_user_prompt().format(conversation=conversation_text)}],
-            temperature=0,
-            max_tokens=500,
-            stream=False,
-            system=_summarize_system_prompt(),
-        )
-        
-        response = self.llm_model.call(request)
-        return self._extract_response_text(response)
+            system=_summarize_system_prompt(), temperature=0, stream=False)))
 
     @staticmethod
-    def _extract_first_meaningful_line(text: str, max_len: int = 120) -> str:
-        """Extract the first meaningful line from assistant reply, skipping markdown noise."""
-        import re
-        for line in text.split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            # Skip markdown headings, horizontal rules, code fences, pure emoji/symbols
-            if re.match(r'^(#{1,4}\s|```|---|\*\*\*|[-*]\s*$|[^\w\u4e00-\u9fff]{1,5}$)', line):
-                continue
-            # Strip leading markdown bold/emoji decorations
-            cleaned = re.sub(r'^[\*#>\-\s]+', '', line).strip()
-            cleaned = re.sub(r'^[\U0001f300-\U0001f9ff\u2600-\u27bf\s]+', '', cleaned).strip()
-            if len(cleaned) >= 5:
-                return cleaned[:max_len]
-        return text.split("\n")[0].strip()[:max_len]
+    def _extract_summary_fallback(messages, max_messages=0):
+        selected = messages if max_messages == 0 else messages[-max_messages * 2:]
+        return "\n".join(f"{m.get('role', '?')}: {MemoryFlushManager._extract_text_from_content(m.get('content', ''))[:500]}"
+                         for m in selected)[-10000:]
 
     @staticmethod
-    def _extract_summary_fallback(messages: List[Dict], max_messages: int = 0) -> str:
-        """
-        Rule-based summary of discarded messages.
-        Format: "用户问了X; 助手回答了Y" per event, compact and readable.
-        """
-        from agent.knowledge.purpose import durable_messages
-        messages = durable_messages(messages)
-        msgs = messages if max_messages == 0 else messages[-max_messages * 2:]
-
-        events: List[str] = []
-        current_user_text = ""
-        for msg in msgs:
-            role = msg.get("role", "")
-            text = MemoryFlushManager._extract_text_from_content(msg.get("content", ""))
-            if not text or not text.strip():
-                continue
-            text = text.strip()
-
-            if role == "user":
-                if len(text) <= 3:
-                    continue
-                current_user_text = text[:120]
-            elif role == "assistant" and current_user_text:
-                reply_summary = MemoryFlushManager._extract_first_meaningful_line(text)
-                if reply_summary:
-                    events.append(f"- 用户: {current_user_text} → 回复: {reply_summary}")
-                else:
-                    events.append(f"- 用户: {current_user_text}")
-                current_user_text = ""
-
-        if current_user_text:
-            events.append(f"- 用户: {current_user_text}")
-
-        return "\n".join(events[:10])
-    
-    @staticmethod
-    def _extract_text_from_content(content) -> str:
-        """Extract plain text from message content (string or content blocks)."""
+    def _extract_text_from_content(content):
         if isinstance(content, str):
             return content
         if isinstance(content, list):
-            parts = []
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    parts.append(block.get("text", ""))
-                elif isinstance(block, str):
-                    parts.append(block)
-            return "\n".join(parts)
+            return "\n".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
         return ""
-
-    @classmethod
-    def _strip_scheduler_pairs(cls, messages: List[Dict]) -> List[Dict]:
-        """Drop scheduler-injected user/assistant pairs from a flush batch.
-
-        A scheduler user message starts with the ``[SCHEDULED]`` marker
-        (written by ``AgentBridge.remember_scheduled_output``); the message
-        immediately following it (if it is an assistant turn) is its paired
-        output and is dropped together. Regular user/assistant turns and
-        any tool_use / tool_result blocks are preserved as-is.
-        """
-        if not messages:
-            return messages
-
-        SCHEDULED_PREFIX = "[SCHEDULED]"
-        result = []
-        skip_next_assistant = False
-        for msg in messages:
-            if not isinstance(msg, dict):
-                result.append(msg)
-                skip_next_assistant = False
-                continue
-            role = msg.get("role")
-            if skip_next_assistant and role == "assistant":
-                skip_next_assistant = False
-                continue
-            skip_next_assistant = False
-            if role == "user":
-                text = cls._extract_text_from_content(msg.get("content", ""))
-                if text.lstrip().startswith(SCHEDULED_PREFIX):
-                    skip_next_assistant = True
-                    continue
-            result.append(msg)
-        return result
-
 
 def create_memory_files_if_needed(workspace_dir: Path, user_id: Optional[str] = None):
     """

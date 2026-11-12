@@ -18,6 +18,7 @@ from agent.tools.current_time.current_time import TimeTool
 # Import memory tools
 from agent.tools.memory.memory_search import MemorySearchTool
 from agent.tools.memory.memory_get import MemoryGetTool
+from agent.tools.memory.memory_record import MemoryRecordTool
 
 # Import self-evolution tools
 from agent.tools.evolution_undo.evolution_undo import EvolutionUndoTool
@@ -160,6 +161,7 @@ __all__ = [
     'SearchFiles',
     'MemorySearchTool',
     'MemoryGetTool',
+    'MemoryRecordTool',
     'EvolutionUndoTool',
     'SubagentTool',
     'AgentDelegateTool',

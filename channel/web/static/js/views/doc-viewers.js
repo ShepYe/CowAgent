@@ -22,11 +22,11 @@ async function docReadFile(relPath) {
 }
 
 /** Save one file's text. Returns the raw response, a conflict included. */
-async function docWriteFile(relPath, content, expectedMtime) {
+async function docWriteFile(relPath, content, expectedMtime, expectedHash) {
     const res = await fetch('/api/workspace/write', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path: relPath, content: content, expected_mtime: expectedMtime }),
+        body: JSON.stringify({ path: relPath, content: content, expected_mtime: expectedMtime, expected_hash: expectedHash }),
     });
     return res.json();
 }
@@ -43,7 +43,8 @@ function docRenderBody(id, content) {
 function docRenderTitle(id, name, state) {
     const el = document.getElementById(id);
     if (!el) return;
-    el.textContent = name || '';
+    el.textContent = (name || '') + (state?.projectionPending ? ' · 投影待完成' : '') + (state?.unverified ? ' · 未核验' : '');
+    el.title = [state?.projectionPending ? '已接受保存，文件投影待完成' : '', state?.unverified].filter(Boolean).join('；');
     if (state && state.dirty) {
         el.insertAdjacentHTML('beforeend', ' <span class="doc-dirty-dot">•</span>');
     }
@@ -67,7 +68,7 @@ const memoryEditor = createDocEditor({
         cancel: document.getElementById('memory-btn-cancel'),
     }),
     read: (doc) => docReadFile(doc.relPath),
-    write: (doc, content, mtime) => docWriteFile(doc.relPath, content, mtime),
+    write: (doc, content, mtime, hash) => docWriteFile(doc.relPath, content, mtime, hash),
     render: (doc) => docRenderBody('memory-viewer-content', doc.content),
     onState: (state) => docRenderTitle('memory-viewer-title', memoryEditor.current()?.filename, state),
 });

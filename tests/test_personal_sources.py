@@ -223,7 +223,7 @@ def test_purpose_context_and_history_round_trip(tmp_path):
     with task_scope("t1"):
         assert durable_messages(messages) == []
         with pytest.raises(ValueError):
-            guard_memory_write(tmp_path / "memory" / "today.md")
+            guard_memory_write(tmp_path / "memory" / "today.md", tmp_path)
     marked = mark_messages(messages, "t1")
     assert durable_messages(marked) == []
     store = ConversationStore(tmp_path / "conversation.db")
@@ -685,7 +685,21 @@ def test_source_task_cannot_write_unmanaged_knowledge(tmp_path, monkeypatch):
         unrelated = tmp_path / "other-project" / "knowledge" / "note.md"
         assert write.execute(dict(path=str(unrelated), content="project document")).status == "success"
     assert page.read_text(encoding="utf-8") == "original"
-    assert write.execute(dict(path=str(page), content="legacy unmanaged edit")).status == "success"
+    result = write.execute(dict(path=str(page), content="legacy unmanaged edit"))
+    assert result.status == "error" and "memory_record" in result.result
+    # 普通交流知识通过真实依据准入，仍保留知识整理能力。
+    from agent.memory.ledger import MemoryLedger
+    from common.runtime_identity import identity_scope
+    with identity_scope(session_id="ordinary-knowledge"):
+        ledger = MemoryLedger(tmp_path / "actual")
+        message = dict(role="user", content="沟通约定：优先用表格说明比较结果")
+        ledger.capture([message], origin="human")
+        basis = ledger.evidence([message])[0]
+        basis.pop("text")
+        basis.pop("origin")
+        entry = dict(content=message["content"], disposition="conversation_memory", basis=[basis], reason="普通交流主题知识")
+        assert ledger.record("ordinary", [entry], trusted=True)["results"][0]["status"] == "remembered"
+        assert ledger.active_entries()[0]["content"] == message["content"]
 
 
 @pytest.mark.parametrize("budget", ["files", "text"])

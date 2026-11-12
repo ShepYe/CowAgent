@@ -248,5 +248,7 @@ def test_legacy_latest_assistant_merge_remains_available(tmp_path):
         rows = connection.execute(
             "SELECT seq, extras FROM messages ORDER BY seq"
         ).fetchall()
-    assert not rows[0][1] or not json.loads(rows[0][1])
-    assert json.loads(rows[1][1]) == {"keep": True, "new": True}
+    first, latest = json.loads(rows[0][1]), json.loads(rows[1][1])
+    assert 'new' not in first and 'keep' not in first
+    assert latest['keep'] is True and latest['new'] is True
+    assert first['memory_trace']['message_id'] != latest['memory_trace']['message_id']

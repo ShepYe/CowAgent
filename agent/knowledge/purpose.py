@@ -38,17 +38,17 @@ def source_derived_context():
 
 
 def durable_messages(messages):
-    # Derived assistant turns share the exclusion of the source conversation.
-    # Long-term material is published through SourceService instead of a second,
-    # unversioned diary copy. Explicit message metadata survives worker snapshots.
-    if source_derived_context() or any(_source_bearing(m) for m in messages) or any(
-        m.get("personal_task_id") or "[personal-task:" in str(m.get("content", "")) or m.get("purpose") in ("transient", "waiting")
-        or m.get("metadata", {}).get("personal_task_id")
-        or m.get("metadata", {}).get("purpose") in ("transient", "waiting")
-        for m in messages
-    ):
+    if source_task_context():
         return []
-    return messages
+    # 这里只缩小候选输入；最终来源／用途准入由台账按片段校验。
+    # 不再用读过来源这一会话提示否决独立的普通消息。
+    def eligible(message):
+        containers = [message] + [message.get(key) or {} for key in ("metadata", "extras")]
+        if any(item.get("personal_task_id") or item.get("archive_only")
+               or item.get("purpose") in ("transient", "waiting") for item in containers):
+            return False
+        return "[personal-task:" not in str(message.get("content", "")) and not _source_bearing(message)
+    return [message for message in messages if eligible(message)]
 
 
 def mark_messages(messages, task_id):
@@ -73,14 +73,16 @@ def mark_messages(messages, task_id):
 
 def guard_memory_write(path, workspace_root=None):
     from pathlib import Path
-    if not source_derived_context():
-        return
     from common import state_dir
     target = Path(path).resolve()
-    workspace = workspace_root or state_dir.state_root()
-    knowledge = Path(state_dir.knowledge_dir(base=workspace)).resolve()
-    if target.is_relative_to(knowledge) or "memory" in target.parts or target.name == "MEMORY.md":
-        raise ValueError("来源资料及派生结论须携带出处通过 knowledge_ingest 发布；临时资料只留档，不能写入摘要/日记/Deep Dream")
+    workspace = Path(workspace_root or state_dir.state_root()).resolve()
+    # 工作区根及共享知识根均须守卫，不能通过普通 knowledge 副本绕开依据核验。
+    protected = (target == workspace / "MEMORY.md"
+                 or target.is_relative_to(workspace / "memory")
+                 or target.is_relative_to(workspace / "knowledge")
+                 or target.is_relative_to(Path(state_dir.knowledge_dir(base=workspace)).resolve()))
+    if protected:
+        raise ValueError("受保护的记忆／知识目标不能通过 edit/write 修改。真实会话记忆及普通交流形成的独立主题知识请使用 memory_record 并引用 basis，准入后保存到 memory/routed.md；资料原文及派生结论请使用 knowledge_ingest。")
 
 
 def refresh_evidence_context(agent):

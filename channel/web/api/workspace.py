@@ -218,10 +218,19 @@ def _mark_memory_dirty(agent_id: str = None) -> None:
     """
     try:
         from bridge.bridge import Bridge
-        agent = Bridge().get_agent_bridge().get_agent(agent_id=agent_id or None)
-        mm = getattr(agent, "memory_manager", None)
-        if mm:
-            mm.mark_dirty()
+        bridge = getattr(Bridge(), '_agent_bridge', None)
+        if bridge is None:
+            return
+        resolved = bridge._resolve_agent_id(agent_id or None)
+        with bridge._agents_lock:
+            agents = [value for (aid, _), value in bridge._agent_instances.items() if aid == resolved]
+            default = bridge._default_agents.get(resolved)
+            if default is not None:
+                agents.append(default)
+        managers = {id(agent.memory_manager): agent.memory_manager for agent in agents
+                    if getattr(agent, 'memory_manager', None) is not None}
+        for manager in managers.values():
+            manager.mark_dirty()
     except Exception as e:
         logger.warning(f"[WebChannel] Failed to mark memory index dirty: {e}")
 
@@ -243,7 +252,12 @@ class WorkspaceReadHandler:
             if not raw_path:
                 return json.dumps({"status": "error", "message": "path is required"})
             svc, rel = _editable_target(raw_path, params.session or None, params.agent or params.agent_id or None)
-            return json.dumps({"status": "success", **svc.read_text(rel)}, ensure_ascii=False)
+            from common.runtime_identity import identity_scope
+            from common.personal_tasks import OWNER, personal_enabled
+            with identity_scope(agent_id=params.agent or params.agent_id or None, session_id=params.session or None,
+                                user_id=OWNER if personal_enabled() else None):
+                result = svc.read_text(rel)
+            return json.dumps({"status": "success", **result}, ensure_ascii=False)
         except (ValueError, FileNotFoundError) as e:
             return json.dumps({"status": "error", "message": str(e)})
         except Exception as e:
@@ -283,9 +297,18 @@ class WorkspaceWriteHandler:
             agent_id = body.get("agent") or body.get("agent_id") or None
             svc, rel = _editable_target(raw_path, body.get("session") or None, agent_id)
             try:
-                result = svc.write_text(rel, content, expected_mtime=body.get("expected_mtime"))
+                from common.runtime_identity import identity_scope
+                from common.personal_tasks import OWNER, personal_enabled
+                with identity_scope(agent_id=agent_id, session_id=body.get("session") or None,
+                                    user_id=OWNER if personal_enabled() else None):
+                    result = svc.write_text(rel, content, expected_mtime=body.get("expected_mtime"),
+                                            expected_hash=body.get("expected_hash"))
             except WorkspaceConflictError as e:
                 return json.dumps({"status": "error", "code": "conflict", "message": str(e)})
+
+            # HTTP 状态与逐条记忆状态分别返回，避免 remembered 覆盖 success。
+            if "status" in result:
+                result["memory_status"] = result.pop("status")
 
             # A memory or knowledge file feeds the vector index; re-embed it on
             # edit so search doesn't keep returning the stale pre-edit text.
@@ -294,7 +317,12 @@ class WorkspaceWriteHandler:
             if indexes_rel_path(rel):
                 _mark_memory_dirty(agent_id)
 
-            logger.info(f"[WebChannel] Workspace file saved: {result['path']} ({result['size']} bytes)")
+            if result.get("projected") is False:
+                result["message"] = "投影待完成"
+                result.setdefault("memory_status", "pending_projection")
+                logger.info(f"[WebChannel] Memory accepted, projection pending: {result['path']}")
+            else:
+                logger.info(f"[WebChannel] Workspace file saved: {result['path']} ({result['size']} bytes)")
             return json.dumps({"status": "success", **result}, ensure_ascii=False)
         except (ValueError, FileNotFoundError) as e:
             return json.dumps({"status": "error", "message": str(e)})

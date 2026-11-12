@@ -1,4 +1,4 @@
-"""Clearing a memory note through Write drops its indexed content without embedding blank text."""
+"""Clearing legacy files drops indexed content without embedding blank text."""
 import asyncio
 import json
 import threading
@@ -9,7 +9,6 @@ import pytest
 from agent.memory.config import MemoryConfig
 from agent.memory.manager import MemoryManager
 from agent.memory.embedding.provider import OpenAIEmbeddingProvider
-from agent.tools.write.write import Write
 from agent.tools.memory.memory_search import MemorySearchTool
 
 
@@ -20,8 +19,17 @@ def make(tmp_path):
     def factory(provider=None):
         (tmp_path / "knowledge").mkdir()
         managers.append(MemoryManager(MemoryConfig(workspace_root=str(tmp_path)), embedding_provider=provider))
-        writer = Write(config={"cwd": str(tmp_path), "memory_manager": managers[-1]})
-        return managers[-1], lambda path, text: writer.execute({"path": path, "content": text}).status
+        manager = managers[-1]
+
+        def write(path, text):
+            # Seed legacy files directly: agent write/edit now reject these paths.
+            target = tmp_path / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text, encoding="utf-8")
+            manager.mark_dirty()
+            return "success"
+
+        return manager, write
     yield factory
     for manager in managers:
         manager.storage.close()

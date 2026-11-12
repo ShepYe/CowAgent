@@ -714,6 +714,44 @@ class ConversationStore:
                     (aid, session_id, ctx_start),
                 )
                 rows = self._rows_within_turns(cursor, max(1, max_turns))
+                # 为旧行补齐可重启复用的身份；绝不从 user 包装推断真人。
+                from agent.memory.message_trace import ensure_trace
+                restored_rows = []
+                with conn:
+                    for seq, role, raw_content, raw_extras in rows:
+                        try:
+                            extras = json.loads(raw_extras) if raw_extras else {}
+                        except (ValueError, TypeError):
+                            restored_rows.append((seq, role, raw_content, raw_extras))
+                            continue
+                        if not isinstance(extras, dict):
+                            restored_rows.append((seq, role, raw_content, raw_extras))
+                            continue
+                        message = {"role": role, "extras": extras}
+                        try:
+                            ensure_trace(message, agent_id=aid, session_id=session_id,
+                                         origin="internal")
+                        except ValueError:
+                            # 损坏元数据原样保留，不把它升级成可信依据。
+                            restored_rows.append((seq, role, raw_content, raw_extras))
+                            continue
+                        encoded = json.dumps(extras, ensure_ascii=False)
+                        if encoded != raw_extras:
+                            updated = conn.execute(
+                                "UPDATE messages SET extras = ? WHERE agent_id = ? "
+                                "AND session_id = ? AND seq = ? AND extras = ?",
+                                (encoded, aid, session_id, seq, raw_extras),
+                            )
+                            if not updated.rowcount:
+                                # 另一句柄先完成了旧行迁移，沿用它生成的身份。
+                                winner = conn.execute(
+                                    "SELECT extras FROM messages WHERE agent_id = ? "
+                                    "AND session_id = ? AND seq = ?", (aid, session_id, seq),
+                                ).fetchone()
+                                if winner:
+                                    encoded = winner[0]
+                        restored_rows.append((seq, role, raw_content, encoded))
+                rows = restored_rows
             finally:
                 conn.close()
 
@@ -736,9 +774,11 @@ class ConversationStore:
                 extras = json.loads(_[0]) if _ and _[0] else {}
             except (ValueError, TypeError):
                 extras = {}
-            if extras.get("personal_task_id"):
-                message["personal_task_id"] = extras["personal_task_id"]
+            if isinstance(extras, dict) and extras:
                 message["extras"] = extras
+                for key in ("message_id", "personal_task_id", "purpose", "archive_only", "metadata"):
+                    if key in extras:
+                        message[key] = extras[key]
             if authors.get(seq):
                 message["agent_id"] = authors[seq]
             result.append(message)
@@ -887,6 +927,20 @@ class ConversationStore:
 
                     inserted = 0
                     for msg in messages:
+                        from agent.memory.message_trace import ensure_trace
+                        from common.runtime_identity import current_identity
+                        identity = current_identity()
+                        content_blocks = msg.get("content")
+                        is_tool = msg.get("role") == "tool" or (
+                            isinstance(content_blocks, list) and any(
+                                isinstance(block, dict) and block.get("type") == "tool_result"
+                                for block in content_blocks
+                            )
+                        )
+                        ensure_trace(msg, agent_id=aid, user_id=identity.user_id or "",
+                                     session_id=session_id,
+                                     origin="tool" if is_tool else (
+                                         "assistant" if msg.get("role") == "assistant" else "internal"))
                         role = msg.get("role", "")
                         content = json.dumps(
                             msg.get("content", ""), ensure_ascii=False

@@ -141,6 +141,8 @@ class MemoryService:
 
         with open(path, "r", encoding="utf-8") as f:
             content = f.read()
+        from agent.memory.projection import filter_memory_text
+        content = filter_memory_text(self.workspace_root, path, content)
 
         return {
             "filename": filename,

@@ -250,10 +250,27 @@ class MemoryManager:
         # rerank; the reranker only reorders the candidates that pass it.
         filtered = []
         knowledge_root = None
+        memory_texts = {}
         for result in merged:
             if result.score < min_score:
                 continue
             path = result.path.replace("\\", "/")
+            from agent.memory.projection import is_memory_path, read_memory_text
+            workspace = self.config.get_workspace()
+            if is_memory_path(workspace, path):
+                # 老索引可能先于排除/更正事务，必须用全文过滤后的当前正文核验。
+                from common.runtime_identity import identity_scope
+                key = (path, result.user_id)
+                if key not in memory_texts:
+                    with identity_scope(**({"user_id": result.user_id} if result.user_id is not None else {})):
+                        memory_texts[key] = read_memory_text(workspace, path)
+                current = memory_texts[key]
+                snippet = result.snippet.strip()
+                # 索引会把长片段截为前500字符并附省略号，核对实际原文前缀。
+                if len(snippet) == 503 and snippet.endswith("..."):
+                    snippet = snippet[:-3]
+                if not snippet or snippet not in current:
+                    continue
             if path.startswith("knowledge/"):
                 from agent.knowledge.personal_assistant import readable
                 if knowledge_root is None:
@@ -313,6 +330,12 @@ class MemoryManager:
                 path = f"memory/users/{user_id}/memory_{content_hash}.md"
             else:
                 path = f"memory/shared/memory_{content_hash}.md"
+
+        from agent.memory.projection import filter_memory_text
+        # add_memory 是索引入口；无权将任意文本变成记忆文件。
+        content = filter_memory_text(self.config.get_workspace(), path, content)
+        if not content.strip():
+            return
         
         # Chunk content
         chunks = self.chunker.chunk_text(content)
@@ -404,7 +427,14 @@ class MemoryManager:
                 # that crowd out the authoritative entry in retrieval.
                 if "dreams" in rel_parts:
                     continue
-                if "daily" in rel_parts:
+                if file_path.name.startswith("routed"):
+                    from agent.memory.projection import projection_owner
+                    user_id = projection_owner(workspace_dir, file_path)
+                    if user_id is None:
+                        continue
+                    scope = "user" if user_id else "shared"
+                    user_id = user_id or None
+                elif "daily" in rel_parts:
                     if "users" in rel_parts or len(rel_parts) > 3:
                         user_idx = rel_parts.index("daily") + 1
                         user_id = rel_parts[user_idx] if user_idx < len(rel_parts) else None
@@ -488,6 +518,11 @@ class MemoryManager:
                 # Was silent, which made a half-indexed workspace look healthy.
                 logger.warning(f"[MemoryManager] Skipping {file_path}: cannot read it ({e})")
                 continue
+            if source == "memory":
+                from agent.memory.projection import filter_memory_text
+                from common.runtime_identity import identity_scope
+                with identity_scope(**({"user_id": user_id} if user_id is not None else {})):
+                    content = filter_memory_text(workspace_dir, file_path, content)
             file_hash = MemoryStorage.compute_hash(content)
             previous_hash = self.storage.get_file_hash(rel_path)
             if previous_hash == file_hash:

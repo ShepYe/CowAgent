@@ -821,6 +821,8 @@ def run():
         load_config()
         from common.figure_recovery import prepare_startup_recovery
         prepare_startup_recovery()
+        from common.memory_recovery import prepare_startup_recovery as prepare_memory_recovery
+        prepare_memory_recovery()
         _register_pid_file()
         _migrate_team_roster()
         _migrate_conversations()
