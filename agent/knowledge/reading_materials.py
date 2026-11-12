@@ -241,14 +241,38 @@ def _page_text_by_hash(reader, version, content_hash, page_number):
     return text
 
 
+def _legacy_text_reader():
+    """每次兼容重建独占旧 LRU，不读取、清空或修改全局文字缓存。"""
+    cache = OrderedDict()
+    cache_bytes = 0
+
+    def text(reader, version, content_hash, page_number):
+        nonlocal cache_bytes
+        key = (version, content_hash, page_number)
+        if key in cache:
+            cache.move_to_end(key)
+            return cache[key][0]
+        value = reader.pages[page_number - 1].extract_text() or ''
+        size = len(value.encode('utf-8'))
+        if size <= 8 * 1024 * 1024:
+            cache[key] = (value, size)
+            cache_bytes += size
+            while len(cache) > 128 or cache_bytes > 8 * 1024 * 1024:
+                _, (_, removed) = cache.popitem(last=False)
+                cache_bytes -= removed
+        return value
+
+    return text
+
+
 def _plan(root, original_relpath, *, document_id, revision_id, parse_id, config_revision,
-          target_pages, budget, overlap_pages):
+          target_pages, budget, overlap_pages, _legacy_text=None, _data=None):
     _validate_budget(budget, overlap_pages)
     identity = dict(document_id=document_id, revision_id=revision_id,
                     parse_id=parse_id, config_revision=config_revision)
     if any(not isinstance(v, str) or not v.strip() for v in identity.values()):
         raise ReadingMaterialError("invalid_request", "逻辑资料、版本、解析及配置身份不可为空")
-    data = _read(root, original_relpath)
+    data = _read(root, original_relpath) if _data is None else _data
     reader = _pdf(data)
     count = len(reader.pages)
     targets = _pages(range(1, count + 1) if target_pages is None else target_pages, count)
@@ -258,7 +282,11 @@ def _plan(root, original_relpath, *, document_id, revision_id, parse_id, config_
     version = "pdf-materials-v1/pypdf-" + pypdf.__version__
     source_hash = _hash(data)
     try:
-        texts = {p: _page_text_by_hash(reader, version, source_hash, p) for p in needed}
+        # extract_text 会缓存解码后的字体流；pypdf 克隆这些临时对象会改变
+        # 分段字节。新准备的文字读取独占 reader，材料从未提取文字的原件生成。
+        text_reader = _pdf(data) if _legacy_text is None else reader
+        text = _page_text_by_hash if _legacy_text is None else _legacy_text
+        texts = {p: text(text_reader, version, source_hash, p) for p in needed}
     except Exception as exc:
         raise ReadingMaterialError("parse_failed", "PDF 本地文字层提取失败") from exc
     key = _digest(dict(identity, preparation_version=version, original_hash=source_hash,
@@ -389,6 +417,54 @@ def _verify_derived_source(root, materials):
     return office
 
 
+_plan_hash_cache = OrderedDict()
+_plan_hash_cache_lock = RLock()
+
+
+def _expected_manifest_hash(root, materials, data, mode):
+    # 只保存完整输入摘要和重建结果摘要，不保存文件、正文、授权或来源状态。
+    options = {k: getattr(materials, k) for k in (
+        'document_id', 'revision_id', 'parse_id', 'config_revision',
+        'target_pages', 'budget', 'overlap_pages')}
+    key = _digest(dict(options, budget=asdict(materials.budget),
+                       original_relpath=materials.original_relpath, original_hash=_hash(data),
+                       preparation_version=materials.preparation_version,
+                       runtime_version=pypdf.__version__, derived_source=materials.derived_source,
+                       mode=mode))
+    with _plan_hash_cache_lock:
+        if key in _plan_hash_cache:
+            _plan_hash_cache.move_to_end(key)
+            return _plan_hash_cache[key]
+    try:
+        if mode == 'legacy':
+            # 兼容无并发干扰的稳定旧 LRU 变体；不枚举任意并发命中轨迹。
+            text = _legacy_text_reader()
+            try:
+                _plan(root, materials.original_relpath, **options, _legacy_text=text, _data=data)
+            except ReadingMaterialError as exc:
+                # 文字缓存已预热；第一遍冷态体积超限不代表稳定旧变体超限。
+                if exc.code != 'budget_exceeded':
+                    raise
+            expected, _ = _plan(root, materials.original_relpath, **options,
+                                _legacy_text=text, _data=data)
+        else:
+            expected, _ = _plan(root, materials.original_relpath, **options, _data=data)
+        if materials.derived_source is not None:
+            expected = replace(expected, derived_source=materials.derived_source)
+        result = expected.manifest_hash
+    except ReadingMaterialError as exc:
+        # clean 分段体积可能超预算而旧变体仍合法；各算法独立执行全部预算检查。
+        if exc.code != 'budget_exceeded':
+            raise
+        result = None
+    with _plan_hash_cache_lock:
+        _plan_hash_cache[key] = result
+        _plan_hash_cache.move_to_end(key)
+        while len(_plan_hash_cache) > 128:
+            _plan_hash_cache.popitem(last=False)
+    return result
+
+
 def verify_pdf_materials(root, materials):
     """重新校验原件、材料、预算及映射；只读，不重建缺失材料。
 
@@ -398,7 +474,8 @@ def verify_pdf_materials(root, materials):
     if (not isinstance(materials, PreparedPdf) or type(materials.schema_version) is not int
             or materials.schema_version != 1):
         raise ReadingMaterialError("invalid_manifest", "未知 PDF 材料清单版本")
-    if _hash(_read(root, materials.original_relpath)) != materials.original_hash:
+    data = _read(root, materials.original_relpath)
+    if _hash(data) != materials.original_hash:
         raise ReadingMaterialError("material_tampered", "PDF 原件哈希不匹配")
     if materials.derived_source is not None:
         _verify_derived_source(root, materials)
@@ -407,13 +484,9 @@ def verify_pdf_materials(root, materials):
     for segment in materials.segments:
         if _hash(_read(root, segment.material_relpath)) != segment.material_hash:
             raise ReadingMaterialError("material_tampered", "PDF 阅读材料哈希不匹配")
-    expected, _ = _plan(root, materials.original_relpath, document_id=materials.document_id,
-                        revision_id=materials.revision_id, parse_id=materials.parse_id,
-                        config_revision=materials.config_revision, target_pages=materials.target_pages,
-                        budget=materials.budget, overlap_pages=materials.overlap_pages)
-    if materials.derived_source is not None:
-        expected = replace(expected, derived_source=materials.derived_source)
-    if materials.manifest_hash != expected.manifest_hash:
+    actual = materials.manifest_hash
+    if (actual != _expected_manifest_hash(root, materials, data, 'clean')
+            and actual != _expected_manifest_hash(root, materials, data, 'legacy')):
         raise ReadingMaterialError("invalid_manifest", "材料版本、映射、位置或预算与原件不一致")
     return materials
 
@@ -637,6 +710,10 @@ def prepare_pdf_region(root, materials, page, region, *, scale=3, max_pixels=4_0
     return verify_pdf_materials(root, result)
 
 
+_region_hash_cache = OrderedDict()
+_region_hash_cache_lock = RLock()
+
+
 def _verify_pdf_region(root, materials):
     try:
         supplement = materials.region_supplement
@@ -648,10 +725,26 @@ def _verify_pdf_region(root, materials):
         payload = _read(root, materials.segments[0].material_relpath)
         if _hash(payload) != materials.segments[0].material_hash:
             raise ReadingMaterialError("material_tampered", "局部 PDF 哈希不匹配")
+        import PIL
+        import pypdfium2 as pdfium
+        # 上层每次已重读原件并确认 actual hash；这里只缓存完整重渲染比对结果。
+        key = _digest(dict(manifest_hash=materials.manifest_hash, original_hash=materials.original_hash,
+                           pypdf=pypdf.__version__, zlib=zlib.ZLIB_RUNTIME_VERSION,
+                           pdfium=str(pdfium.version.PDFIUM_INFO),
+                           binding=str(pdfium.version.PYPDFIUM_INFO), pillow=PIL.__version__))
+        with _region_hash_cache_lock:
+            if key in _region_hash_cache:
+                _region_hash_cache.move_to_end(key)
+                return materials
         expected, expected_png, expected_pdf = _plan_region(root, materials, supplement["source_page"],
                                                           supplement["region"], **supplement["limits"])
         if (materials.manifest_hash != expected.manifest_hash or png != expected_png or payload != expected_pdf):
             raise ReadingMaterialError("invalid_manifest", "局部图像、映射、引擎或预算与源页重渲染不一致")
+        with _region_hash_cache_lock:
+            _region_hash_cache[key] = materials.manifest_hash
+            _region_hash_cache.move_to_end(key)
+            while len(_region_hash_cache) > 128:
+                _region_hash_cache.popitem(last=False)
     except (KeyError, TypeError, IndexError, ValueError) as exc:
         if isinstance(exc, ReadingMaterialError):
             raise

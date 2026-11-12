@@ -362,6 +362,11 @@ def test_first_round_failure_never_sends_pdf_and_records_unknown(tmp_path, monke
         record = json.loads(db.execute('SELECT record FROM reading_capabilities').fetchone()[0])
     assert record['state'] == 'unknown' and record['probe_version'] == 4
     assert 'private endpoint' not in json.dumps(record)
+    expected_code = ('capability_probe_call_failed' if case == 'error' else
+                     'unknown_error' if case == 'exception' else
+                     'capability_probe_call_missing' if case in ('no_call', 'multiple', 'truncated') else
+                     'capability_probe_call_invalid')
+    assert record['diagnostic']['error_code'] == expected_code
 
 
 def test_synthetic_supported_proof_not_inherited(tmp_path, probe_transport):
@@ -430,3 +435,178 @@ def test_small_fixture_supported_proof_not_inherited(tmp_path, probe_transport):
         db.execute('INSERT INTO reading_capabilities VALUES(?,?)', (_key(identity), json.dumps(record)))
     assert ensure_pdf_capability(tmp_path, model, revision)
     assert len(probe_transport) == 1
+
+
+@pytest.mark.parametrize('case,stage,reason,exception_type,delivery,chars,match', [
+    ('fixture', 'fixture', 'exception', 'OSError', [], 0, False),
+    ('first_error', 'request_call', 'exception', 'ToolMediaError', [], 0, False),
+    ('first_timeout', 'request_call', 'exception', 'TimeoutError', [], 0, False),
+    ('identity', 'verify_identity', 'identity_changed', None, [], 0, False),
+    ('second_error', 'media_request', 'stream_error', None, ['sent', 'unknown'], 0, False),
+    ('second_exception', 'media_request', 'exception', 'ConnectionError', ['sent'], 2, False),
+    ('custom_exception', 'media_request', 'exception', 'OtherError', ['sent'], 0, False),
+    ('mismatch', 'verify_result', 'answer_mismatch', None, ['sent', 'completed'], 6, False),
+    ('no_delivery', 'verify_result', 'delivery_incomplete', None, [], 6, True),
+    ('late_unknown', 'verify_result', 'delivery_incomplete', None, ['sent', 'completed', 'unknown'], 6, True),
+    ('unsafe_delivery', 'verify_result', 'delivery_incomplete', None, ['sent', 'completed', 'other'], 6, True),
+    ('success', 'verify_result', 'verified', None, ['sent', 'completed'], 8, True),
+])
+def test_safe_diagnostic_locates_probe_failure(tmp_path, monkeypatch, case, stage, reason,
+                                            exception_type, delivery, chars, match):
+    from agent.knowledge.personal_assistant import SourceService
+    import agent.knowledge.reading_capabilities as capabilities
+    # 同时污染异常名、详情、流式错误、答案及回执；只允许固定枚举进入诊断。
+    from common.log import logger
+    secret = 'https://secret.invalid/token D:/private/document.pdf payload-secret'
+    unsafe_error = type('PrivatePayloadSecret', (Exception,), {})
+    logs, rounds = [], []
+    monkeypatch.setattr(logger, 'info', lambda *args, **kwargs: logs.append((args, kwargs)))
+    monkeypatch.setattr('secrets.randbelow', lambda n: 372913)
+
+    def fixture(code):
+        if case == 'fixture':
+            raise OSError(secret)
+        return b'%PDF-test'
+
+    class Model(ProbeModel):
+        def call_stream(self, request):
+            rounds.append('first')
+            if case == 'first_error':
+                yield {'error': {'message': secret, 'code': secret}}
+                return
+            if case == 'first_timeout':
+                raise TimeoutError(secret)
+            yield from super().call_stream(request)
+            if case == 'identity':
+                self.model = 'changed'
+
+    def transport(model, request, pending):
+        rounds.append('second')
+        ref = next(iter(pending.values()))[0]
+        if case == 'no_delivery':
+            yield {'choices': [{'delta': {'content': '472913'}}]}
+            return
+        ref.on_delivery('sent')
+        if case == 'second_error':
+            ref.on_delivery('unknown')
+            yield {'error': {'message': secret, 'code': secret}, 'payload': secret}
+            return
+        if case == 'second_exception':
+            yield {'choices': [{'delta': {'content': '47'}}]}
+            raise ConnectionError(secret)
+        if case == 'custom_exception':
+            raise unsafe_error(secret)
+        ref.on_delivery('completed')
+        if case in ('late_unknown', 'unsafe_delivery'):
+            ref.on_delivery('unknown' if case == 'late_unknown' else secret)
+        yield {'choices': [{'delta': {'content': '628145' if case == 'mismatch' else ' 472913 ' if case == 'success' else '472913'}}]}
+
+    monkeypatch.setattr(capabilities, '_probe_pdf', fixture)
+    monkeypatch.setattr('agent.protocol.tool_media.stream_with_tool_media', transport)
+    assert ensure_pdf_capability(tmp_path, Model(), capture_config_revision()) == (case == 'success')
+    with SourceService(tmp_path).transaction() as db:
+        record = json.loads(db.execute('SELECT record FROM reading_capabilities').fetchone()[0])
+    diagnostic = record['diagnostic']
+    error_code = (dict(first_error='capability_probe_call_failed', identity='capability_probe_config_changed')
+                  .get(case, 'unknown_error') if stage != 'verify_result' else None)
+    assert diagnostic == dict(stage=stage, reason=reason, exception_type=exception_type,
+                              error_code=error_code,
+                              delivery=delivery, delivery_count=len(delivery),
+                              response_chars=chars, exact_match=match)
+    assert logs == [(('PDF能力探测 %s', diagnostic), {})]
+    assert {'identity', 'endpoint', 'endpoint_hash', 'api_base', 'payload', 'message'}.isdisjoint(diagnostic)
+    encoded = json.dumps(logs, ensure_ascii=False)
+    for forbidden in (secret, 'PrivatePayloadSecret', '472913', '628145', 'offline.invalid',
+                      'endpoint_hash', 'payload', 'call_model_generated'):
+        assert forbidden not in encoded
+    assert secret not in json.dumps(record)
+    assert rounds == ([] if case == 'fixture' else ['first'] if stage in ('request_call', 'verify_identity')
+                      else ['first', 'second'])
+
+
+def test_historical_v4_supported_without_diagnostic_is_reused(tmp_path, monkeypatch):
+    from agent.knowledge.personal_assistant import SourceService
+    import agent.knowledge.reading_capabilities as capabilities
+    model = ProbeModel()
+    revision = capture_config_revision()
+    identity = capability_identity(model, revision)
+    record = dict(schema_version=1, probe_version=4, identity=identity, state='supported',
+                  verified_image=True, fixture_profile=capabilities._FIXTURE_PROFILE)
+    with SourceService(tmp_path).transaction() as db:
+        db.execute('CREATE TABLE reading_capabilities(id TEXT PRIMARY KEY,record TEXT)')
+        db.execute('INSERT INTO reading_capabilities VALUES(?,?)', (capabilities._key(identity), json.dumps(record)))
+    monkeypatch.setattr(capabilities, '_probe_pdf', lambda code: pytest.fail('历史凭据不得重新探测'))
+    assert ensure_pdf_capability(tmp_path, model, revision)
+    with SourceService(tmp_path).transaction() as db:
+        assert json.loads(db.execute('SELECT record FROM reading_capabilities').fetchone()[0]) == record
+
+
+def test_diagnostic_bounds_delivery_and_never_records_answer(tmp_path, monkeypatch):
+    from agent.knowledge.personal_assistant import SourceService
+    import agent.knowledge.reading_capabilities as capabilities
+    from common.log import logger
+    answer = 'https://private.invalid D:/private/answer.pdf payload-secret 472913'
+    logged = []
+    monkeypatch.setattr(logger, 'info', lambda message, diagnostic: logged.append(diagnostic))
+    monkeypatch.setattr(capabilities, '_probe_pdf', lambda code: b'%PDF-test')
+    def transport(model, request, pending):
+        ref = next(iter(pending.values()))[0]
+        for state in ['sent', 'completed'] + [answer] * 20:
+            ref.on_delivery(state)
+        yield {'choices': [{'delta': {'content': answer}}]}
+    monkeypatch.setattr('agent.protocol.tool_media.stream_with_tool_media', transport)
+    assert not ensure_pdf_capability(tmp_path, ProbeModel(), capture_config_revision())
+    with SourceService(tmp_path).transaction() as db:
+        record = json.loads(db.execute('SELECT record FROM reading_capabilities').fetchone()[0])
+    diagnostic = record['diagnostic']
+    assert diagnostic['delivery'] == ['sent', 'completed', 'other', 'other']
+    assert diagnostic['delivery_count'] == 22
+    assert diagnostic['response_chars'] == len(answer)
+    assert diagnostic['exact_match'] is False
+    assert diagnostic['reason'] == 'delivery_incomplete'
+    assert logged == [diagnostic]
+    assert answer not in json.dumps(record)
+    assert answer not in json.dumps(logged)
+
+
+@pytest.mark.parametrize('origin,code,expected', [
+    ('exception', 'capability_probe_call_failed', 'capability_probe_call_failed'),
+    ('exception', 'capability_probe_call_missing', 'capability_probe_call_missing'),
+    ('exception', 'capability_probe_call_invalid', 'capability_probe_call_invalid'),
+    ('exception', 'capability_probe_config_changed', 'capability_probe_config_changed'),
+    ('exception', 'capability_probe_call_failed https://secret.invalid private-payload', 'unknown_error'),
+    ('subclass', 'capability_probe_call_missing', 'unknown_error'),
+    ('chunk', 'attachment_unsupported', 'attachment_unsupported'),
+    ('chunk', 'media_context_lost', 'media_context_lost'),
+    ('chunk', 'media_request_timeout', 'media_request_timeout'),
+    ('chunk', 'attachment_unsupported https://secret.invalid private-payload', 'unknown_error'),
+    ('chunk', {'message': 'private-payload'}, 'unknown_error'),
+])
+def test_safe_error_code_allowlist(tmp_path, monkeypatch, origin, code, expected):
+    from agent.knowledge.personal_assistant import SourceService
+    from agent.protocol.tool_media import ToolMediaError
+    from common.log import logger
+    import agent.knowledge.reading_capabilities as capabilities
+    logs = []
+    monkeypatch.setattr(logger, 'info', lambda message, diagnostic: logs.append(diagnostic))
+    monkeypatch.setattr(capabilities, '_probe_pdf', lambda code: b'%PDF-test')
+    class UnsafeSubclass(ToolMediaError):
+        pass
+    def first(model):
+        raise (UnsafeSubclass if origin == 'subclass' else ToolMediaError)(code)
+    def transport(model, request, pending):
+        yield {'error': {'code': code, 'message': 'https://secret.invalid private-payload'},
+               'payload': 'private-payload'}
+    if origin in ('exception', 'subclass'):
+        monkeypatch.setattr(capabilities, '_request_probe_call', first)
+    monkeypatch.setattr('agent.protocol.tool_media.stream_with_tool_media', transport)
+    assert not ensure_pdf_capability(tmp_path, ProbeModel(), capture_config_revision())
+    with SourceService(tmp_path).transaction() as db:
+        record = json.loads(db.execute('SELECT record FROM reading_capabilities').fetchone()[0])
+    diagnostic = record['diagnostic']
+    assert diagnostic['error_code'] == expected
+    assert diagnostic['stage'] == ('media_request' if origin == 'chunk' else 'request_call')
+    assert logs == [diagnostic]
+    for forbidden in ('secret.invalid', 'private-payload', 'UnsafeSubclass'):
+        assert forbidden not in json.dumps(record)
+        assert forbidden not in json.dumps(logs)

@@ -292,8 +292,11 @@ class OpenAICompatibleBot:
             reasoning_effort=self._responses_reasoning_effort(model_name, kwargs),
             response_format=kwargs.get("response_format"),
         )
+        from agent.protocol.tool_media import current_tool_media
         cache_key = self._responses_prompt_cache_key(model_name, api_config, kwargs)
-        if cache_key:
+        # 部分网关把文字缓存路由复用于含文件的请求，会在发送媒体后提前断流。
+        # 媒体轮次独立路由，纯文本轮次仍沿用原键；不重发已消费的媒体。
+        if cache_key and not current_tool_media():
             payload["prompt_cache_key"] = cache_key
         api_key = api_config.get("api_key")
         api_base = api_config.get("api_base")

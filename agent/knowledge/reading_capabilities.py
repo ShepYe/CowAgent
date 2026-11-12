@@ -4,12 +4,21 @@ import json
 import secrets
 
 from agent.knowledge.personal_assistant import SourceService
+from common.log import logger
 
 _PROBE_SYSTEM = '先调用read_probe获取无敏感PDF，再只输出PDF图像里的六位数字；看不清输出unknown。'
 _PROBE_TOOLS = [dict(name='read_probe', description='获取无敏感能力测试PDF',
                      input_schema={'type': 'object', 'properties': {}, 'additionalProperties': False})]
 _PROBE_USER = dict(role='user', content='请调用read_probe并读取测试图像。')
 _FIXTURE_PROFILE = 'p01-900x600-arial64-shapes-120dpi-v1'
+_SAFE_ERROR_CODES = frozenset((
+    'capability_probe_call_failed', 'capability_probe_call_missing',
+    'capability_probe_call_invalid', 'capability_probe_config_changed',
+    'attachment_unsupported', 'invalid_tool_media', 'media_validation_failed',
+    'media_context_lost', 'media_receipt_failed', 'media_response_checkpoint_failed',
+    'media_request_timeout', 'media_request_rejected', 'media_request_failed',
+    'reading_budget_exceeded', 'rate_limited',
+))
 
 
 def _probe_output_budget(model):
@@ -175,12 +184,18 @@ def _ensure_pdf_capability(workspace, model, revision):
 
     ref = ToolMediaReference(load, supports, states.append)
     text, error = '', False
+    stage, reason, exception_type = 'fixture', None, None
+    error_code = None
     try:
         raw = _probe_pdf(code)
+        stage = 'request_call'
         assistant = _request_probe_call(model)
         # 首轮后再次核验实际模型／Provider，不能借用其间变化的客户端。
+        stage = 'verify_identity'
         if capability_identity(model, revision) != identity:
+            reason = 'identity_changed'
             raise ToolMediaError('capability_probe_config_changed')
+        stage = 'media_request'
         call = next(item for item in assistant['content'] if item.get('type') == 'tool_use')
         call_id = call['id']
         request = LLMRequest(system=_PROBE_SYSTEM,
@@ -188,16 +203,45 @@ def _ensure_pdf_capability(workspace, model, revision):
                 dict(type='tool_result', tool_use_id=call_id, content='本次能力测试图像')])],
             tools=_PROBE_TOOLS, max_tokens=_probe_output_budget(model), stream=True)
         for chunk in stream_with_tool_media(model, request, {call_id: (ref,)}):
+            if chunk.get('error') and error_code in (None, 'unknown_error'):
+                detail = chunk['error']
+                candidate = detail.get('code') if type(detail) is dict else None
+                error_code = (candidate if type(candidate) is str and candidate in _SAFE_ERROR_CODES
+                              else 'unknown_error')
             error = error or bool(chunk.get('error'))
             for choice in chunk.get('choices') or []:
                 text += choice.get('delta', {}).get('content') or ''
-    except Exception:
+        if error:
+            reason = 'stream_error'
+    except Exception as exc:
         error = True
+        # 仅此受信精确类型允许把完整字符串与固定码比对；绝不记录原文。
+        candidate = str(exc) if type(exc) is ToolMediaError else None
+        error_code = candidate if candidate in _SAFE_ERROR_CODES else 'unknown_error'
+        if reason != 'identity_changed':
+            reason = 'exception'
+            # 只按精确类型查白名单；不读取异常详情、动态类名或服务端字段。
+            exception_type = {
+                TimeoutError: 'TimeoutError', ConnectionError: 'ConnectionError',
+                OSError: 'OSError', ValueError: 'ValueError', TypeError: 'TypeError',
+                ToolMediaError: 'ToolMediaError',
+            }.get(type(exc), 'OtherError')
     # completed 后出现错误／unknown 也不能形成支持凭据。
     state = 'supported' if not error and states == ['sent', 'completed'] and text.strip() == code else 'unknown'
+    if not error:
+        stage = 'verify_result'
+        reason = ('delivery_incomplete' if states != ['sent', 'completed'] else
+                  'verified' if state == 'supported' else 'answer_mismatch')
+    # 诊断与凭据隔离：不包含 identity、URL、路径、请求/回答内容或随机码。
+    # 回执仅展示前四项固定枚举，总数用于识别异常序列，不能放宽支持判据。
+    diagnostic = dict(stage=stage, reason=reason, exception_type=exception_type, error_code=error_code,
+        delivery=[item if type(item) is str and item in ('sent', 'completed', 'unknown') else 'other'
+                  for item in states[:4]], delivery_count=len(states),
+        response_chars=len(text), exact_match=text.strip() == code)
     with service.transaction() as db:
         db.execute('INSERT OR REPLACE INTO reading_capabilities VALUES(?,?)', (key, json.dumps(
             dict(schema_version=1, probe_version=4, identity=identity, state=state,
                  fixture_profile=_FIXTURE_PROFILE,
-                 verified_image=state == 'supported'))))
+                 verified_image=state == 'supported', diagnostic=diagnostic))))
+    logger.info('PDF能力探测 %s', diagnostic)
     return state == 'supported'

@@ -98,7 +98,8 @@ class KnowledgeIngest(BaseTool):
         self.params = copy.deepcopy(type(self).params)
         properties = self.params['properties']
         properties.update(reading_submission_id={'type': 'string'}, reading_evidence={
-            'type': 'array', 'items': {'type': 'object', 'properties': {
+            'type': 'array', 'description': '只提交本批正文sources实际引用的阅读别名，须一一对应。已读但未引用的页仅保留在reading_coverage，不提交多余观察。',
+            'items': {'type': 'object', 'properties': {
                 'reading_id': {'type': 'string'}, 'evidence_key': {'type': 'string'},
                 'segment_id': {'type': 'string'}, 'location': {'type': 'object'},
                 'observation': {'type': 'string'},
@@ -386,8 +387,11 @@ class KnowledgeIngest(BaseTool):
                         raise SourceError('invalid_request', '出处须为四元身份或互斥阅读别名')
         if not isinstance(evidence, list) or any(not isinstance(e, dict) for e in evidence):
             raise SourceError('invalid_request', '阅读观察数组无效')
-        if wanted != {(e.get('reading_id'), e.get('evidence_key')) for e in evidence}:
-            raise SourceError('invalid_request', '图文观察与正文出处不对应')
+        provided = {(e.get('reading_id'), e.get('evidence_key')) for e in evidence}
+        if wanted != provided:
+            raise SourceError('invalid_request',
+                f'图文观察与正文出处不对应：缺少{len(wanted - provided)}个，额外{len(provided - wanted)}个。'
+                'reading_evidence只提交正文sources实际引用的别名；已读范围保留在reading_coverage。')
         with store.commit_guard(task['owner_id'], task['task_id'], task['attempt']):
             current = store.get(task['owner_id'], task['task_id'])
             submissions = dict(current.get('reading_tool_submissions') or {})
