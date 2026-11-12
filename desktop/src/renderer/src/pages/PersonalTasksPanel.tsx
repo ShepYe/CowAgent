@@ -517,7 +517,7 @@ function ReferenceBrowser({ taskId, publishId, version, onClose }: { taskId: str
         <ReadingCopyLink reference={reference} taskId={taskId} publishId={publishId} />
       </div>
       <details><summary className="cursor-pointer text-sm">出处目录</summary><div className="flex flex-wrap gap-2 py-2">{reference.units.slice(Math.floor(ordinal / 50) * 50, Math.floor(ordinal / 50) * 50 + 50).map(unit => <button key={unit.ordinal} className={btn} onClick={() => setOrdinal(unit.ordinal)} aria-current={unit.ordinal === ordinal}>{unit.filename ? `${unit.filename} · ` : ''}{locationLabel(unit.location)}</button>)}</div></details>
-      <Markdown content={reference.text} />
+      <Markdown figures={{ ...reference, publish_id: publishId }} figureView="history" content={reference.text} />
     </>}
   </section>
 }

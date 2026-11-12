@@ -40,6 +40,7 @@ import type {
   KnowledgeCatalog,
   KnowledgeHistory,
   KnowledgeVersion,
+  KnowledgeFigures,
   WorkspaceEntry,
   WorkspaceReadResult,
   WorkspaceTree,
@@ -1429,6 +1430,14 @@ class ApiClient {
     })
   }
 
+  getKnowledgeFigureUrl(publishId: string, figureId: string, view: 'current' | 'history' = 'current', agentId?: string): string {
+    return this.withToken(`${this.baseUrl}${this.scoped(`/api/knowledge/figure?publish_id=${encodeURIComponent(publishId)}&figure_id=${encodeURIComponent(figureId)}&view=${view}`, agentId)}`)
+  }
+
+  getKnowledgeFigureOriginalUrl(publishId: string, figureKey: string, view: 'current' | 'history' = 'current', agentId?: string, material: 'original' | 'reading-copy' = 'original'): string {
+    return this.withToken(`${this.baseUrl}${this.scoped(`/api/knowledge/figure-original?publish_id=${encodeURIComponent(publishId)}&figure_key=${encodeURIComponent(figureKey)}&material=${material}&view=${view}`, agentId)}`)
+  }
+
   async getKnowledgeList(agentId?: string): Promise<KnowledgeList> {
     return this.request<{ status: string } & KnowledgeList>(this.scoped('/api/knowledge/list', agentId))
   }
@@ -1756,7 +1765,7 @@ export interface PersonalSourceAction {
   purpose?: 'long_term' | 'transient'
   request_id?: string
 }
-export interface PersonalReference {
+export interface PersonalReference extends KnowledgeFigures {
   type?: string
   origin?: string
   reading_id?: string

@@ -6,8 +6,8 @@ import Markdown from './Markdown'
 import { formatKnowledgeTime } from './KnowledgeHistory'
 import { scrollToKnowledgeAnchor, stripMatchingHeading } from '../lib/knowledgeNavigation'
 
-export function KnowledgeVersionContent({ version, onOpenCurrent, onInternalLink }: {
-  version: KnowledgeVersion; onOpenCurrent: (path: string, title: string) => void
+export function KnowledgeVersionContent({ version, onOpenCurrent, onInternalLink, agentId }: {
+  agentId?: string; version: KnowledgeVersion; onOpenCurrent: (path: string, title: string) => void
   onInternalLink: (href: string, sourcePath: string) => void
 }) {
   return <>
@@ -21,7 +21,7 @@ export function KnowledgeVersionContent({ version, onOpenCurrent, onInternalLink
           className="inline-flex items-center gap-1 rounded-btn border border-default px-2 py-1 text-accent hover:bg-accent-soft">查看当前有效版<ArrowUpRight size={12} /></button>}
       </div>
     </header>
-    <Markdown content={stripMatchingHeading(version.content, version.title)} onInternalLink={href => onInternalLink(href, version.path || '')} />
+    <Markdown figures={version} figureView="history" agentId={agentId} content={stripMatchingHeading(version.content, version.title)} onInternalLink={href => onInternalLink(href, version.path || '')} />
   </>
 }
 
@@ -35,17 +35,18 @@ export default function KnowledgeVersionView({ publishId, agentId, onBack, onOpe
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [retry, setRetry] = useState(0)
+  const backend = apiClient.getBaseUrl?.()
   useEffect(() => {
     let active = true
     setVersion(null); setLoading(true); setError('')
     apiClient.getKnowledgeVersion(publishId, agentId).then(result => {
-      if (!active) return
+      if (!active || backend !== apiClient.getBaseUrl?.()) return
       if (result.status !== 'success') throw new Error(result.message || '读取历史版本失败')
       setVersion(result.version)
     }).catch(e => { if (active) setError(e.message || '读取历史版本失败') })
       .finally(() => { if (active) setLoading(false) })
     return () => { active = false }
-  }, [publishId, agentId, retry])
+  }, [publishId, agentId, retry, backend])
   useEffect(() => {
     if (loading || !version || !anchor) return
     const timer = setTimeout(() => onAnchorResolved?.(scrollToKnowledgeAnchor(root.current, anchor)), 0)
@@ -55,6 +56,6 @@ export default function KnowledgeVersionView({ publishId, agentId, onBack, onOpe
     <button type="button" onClick={onBack} className="mb-5 inline-flex items-center gap-1 text-sm text-content-secondary hover:text-accent"><ArrowLeft size={14} />返回整理记录</button>
     {loading ? <div role="status" className="flex items-center gap-2 text-sm text-content-tertiary"><Loader2 size={16} className="animate-spin" />核验历史版本…</div>
       : error ? <div role="alert" className="flex gap-3 text-sm text-danger">{error}<button onClick={() => setRetry(v => v + 1)} className="underline">重试</button></div>
-        : version && <KnowledgeVersionContent version={version} onOpenCurrent={onOpenCurrent} onInternalLink={onInternalLink} />}
+        : version && <KnowledgeVersionContent agentId={agentId} version={version} onOpenCurrent={onOpenCurrent} onInternalLink={onInternalLink} />}
   </div>
 }

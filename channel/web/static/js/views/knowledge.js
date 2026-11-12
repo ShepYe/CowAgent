@@ -8,6 +8,7 @@
 let _knowledgeTreeData = [];
 let _knowledgeRootFiles = [];
 let _knowledgeCurrentFile = null;
+let _knowledgeDocumentSequence = 0;
 let _knowledgeGraphLoaded = false;
 // Which tab is selected, and whether the base has anything to show in it.
 // Both panels stay hidden behind the empty state until the list says there
@@ -835,7 +836,16 @@ function bindKnowledgeImages(container, baseDir) {
 function renderKnowledgeDoc(doc) {
     const bodyEl = document.getElementById('knowledge-viewer-body');
     if (!bodyEl) return;
-    bodyEl.innerHTML = renderMarkdown(doc.content || '');
+    bodyEl._disposeKnowledgeFigures?.();
+    const agentId = doc.agentId || viewingKnowledgeAgentId();
+    const env = {figures: doc, figureView: doc.figureView || 'current', agentId};
+    bodyEl.innerHTML = renderMarkdown(doc.content || '', env);
+    const sequence = _knowledgeDocumentSequence;
+    mountKnowledgeFigures(bodyEl, env, () => agentId === viewingKnowledgeAgentId() && sequence === _knowledgeDocumentSequence);
+    if (doc.publish_id) {
+        const history = document.createElement('button'); history.textContent = '历史版本'; history.className = 'knowledge-figure-state';
+        history.onclick = () => showKnowledgeFigureHistory(doc, agentId); bodyEl.prepend(history);
+    }
     applyHighlighting(bodyEl);
     bindKnowledgeLinks(bodyEl, doc.path);
     bindKnowledgeImages(bodyEl, doc.dir);
@@ -853,7 +863,10 @@ function openKnowledgeFile(path, title) {
     // Immediately hide placeholder
     document.getElementById('knowledge-content-placeholder').classList.add('hidden');
 
+    const scope = viewingKnowledgeAgentId();
+    const sequence = ++_knowledgeDocumentSequence;
     knowledgeReadDoc(path).then(data => {
+        if (sequence !== _knowledgeDocumentSequence || scope !== viewingKnowledgeAgentId() || path !== _knowledgeCurrentFile) return;
         document.getElementById('knowledge-viewer-path').textContent = path;
         document.getElementById('knowledge-content-viewer').classList.remove('hidden');
         knowledgeEditor.open({
@@ -862,6 +875,8 @@ function openKnowledgeFile(path, title) {
             content: data.content || '',
             // Absolute dir of the page, for resolving its relative image srcs.
             dir: data.dir,
+            page_id: data.page_id, publish_id: data.publish_id, figure_state: data.figure_state, figure_manifest: data.figure_manifest,
+            agentId: scope,
             editable: !!data.editable,
         });
 
@@ -1125,3 +1140,36 @@ function renderKnowledgeGraph(container, nodes, links) {
     container.appendChild(legendDiv);
 }
 
+
+
+async function openKnowledgeVersion(publishId) {
+    const scope = viewingKnowledgeAgentId(), sequence = ++_knowledgeDocumentSequence;
+    const result = await fetch(_kbUrl('/api/knowledge/version?publish_id=' + encodeURIComponent(publishId))).then(r => r.json());
+    if (sequence !== _knowledgeDocumentSequence || scope !== viewingKnowledgeAgentId() || result.status !== 'success') return;
+    const doc = {...result.version, figureView: 'history', agentId: scope, editable: false};
+    knowledgeEditor.open(doc);
+}
+
+async function showKnowledgeFigureHistory(doc, scope) {
+    const root = document.getElementById('knowledge-viewer-body');
+    const sequence = _knowledgeDocumentSequence;
+    const current = () => sequence === _knowledgeDocumentSequence && scope === viewingKnowledgeAgentId()
+        && root?.isConnected && root === document.getElementById('knowledge-viewer-body') && knowledgeEditor.current() === doc;
+    if (!current()) return;
+    let offset = 0, events = [], result;
+    do {
+        result = await fetch(_kbUrl('/api/knowledge/history?offset=' + offset + '&limit=200')).then(r => r.json());
+        if (!current()) return;
+        if (result.status !== 'success') return;
+        events.push(...result.events); offset += result.events.length;
+    } while (result.has_more && result.events.length);
+    const list = document.createElement('div'); list.className = 'knowledge-figure-state';
+    const ids = new Set();
+    for (const event of events) {
+        if (event.page_id !== doc.page_id || ids.has(event.publish_id)) continue;
+        ids.add(event.publish_id);
+        const button = document.createElement('button'); button.textContent = event.created_at + ' · ' + event.title;
+        button.style.display = 'block'; button.onclick = () => openKnowledgeVersion(event.publish_id); list.appendChild(button);
+    }
+    if (current()) root.prepend(list);
+}

@@ -97,3 +97,39 @@ def test_disk_failure_never_returns_accepted(tmp_path, monkeypatch):
     with pytest.raises(OSError):
         submit(store)
     assert TaskStore(tmp_path).list() == []
+
+
+@pytest.mark.parametrize('damage', ['missing_table', 'missing_task_id', 'missing_record'])
+def test_v3_missing_figure_structure_is_rejected_without_repair(tmp_path, damage):
+    store = TaskStore(tmp_path)
+    task = submit(store)
+    with sqlite3.connect(store.db) as db:
+        db.execute('PRAGMA user_version=3')
+        db.execute('DROP TABLE figure_publications')
+        if damage == 'missing_task_id':
+            db.execute('CREATE TABLE figure_publications(record TEXT NOT NULL)')
+        elif damage == 'missing_record':
+            db.execute('CREATE TABLE figure_publications(task_id TEXT PRIMARY KEY)')
+        before = db.execute("SELECT name,sql FROM sqlite_master ORDER BY name").fetchall()
+    with pytest.raises(TaskError, match='version_conflict'):
+        TaskStore(tmp_path)
+    with sqlite3.connect(store.db) as db:
+        assert db.execute('PRAGMA user_version').fetchone()[0] == 3
+        assert db.execute("SELECT name,sql FROM sqlite_master ORDER BY name").fetchall() == before
+        assert task['task_id'] == db.execute('SELECT id FROM tasks').fetchone()[0]
+
+
+def test_v3_unknown_child_version_is_preserved_and_rejected_on_read(tmp_path):
+    from agent.knowledge.figure_publication import _load
+    store = TaskStore(tmp_path)
+    task = submit(store)
+    with store._transaction() as db:
+        db.execute('PRAGMA user_version=3')
+        task['figure_publication'] = {'schema_version': 1}
+        store._save(db, task)
+        db.execute('INSERT INTO figure_publications VALUES(?,?)', (task['task_id'], '{"schema_version":99}'))
+    reopened = TaskStore(tmp_path)
+    with reopened._transaction() as db:
+        with pytest.raises(TaskError, match='version_conflict'):
+            _load(db, reopened._read(db, OWNER, task['task_id']))
+        assert db.execute('SELECT record FROM figure_publications').fetchone()[0] == '{"schema_version":99}'

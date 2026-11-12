@@ -19,7 +19,7 @@ Maintain a persistent, structured knowledge base in the `knowledge/` directory.
 3. 先查 `knowledge/index.md`，用 `memory_search/read` 找相关主题页及其当前版本；空库目录不存在时按新建主题继续。沿用当前有效分类，`category_mode=manual` 保持本人固定的选择；恢复自动后由后续整理判断。更新使用稳定 `page_id` 和当前 `page_version`。
 4. 实际用 `read` 读取授权附件，按 `has_more/next_offset/next_pages` 续读。返回 `reading_id` 时，直接阅读工具提供的 PDF；在紧接的响应中保存带位置的具体主题发现，或直接提交成品，然后再调用其他工具。媒体仅在这一轮提供，后轮复用自己的发现；无需全书逐页转写。一源可拆多页，多源可合一页。旧路线保留 `document_id/revision_id/parse_id/ordinal`，按 visual_continuation 补读缺口，显式 parse_id 保持原解析。仅分页读取已有文字用 visual=false；未读取图表保留缺口。
 5. 提炼知识正文，给清晰标题、分类、适用条件和关键结论，每个正文块附一处或多处真实出处。为每篇知识写一句 `summary`，说明该页主题、范围或用途，建议 30～60 字；依据本页正文，不重复标题，不加入正文没有的结论、数值或未核验图表解释。普通相关关系与作为论据的派生依赖分别登记。
-6. 提交 `knowledge_ingest` 的完整 `pages` 数组。每页结构：`{title,category,summary,blocks:[{content,sources:[{document_id,revision_id,parse_id,ordinal}]}],related_page_ids:[],depends_on:[{page_id,page_version}]}`。每页 `pages[].summary` 必填，去除首尾空白后为 1～160 个 Unicode 码点的单行纯文本，禁止换行及控制字符；任务顶层 `summary` 不能代替各页摘要。新增和更新正文都提交对应摘要；收到 invalid_request 时修正输入并重提，不截断摘要或以标题、分类、正文首段冒充。新页可省略 page_id；同批新建多个相关页时先各自指定稳定 page_id，再用 related_page_ids 关联同批页。更新页传 page_id 和 expected_version。相关链接目标须为已有页或同批创建页；派生依赖须为已核验发布版本。
+6. 提交 `knowledge_ingest` 的完整 `pages` 数组。每页结构：`{title,category,summary,blocks:[{content,sources:[{document_id,revision_id,parse_id,ordinal}],figures:[]}],related_page_ids:[],depends_on:[{page_id,page_version}]}`。配图按下方“知识配图”流程选择；每块显式提交 figures，无选图填 []。每页 `pages[].summary` 必填，去除首尾空白后为 1～160 个 Unicode 码点的单行纯文本，禁止换行及控制字符；任务顶层 `summary` 不能代替各页摘要。新增和更新正文都提交对应摘要；收到 invalid_request 时修正输入并重提，不截断摘要或以标题、分类、正文首段冒充。新页可省略 page_id；同批新建多个相关页时先各自指定稳定 page_id，再用 related_page_ids 关联同批页。更新页传 page_id 和 expected_version。相关链接目标须为已有页或同批创建页；派生依赖须为已核验发布版本。
 7. 受控发布维护来源、页版本、索引及日志，无需另用 write/edit 修改托管页和目录索引。`running` 继续处理；`pending_index` 接续索引。只有当前有效且索引核验通过的 searchable 回执才能报告可检索；视觉仍有缺口时单列未处理范围，不能称整份资料已完整理解。回复仅展示标题、分类、可读出处及状态，资料/版本/解析/发布编号和状态修订留在工具参数中。
 
 托管页位于 `knowledge/wiki/`，旧投影位于 `knowledge/managed/`，都通过受控发布维护。更正、撤回和用途改变调用 `knowledge_source_action(document_id,expected_state,reason,action)`；来源失效时受影响整页与派生页暂停。恢复长期资格后重新读取、整理和发布，不将资格恢复称为可检索。冲突时核对当前依据并重新整理。
@@ -34,6 +34,12 @@ XLSX先读单元格及 `spreadsheet` 结构，按 `worksheet` 和 `objects=[obje
 
 同次提交附 `reading_coverage:[{reading_id,segment_id}]`，只列已完成阅读和主题整理的批次。工具返回 running 时按 next_pages 继续剩余目标；部分主题可检索不等于整任务完成。已成功的批次和已保存观察直接复用，不重复发布。遇到 reading_incomplete、未知响应或取消，保留已发布成果与缺口，不能缩小目标后宣称完整成功。
 
+### 知识配图
+
+1. 选择支撑结论、方法或公式的关键原图，优先局部并保留标号、图例和必要文字。以已成功交付并保存具体观察的单页视觉出处为依据；局部扩大或整页兜底前，用原件 `read` 补读目标范围并保存成功观察，再提交选图。
+2. 在对应正文块提交 `figures:[{figure_key,caption,source,region}]`。source 沿用该块 sources 中的四元出处或 `{reading_id,evidence_key}`；region 为归一化矩形，省略表示整页。figure_key 同页唯一，去首尾空白后 1～128 码点；caption 为 1～512 码点单行纯文本。图片由程序生成，正文中的图片逻辑引用由发布器插入。
+3. 收到 `figure_state=pending` 或 `figure_incomplete` 时保留已发布正文及选图目标，按工具回执接续补图；显式 [] 仅表示该块原本无选图。图文目标全部就绪且任务完成回执通过后，再报告整理完成；预算耗尽则报告“正文已发布，待补图”及缺口。
+
 ### 2. Synthesize — Conversation produces valuable structured knowledge
 
 1. 有接收任务的对话结论沿用上述受控整理与来源关联。普通会话引用托管资料产生的新结论，调用 knowledge_ingest(purpose=long_term,pages,reason)（省略 task_id）受控发布，保留真实出处及 depends_on；检索问答本身无需重复收录。普通无来源对话知识沿用下列目录约定，记录对话出处；临时任务及派生内容始终排除。
@@ -46,6 +52,7 @@ XLSX先读单元格及 `spreadsheet` 结构，按 `worksheet` 和 `objects=[obje
 1. Check `knowledge/index.md` in context to select pages. Large indexes contain summary previews of at most 40 characters marked truncated and may omit complete entries with a count. Previews only help select pages. 按需用 `read` 的 offset/limit 分页读取完整索引，或 `memory_search` 找页；缩略摘要只供选页，不作为事实依据。
 2. Read selected pages' full bodies and currently valid original sources with `read`, checking versions and source locations before answering. Follow pagination when needed; do not answer from summary previews or search snippets alone.
 3. 回读当前有效原文，回答提供知识页及足以定位原件的出处。PDF 用物理页，DOCX 用段落/表格，XLSX 用工作表/单元格；缓存缺失不猜公式值。失效或撤回页不能作为有效依据；旧页缺摘要时直接读正文，不猜摘要。图谱只表示知识关系，不代替原件或成功回执。
+4. 图注可帮助找图；涉及图中标号、连线或布局时，调用 `read(path="knowledge-figure:<publish_id>/<figure_id>")`，以紧接响应中的实际 PNG 观察作答。历史回看显式附 `?view=history` 并说明历史身份。`visual=false`、媒体能力不足或核验失败时，明确“未看图”，保留视觉细节缺口。
 
 ## Page Format
 

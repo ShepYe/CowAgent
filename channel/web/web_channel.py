@@ -46,6 +46,7 @@ from channel.web.api.knowledge import (  # noqa: F401
     KnowledgeActionHandler, KnowledgeGraphHandler, KnowledgeImportHandler,
     KnowledgeListHandler, KnowledgeReadHandler,
     KnowledgeCatalogHandler, KnowledgeHistoryHandler, KnowledgeVersionHandler,
+    KnowledgeFigureHandler, KnowledgeFigureOriginalHandler,
 )
 from channel.web.api.personal import (  # noqa: F401
     PersonalTasksHandler, PersonalTaskHandler, PersonalOriginalHandler,
@@ -173,6 +174,8 @@ URLS = (
     '/api/knowledge/catalog', 'KnowledgeCatalogHandler',
     '/api/knowledge/history', 'KnowledgeHistoryHandler',
     '/api/knowledge/version', 'KnowledgeVersionHandler',
+    '/api/knowledge/figure', 'KnowledgeFigureHandler',
+    '/api/knowledge/figure-original', 'KnowledgeFigureOriginalHandler',
     '/api/knowledge/read', 'KnowledgeReadHandler',
     '/api/knowledge/graph', 'KnowledgeGraphHandler',
     '/api/knowledge/action', 'KnowledgeActionHandler',

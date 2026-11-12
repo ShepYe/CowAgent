@@ -33,7 +33,7 @@ def recover():
     for r in records:
         if r["status"] == "needs_reconcile":
             # 知识发布的恢复由知识登记核对；不盲目重新调用模型。
-            if "reading_publication" in r or r.get("wiki_batch_id") or r.get("source_candidates") or r.get("attachment_decisions") or r["stage"] in {"receive", "download", "decide"}:
+            if "figure_publication" in r or "reading_publication" in r or r.get("wiki_batch_id") or r.get("source_candidates") or r.get("attachment_decisions") or r["stage"] in {"receive", "download", "decide"}:
                 r = store._change(OWNER, r["task_id"], r["attempt"], {"needs_reconcile"}, status="queued")
             else:
                 store.fail(OWNER, r["task_id"], r["attempt"], "needs_reconcile", r["stage"])
@@ -73,18 +73,36 @@ def _run(task_id):
         require_config_revision(task["config_revision"])
         decisions = task.get("attachment_decisions") or {}
         fully_decided = bool(decisions) and len(decisions) == len(task["attachments"]) and all(d.get("ready") for d in decisions.values())
+        if "figure_publication" in task:
+            from agent.knowledge.figure_publication import resume_publication as resume_figures
+            store.stage(OWNER, task_id, running_attempt, "publish")
+            task = resume_figures(store, task)
         if "reading_publication" in task:
             # 只从受信持久检查点恢复阅读登记，不能采用模型工具参数中的目录。
             from agent.knowledge.reading import ReadingService
             workspaces = {d["workspace"] for d in decisions.values() if d.get("workspace")}
             if not workspaces and task.get("wiki_workspace"):
                 workspaces.add(task["wiki_workspace"])
-            for workspace in sorted(workspaces):
-                ReadingService(workspace, task_store=store).resume_all(task)
+            from agent.knowledge.reading_publication import publication_state as reading_state
+            if reading_state(store, task)["remaining"]:
+                for workspace in sorted(workspaces):
+                    ReadingService(workspace, task_store=store).resume_all(task)
             from agent.knowledge.reading_publication import resume_publication as resume_reading
             task = resume_reading(store, task)
             if task["status"] == "succeeded":
                 _notify(store, task, "资料索引与发布已完成，可检索。")
+                return
+        elif "figure_publication" in task:
+            from agent.knowledge.figure_publication import check_complete
+            try:
+                with store.commit_guard(OWNER, task_id, running_attempt):
+                    check_complete(store, task)
+                    task = store.complete(OWNER, task_id, running_attempt, "published", [])
+            except TaskError as exc:
+                if exc.code != "figure_incomplete":
+                    raise
+            if task["status"] == "succeeded":
+                _notify(store, task, "图文资料已发布，可检索。")
                 return
         elif task.get("wiki_batch_id") or task.get("source_candidates") or fully_decided:
             from agent.tools.knowledge_ingest import resume_publication
@@ -110,7 +128,7 @@ def _run(task_id):
         task = store.get(OWNER, task_id)
         if task["attachments"] and origin.get("channel") == "feishu":
             _notify(store, task, f"原件已保存，正在整理。任务 {task_id}。")
-        store.stage(OWNER, task_id, task["attempt"], "decide")
+        store.stage(OWNER, task_id, task["attempt"], "publish" if "figure_publication" in task else "decide")
         response = run_agent(task)
         task = store.get(OWNER, task_id)
         if task["attempt"] != running_attempt:
@@ -119,12 +137,22 @@ def _run(task_id):
             _notify(store, task, "任务已取消。原始记录与附件保留。")
             return
         if task["status"] == "running":
+            if "figure_publication" in task:
+                from agent.knowledge.figure_publication import resume_publication as resume_figures
+                task = resume_figures(store, task)
             if "reading_publication" in task:
                 from agent.knowledge.reading_publication import resume_publication as resume_reading
                 task = resume_reading(store, task)
                 if task["status"] == "running":
-                    store.fail(OWNER, task_id, running_attempt, "reading_incomplete", "parse")
-                    response = "阅读范围尚未全部完成，已发布成果保留，可继续重试。"
+                    from agent.knowledge.reading_publication import publication_state as reading_state
+                    if ("figure_publication" in task or "figure_requirement" in task.get("payload", {})) and not reading_state(store, task)["remaining"]:
+                        store.fail(OWNER, task_id, running_attempt, "figure_incomplete", "publish")
+                        response = "正文已发布，待补图或重核依赖，可继续重试。"
+                    else:
+                        store.fail(OWNER, task_id, running_attempt, "reading_incomplete", "parse")
+                        response = "阅读范围尚未全部完成，已发布成果保留，可继续重试。"
+            elif "figure_publication" in task or "figure_requirement" in task.get("payload", {}):
+                store.complete(OWNER, task_id, running_attempt, "published", [])
             elif task["attachments"]:
                 # 只有 Agent 明确调用 waiting 才向用户追问；缺少整理成品属于处理未完成。
                 store.fail(OWNER, task_id, task["attempt"], "organization_incomplete", "publish")
@@ -142,8 +170,10 @@ def _run(task_id):
             from common.log import logger
             logger.warning('[PersonalTask] task=%s attempt=%s stage=%s failed code=%s',
                            task_id, task['attempt'], task['stage'], code)
-            store.fail(OWNER, task_id, task["attempt"], code, task["stage"])
-            _notify(store, store.get(OWNER, task_id), f"处理未完成：{code}。任务 {task_id} 可在桌面查看或重试。")
+            stage = "publish" if code == "figure_incomplete" else task["stage"]
+            store.fail(OWNER, task_id, task["attempt"], code, stage)
+            text = "正文已发布，待补图或重核依赖，可继续重试。" if code == "figure_incomplete" else f"处理未完成：{code}。任务 {task_id} 可在桌面查看或重试。"
+            _notify(store, store.get(OWNER, task_id), text)
     finally:
         with _lock:
             _active.discard(task_id)
@@ -162,12 +192,23 @@ def run_agent(task):
         query += ("\n[系统阅读目标] 继续未完成范围；已成功发布的批次不得重复提交。目标不可缩小。\n"
                   + json.dumps({"targets": state["targets"], "remaining": state["remaining"],
                                 "result_refs": task["result_refs"]}, ensure_ascii=False))
+    if "figure_publication" in task or "figure_requirement" in task.get("payload", {}):
+        import json
+        from agent.knowledge.figure_publication import publication_state as figure_state
+        state = figure_state(TaskStore(), task)
+        query += ("\n[系统配图目标] 每个正文块必须显式提供 figures 数组；无图用 figures: []。"
+                  "正文已发布的 pending 目标只补缺图，复用成功阅读与可靠正文，不重新生成全文。"
+                  "目标内暂停的下游须按依赖拓扑重核真实来源后发布，不能只改依赖版本冒充核验。"
+                  "目标外暂停须如实报告。工具回执未完成时不得宣称整任务成功。\n"
+                  + json.dumps(state, ensure_ascii=False))
     if task["attachments"]:
         import json
         query += ("\n[系统接收记录] task_id=" + task["task_id"] +
                   "\n附件已可靠保存。根据用户上下文自主判断用途，分享资料主动整理，无需逐份询问。"
                   "先读取 knowledge-wiki 技能正文及资料，调用 knowledge_ingest 登记用途；长期资料须继续提炼、分类、命名，"
-                  "以 pages 正文块、每页必填的一句话 summary 与真实出处完成受控发布，支持拆页、跨来源和更新已有页。organization_required 表示须继续整理。"
+                  "以 pages 正文块、每页必填的一句话 summary 与真实出处完成受控发布，支持拆页、跨来源和更新已有页。"
+                  "新图文整理每个正文块显式给 figures 数组，无图给 figures: []；选图只提供受控来源、figure_key、caption及可选region。"
+                  "pending 表示正文已发布但仍待补图，须复用固定目标补缺口，不可漏交 figures 消除目标或声称全部完成。organization_required 表示须继续整理。"
                   "临时资料只留档，缺少必要信息时具体澄清。"
                   "面向用户只展示标题、分类、出处和真实处理状态；document_id、revision_id、parse_id、publish_id及状态修订仅用于工具参数，不在回复中罗列。"
                   "禁止将未完成索引称为可检索。附件：\n" + json.dumps(task["attachments"], ensure_ascii=False))

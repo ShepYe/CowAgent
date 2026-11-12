@@ -308,12 +308,14 @@ def test_cancel_winner_cannot_change_existing_purpose(tmp_path):
 
 
 @pytest.mark.parametrize("interrupt", [False, True])
-def test_attachment_subsets_mixed_purposes(tmp_path, monkeypatch, interrupt):
+@pytest.mark.parametrize("explicit_figures", [False, True])
+def test_attachment_subsets_mixed_purposes(tmp_path, monkeypatch, interrupt, explicit_figures):
     from common.personal_tasks import TaskStore, OWNER, task_scope
     from common.runtime_identity import identity_scope
     from agent.tools.knowledge_ingest import KnowledgeIngest, resume_publication
+    from models.config_revision import capture_config_revision
     store = TaskStore(tmp_path / "tasks")
-    task = store.submit(OWNER, "mixed", {"text": "第一份长期，第二份临时"}, {"channel": "web"}, "cfg")
+    task = store.submit(OWNER, "mixed", {"text": "第一份长期，第二份临时"}, {"channel": "web"}, capture_config_revision())
     for number, text in enumerate(("长期资料证据", "临时机密素材")):
         path = tmp_path / f"mixed-{number}.txt"
         path.write_text(text, encoding="utf-8")
@@ -339,11 +341,15 @@ def test_attachment_subsets_mixed_purposes(tmp_path, monkeypatch, interrupt):
         complete = store.complete
         if interrupt:
             monkeypatch.setattr(store, "complete", lambda *a, **kw: (_ for _ in ()).throw(OSError("模拟发布后退出")))
-        last = tool.execute(dict(task_id=task["task_id"], purpose="long_term", reason="完成整理",
-                                 pages=organized_pages(last.result, "长期资料的可靠结论")))
+        pages = organized_pages(last.result, "长期资料的可靠结论")
+        if explicit_figures:
+            pages[0]['blocks'][0]['figures'] = []
+        last = tool.execute(dict(task_id=task["task_id"], purpose="long_term", reason="完成整理", pages=pages))
         monkeypatch.setattr(SourceService, "parse", lambda *a: pytest.fail("恢复不能重新解析"))
         if interrupt:
             assert last.status == "error"
+            if explicit_figures:
+                assert any(r.get('purpose') == 'transient' for r in store.get(OWNER, task['task_id'])['result_refs'])
             monkeypatch.setattr(store, "complete", complete)
             store.retry(OWNER, task["task_id"], 1)
             claimed = store.claim(OWNER, task["task_id"])

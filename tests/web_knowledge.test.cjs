@@ -53,3 +53,21 @@ test('Web窄窗口焦点及悬停可访问完整摘要，Escape关闭，缺摘�
   const old = flatten(tree).find(el => el.dataset.path?.endsWith('/旧页.md'));
   assert.equal(old.onfocus, undefined); assert.doesNotMatch(old.innerHTML, /knowledge-tree-summary/);
 });
+
+test('Web历史分页迟到不会插入同Agent的新页，当前版本仍可打开历史', async () => {
+  const {sandbox: s, tree} = fixture();
+  tree.isConnected = true; tree.prepend = child => tree.children.unshift(child);
+  s.activeAgentId = 'alpha'; s.defaultAgentId = 'alpha';
+  let resolve; s.fetch = () => new Promise(r => { resolve = r; });
+  s.doc = {page_id:'page-a', publish_id:'version-a'};
+  vm.runInContext('knowledgeEditor.current = () => doc', s);
+  const request = s.showKnowledgeFigureHistory(s.doc, 'alpha');
+  s.doc = {page_id:'page-b', publish_id:'version-b'};
+  vm.runInContext('++_knowledgeDocumentSequence', s);
+  resolve({json:async()=>({status:'success', events:[{page_id:'page-a',publish_id:'old-a',created_at:'旧时间',title:'A'}],has_more:false})});
+  await request; assert.equal(tree.children.length,0);
+  const latest = s.showKnowledgeFigureHistory(s.doc,'alpha');
+  resolve({json:async()=>({status:'success',events:[{page_id:'page-b',publish_id:'old-b',created_at:'旧时间',title:'B'}],has_more:false})});
+  await latest;
+  assert.equal(tree.children.length,1); assert.equal(tree.children[0].children[0].textContent,'旧时间 · B');
+});

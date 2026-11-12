@@ -1,4 +1,4 @@
-import React, { useMemo, useRef, useCallback } from 'react'
+import React, { useMemo, useRef, useCallback, useEffect } from 'react'
 import MarkdownIt from 'markdown-it'
 import hljs from 'highlight.js'
 import 'katex/dist/katex.min.css'
@@ -6,6 +6,7 @@ import '../lib/markdownMath.css'
 import { markdownMath } from '../lib/markdownMath'
 import { t } from '../i18n'
 import apiClient from '../api/client'
+import type { KnowledgeFigures, KnowledgeFigureItem } from '../types'
 import { workspaceHrefOf } from '../lib/fileKind'
 import { useWorkspaceStore } from '../store/workspaceStore'
 import { useLightboxStore } from './Lightbox'
@@ -143,6 +144,16 @@ const defaultImage =
 md.renderer.rules.image = function (tokens, idx, options, env, self) {
   const token = tokens[idx]
   const src = token.attrGet('src') || ''
+  if (src.startsWith('knowledge-figure:')) {
+    const match = /^knowledge-figure:([A-Za-z0-9_-]{1,128})\/([A-Za-z0-9_-]{1,128})$/.exec(src)
+    if (!match) return '<span class="knowledge-figure-state">图片不可用</span>'
+    const figures = env?.figures as KnowledgeFigures | undefined
+    if (figures?.publish_id && figures.publish_id !== match[1]) return '<span class="knowledge-figure-state">图片不可用</span>'
+    const item = figures?.figure_manifest?.items.find(i => i.figure_id === match[2])
+    const caption = item?.caption || token.content
+    const original = item ? figureOriginal(item, match[1], env.figureView, env.agentId) : ''
+    return `<span class="knowledge-figure" data-publish-id="${match[1]}" data-figure-id="${match[2]}"><span class="knowledge-figure-state">加载图片…</span><span class="knowledge-figure-caption">${md.utils.escapeHtml(caption)} ${original} <span title="已核验的原图或裁图；点击图片放大，原件入口可核对出处。">?</span></span></span>`
+  }
   const baseDir = (env as { imageBaseDir?: string } | undefined)?.imageBaseDir
   if (/^\/(?:api\/file|preview)\b/.test(src)) {
     // The backend already rewrote a workspace-relative ref to a site-absolute
@@ -229,6 +240,33 @@ export function markdownToHtml(content: string): string {
   return md.render(content || '')
 }
 
+function figureOriginal(item: KnowledgeFigureItem, publish: string, view: 'current' | 'history', agentId?: string) {
+  const location = item.location || {}, page = location.physical_page
+  const slide = location.source_slide_number
+  const office = location.kind === 'slide' || location.kind === 'word_reading_copy_page'
+  const url = apiClient.getKnowledgeFigureOriginalUrl(publish, item.figure_key, view, agentId)
+  const label = slide ? `原件 · 幻灯片${slide}` : page ? `原件 · 第${page}页` : '原件'
+  let html = `<a href="${md.utils.escapeHtml(url + (page && !office ? `#page=${page}` : ''))}" target="_blank" rel="noopener noreferrer">${label} ↗</a>`
+  if (office) {
+    const copy = apiClient.getKnowledgeFigureOriginalUrl(publish, item.figure_key, view, agentId, 'reading-copy')
+    html += ` <a href="${md.utils.escapeHtml(copy)}#page=${item.source_page || location.reading_copy_page || slide || 1}" target="_blank" rel="noopener noreferrer" title="PDF 阅读副本的页码；与原件位置的对应关系由阅读时保存的映射确定。">阅读副本 · 第${item.source_page || location.reading_copy_page || slide || 1}页 ↗</a>`
+  }
+  return html
+}
+
+const figureQueue: (() => Promise<void>)[] = []
+let figureRequests = 0
+function queueFigure(job: () => Promise<void>) {
+  figureQueue.push(job)
+  const drain = () => {
+    while (figureRequests < 4 && figureQueue.length) {
+      figureRequests++
+      figureQueue.shift()!().finally(() => { figureRequests--; drain() })
+    }
+  }
+  drain()
+}
+
 interface MarkdownProps {
   content: string
   /**
@@ -244,12 +282,66 @@ interface MarkdownProps {
    * the knowledge viewer; without it relative srcs are left untouched.
    */
   imageBaseDir?: string
+  figures?: KnowledgeFigures
+  figureView?: 'current' | 'history'
+  agentId?: string
 }
 
-const Markdown: React.FC<MarkdownProps> = ({ content, onInternalLink, imageBaseDir }) => {
+const Markdown: React.FC<MarkdownProps> = ({ content, onInternalLink, imageBaseDir, figures, figureView = 'current', agentId }) => {
   const rootRef = useRef<HTMLDivElement>(null)
 
-  const html = useMemo(() => md.render(content || '', { imageBaseDir, knowledgeLinks: !!onInternalLink }), [content, imageBaseDir, onInternalLink])
+  const controlled = !!figures?.figure_manifest || content.includes('knowledge-figure:')
+  const backend = controlled ? apiClient.getBaseUrl() : ''
+  const scope = agentId ?? (controlled ? apiClient.getActiveAgentId() : '')
+  const identity = `${backend}:${scope}:${figures?.publish_id || ''}:${figureView}`
+  const html = useMemo(() => {
+    let rendered = md.render(content || '', { imageBaseDir, knowledgeLinks: !!onInternalLink, figures, figureView, agentId: scope })
+    for (const item of figures?.figure_manifest?.items || []) {
+      if (item.state !== 'pending') continue
+      rendered += `<p class="knowledge-figure-state">待补图 ${figureOriginal(item, figures!.publish_id!, figureView, scope)} <span title="正文已核验；图片尚未生成，补图将发布为新版本。">?</span></p>`
+    }
+    return rendered
+  }, [content, imageBaseDir, onInternalLink, figures, identity])
+
+  useEffect(() => {
+    const root = rootRef.current
+    if (!root) return
+    const controller = new AbortController(), urls: string[] = []
+    let active = true
+    const valid = () => active && backend === apiClient.getBaseUrl() && scope === (agentId ?? apiClient.getActiveAgentId())
+    const load = (element: HTMLElement) => {
+      if (element.dataset.loading) return
+      element.dataset.loading = 'true'
+      queueFigure(async () => {
+        if (!valid()) return
+        try {
+          const response = await fetch(apiClient.getKnowledgeFigureUrl(element.dataset.publishId!, element.dataset.figureId!, figureView, scope), { signal: controller.signal, cache: 'no-store' })
+          if (!response.ok || !response.headers.get('Content-Type')?.startsWith('image/png')) throw new Error('unavailable')
+          const blob = await response.blob()
+          if (!valid()) return
+          const url = URL.createObjectURL(blob); urls.push(url)
+          const img = document.createElement('img')
+          img.alt = element.querySelector('.knowledge-figure-caption')?.textContent || ''
+          img.loading = 'lazy'; img.src = url
+          img.onerror = () => { if (valid()) { img.remove(); element.querySelector('.knowledge-figure-state')!.textContent = '图片不可用' } }
+          img.onload = () => { if (valid()) element.querySelector('.knowledge-figure-state')!.textContent = '' }
+          element.prepend(img)
+        } catch { if (valid()) element.querySelector('.knowledge-figure-state')!.textContent = '图片不可用' }
+      })
+    }
+    const observer = typeof IntersectionObserver === 'undefined' ? null : new IntersectionObserver(entries => {
+      for (const entry of entries) if (entry.isIntersecting) { observer!.unobserve(entry.target); load(entry.target as HTMLElement) }
+    }, { rootMargin: '200px' })
+    root.querySelectorAll<HTMLElement>('.knowledge-figure[data-figure-id]').forEach(element => observer ? observer.observe(element) : load(element))
+    return () => {
+      active = false
+      controller.abort()
+      observer?.disconnect()
+      const lightbox = useLightboxStore.getState()
+      if (lightbox.src && urls.includes(lightbox.src)) lightbox.close()
+      urls.forEach(URL.revokeObjectURL)
+    }
+  }, [html, identity])
 
   // Delegate clicks: images zoom, copy buttons on code blocks, internal doc links.
   const handleClick = useCallback(
@@ -302,6 +394,7 @@ const Markdown: React.FC<MarkdownProps> = ({ content, onInternalLink, imageBaseD
 
   return (
     <div
+      key={identity}
       ref={rootRef}
       className="msg-content text-sm text-content leading-relaxed break-words"
       onClick={handleClick}

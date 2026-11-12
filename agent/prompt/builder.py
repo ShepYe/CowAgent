@@ -656,6 +656,7 @@ def _build_knowledge_section(
     index_path = os.path.join(knowledge_root, "index.md")
     organization = (
         "Read knowledge-wiki and the authorized source text first, then use knowledge_ingest to decide purpose. "
+        "Submit explicit figures for every block ([] for no selected figure); follow knowledge-wiki for key-image selection, scope expansion, pending figures and knowledge-figure readback. "
         "For long_term, submit organized pages with title, category, summary, body blocks and real sources; "
         "organization_required means continue organizing. Each pages[].summary is required: a single line of plain text, "
         "1–160 Unicode code points after trimming (30–60 recommended), based on that page's body. "
@@ -665,6 +666,7 @@ def _build_knowledge_section(
         "Only a currently valid, index-verified searchable receipt means searchable."
         if language == "en" else
         "个人资料先读取 knowledge-wiki 和授权原文，再用 knowledge_ingest 自主登记用途；长期资料须提交整理后的 pages"
+        "，每块显式figures（无选图填[]）；按knowledge-wiki选关键图，扩大范围先补读，pending继续补图；图中细节通过read读取knowledge-figure实际回看"
         "（标题、分类、summary、正文块与真实出处），organization_required 时继续整理。每页 pages[].summary 必填："
         "以本页正文为依据的一句话，建议 30～60 字，去除首尾空白后 1～160 个 Unicode 码点的单行纯文本，禁止换行及控制字符；"
         "任务级摘要不能替代每页摘要。transient 资料及派生结论仅留档，waiting 仅必要澄清。"

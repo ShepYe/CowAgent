@@ -1,0 +1,44 @@
+{
+  "content": "## 端口示意\n\n![端口方向 · 原图裁区](knowledge-figure:fixture-publication/port)\n\n![损坏图片仍保留出处](knowledge-figure:fixture-publication/broken)\n\n待补图的已核验正文（待补图）〔出处 1〕",
+  "figure_manifest": {
+    "schema_version": 1,
+    "items": [
+      {
+        "block_ordinal": 0,
+        "figure_key": "port",
+        "figure_id": "port",
+        "caption": "端口方向 · 原图裁区",
+        "state": "ready",
+        "source": {},
+        "location": {
+          "kind": "pdf",
+          "physical_page": 3
+        },
+        "source_page": 3,
+        "source_index": 0
+      },
+      {
+        "block_ordinal": 0,
+        "figure_key": "broken",
+        "figure_id": "broken",
+        "caption": "损坏图片仍保留出处",
+        "state": "ready",
+        "source": {},
+        "source_index": 0
+      },
+      {
+        "block_ordinal": 0,
+        "figure_key": "pending",
+        "caption": "待补图的已核验正文",
+        "state": "pending",
+        "source": {},
+        "location": {
+          "kind": "slide",
+          "source_slide_number": 5
+        },
+        "source_page": 5,
+        "source_index": 0
+      }
+    ]
+  }
+}

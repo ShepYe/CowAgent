@@ -146,6 +146,15 @@ function createMd() {
             '<pre><code class="language-mermaid">' + escapeHtml(token.content) + '</code></pre>' +
             '</div>';
     };
+    const image = md.renderer.rules.image;
+    md.renderer.rules.image = function(tokens, idx, options, env, self) {
+        const src = tokens[idx].attrGet('src') || '';
+        if (!src.startsWith('knowledge-figure:')) return image(tokens, idx, options, env, self);
+        const match = /^knowledge-figure:([A-Za-z0-9_-]{1,128})\/([A-Za-z0-9_-]{1,128})$/.exec(src);
+        if (!match || (env?.figures?.publish_id && env.figures.publish_id !== match[1])) return '<span class="knowledge-figure-state">图片不可用</span>';
+        const item = env?.figures?.figure_manifest?.items.find(i => i.figure_id === match[2]);
+        return `<span class="knowledge-figure" data-publish-id="${match[1]}" data-figure-id="${match[2]}"><span class="knowledge-figure-state">加载图片…</span><span class="knowledge-figure-caption">${escapeHtml(item?.caption || tokens[idx].content)} ${knowledgeFigureOriginal(env, item)} <span title="点击图片放大；原件入口可核对出处。">?</span></span></span>`;
+    };
     return md;
 }
 
@@ -279,9 +288,9 @@ function _rewriteLocalImgSrc(html) {
     });
 }
 
-function renderMarkdown(text) {
+function renderMarkdown(text, env) {
     try {
-        let html = md.render(text);
+        let html = md.render(text, env);
         html = _rewriteLocalImgSrc(html);
         // Order matters: video first (more specific), then image.
         html = injectImagePreviews(injectVideoPlayers(html));
@@ -572,3 +581,70 @@ function renderMermaidBlocks(container) {
     if (pending.length) _loadAndRenderMermaid(Array.from(pending));
 }
 
+
+
+function knowledgeFigureUrl(env, item, original, material = 'original') {
+    const params = new URLSearchParams({publish_id: env.figures.publish_id, view: env.figureView || 'current', agent_id: env.agentId || ''});
+    if (original) params.set('material', material);
+    params.set(original ? 'figure_key' : 'figure_id', original ? item.figure_key : item.figure_id);
+    return '/api/knowledge/' + (original ? 'figure-original' : 'figure') + '?' + params;
+}
+function knowledgeFigureOriginal(env, item) {
+    if (!item || !env?.figures?.publish_id) return '';
+    const location = item.location || {}, page = location.physical_page, slide = location.source_slide_number;
+    const office = location.kind === 'slide' || location.kind === 'word_reading_copy_page';
+    const label = slide ? `原件 · 幻灯片${slide}` : page ? `原件 · 第${page}页` : '原件';
+    let html = `<a href="${escapeHtml(knowledgeFigureUrl(env, item, true))}${page && !office ? '#page=' + page : ''}" target="_blank" rel="noopener noreferrer">${label} ↗</a>`;
+    if (office) html += ` <a href="${escapeHtml(knowledgeFigureUrl(env, item, true, 'reading-copy'))}#page=${item.source_page || location.reading_copy_page || slide || 1}" target="_blank" rel="noopener noreferrer" title="阅读副本页；位置映射随历史版本固定。">阅读副本 · 第${item.source_page || location.reading_copy_page || slide || 1}页 ↗</a>`;
+    return html;
+}
+let _knowledgeFigureQueue = [], _knowledgeFigureRunning = 0;
+function queueKnowledgeFigure(job) {
+    _knowledgeFigureQueue.push(job);
+    function drain() {
+        while (_knowledgeFigureRunning < 4 && _knowledgeFigureQueue.length) {
+            _knowledgeFigureRunning++;
+            _knowledgeFigureQueue.shift()().finally(() => { _knowledgeFigureRunning--; drain(); });
+        }
+    }
+    drain();
+}
+function mountKnowledgeFigures(container, env, isCurrent = () => true) {
+    container._disposeKnowledgeFigures?.();
+    let active = true;
+    const controller = new AbortController(), urls = [];
+    const valid = () => active && container.isConnected && isCurrent();
+    for (const item of env.figures?.figure_manifest?.items || []) {
+        if (item.state !== 'pending') continue;
+        const note = document.createElement('p'); note.className = 'knowledge-figure-state';
+        note.innerHTML = `待补图 ${knowledgeFigureOriginal(env, item)} <span title="正文已核验；补图将发布为新版本。">?</span>`;
+        container.appendChild(note);
+    }
+    const load = element => {
+        if (element.dataset.loading) return;
+        element.dataset.loading = 'true';
+        queueKnowledgeFigure(async () => {
+            if (!valid()) return;
+            try {
+                const url = knowledgeFigureUrl({...env, figures: {...env.figures, publish_id: element.dataset.publishId}}, {figure_id: element.dataset.figureId}, false);
+                const response = await fetch(url, {signal: controller.signal, cache: 'no-store'});
+                if (!response.ok || !response.headers.get('Content-Type')?.startsWith('image/png')) throw Error('unavailable');
+                const blob = await response.blob();
+                if (!valid()) return;
+                const src = URL.createObjectURL(blob); urls.push(src);
+                const img = document.createElement('img'); img.alt = element.querySelector('.knowledge-figure-caption').textContent;
+                img.loading = 'lazy'; img.src = src;
+                img.onclick = () => _openImageLightbox(src);
+                img.onload = () => { if (valid()) element.querySelector('.knowledge-figure-state').textContent = ''; };
+                img.onerror = () => { if (valid()) { img.remove(); element.querySelector('.knowledge-figure-state').textContent = '图片不可用'; } };
+                element.prepend(img);
+            } catch (_) { if (valid()) element.querySelector('.knowledge-figure-state').textContent = '图片不可用'; }
+        });
+    };
+    const observer = typeof IntersectionObserver === 'undefined' ? null : new IntersectionObserver(entries => {
+        for (const entry of entries) if (entry.isIntersecting) { observer.unobserve(entry.target); load(entry.target); }
+    }, {rootMargin: '200px'});
+    container.querySelectorAll('.knowledge-figure[data-figure-id]').forEach(element => observer ? observer.observe(element) : load(element));
+    container._disposeKnowledgeFigures = () => { active = false; controller.abort(); observer?.disconnect(); urls.forEach(URL.revokeObjectURL); };
+    return container._disposeKnowledgeFigures;
+}

@@ -92,6 +92,7 @@ interface KnowledgeRef {
    * response knows where the base resolved to; the render that draws the new
    * content picks it up, so it needs no state of its own.
    */
+  figures?: import('../types').KnowledgeFigures
   dir?: string
 }
 
@@ -108,6 +109,7 @@ const knowledgeEditor = createDocEditorStore<KnowledgeRef, KnowledgeReadResult>(
   read: async (doc) => {
     const res = await apiClient.readKnowledge(doc.path, doc.agentId || undefined)
     doc.dir = res.dir || ''
+    doc.figures = res
     return res
   },
   write: async (doc, content, expectedMtime) => {
@@ -1066,6 +1068,8 @@ const KnowledgePage: React.FC<KnowledgePageProps> = ({ baseUrl }) => {
                           content={stripDuplicateH1(content, docTitle)}
                           onInternalLink={href => openInternalLink(href, doc.path)}
                           imageBaseDir={doc.dir}
+                          figures={doc.figures}
+                          agentId={doc.agentId}
                         />
                       )}
                     </div>

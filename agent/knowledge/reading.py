@@ -168,7 +168,7 @@ class ReadingService:
             db.execute("CREATE TABLE IF NOT EXISTS reading_submissions(scope TEXT PRIMARY KEY,payload TEXT)")
             db.execute("CREATE TABLE IF NOT EXISTS reading_parse_heads(revision TEXT PRIMARY KEY,parse TEXT)")
             db.execute("CREATE TABLE IF NOT EXISTS reading_resumes(reading TEXT,attempt INTEGER,PRIMARY KEY(reading,attempt))")
-            db.execute("PRAGMA user_version=2")
+            db.execute("PRAGMA user_version=" + str(max(2, db.execute("PRAGMA user_version").fetchone()[0])))
 
     @contextmanager
     def _guard(self, task):

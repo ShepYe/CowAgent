@@ -1187,7 +1187,23 @@ export interface KnowledgeList {
 // What `/api/knowledge/read` answers. `mtime` and `editable` mirror the
 // workspace read endpoint, which is what lets a knowledge page drive the same
 // document editor the memory and skill pages use.
-export interface KnowledgeReadResult {
+export interface KnowledgeFigureItem {
+  figure_key: string
+  figure_id?: string
+  caption: string
+  state: 'ready' | 'pending'
+  source: Record<string, unknown>
+  region?: number[]
+  source_page?: number
+  location?: { kind?: string; physical_page?: number; reading_copy_page?: number; source_slide_number?: number; source_slide_id?: string }
+}
+export interface KnowledgeFigures {
+  publish_id?: string
+  figure_state?: 'none' | 'pending' | 'ready' | 'unavailable'
+  figure_manifest?: { schema_version: 1; items: KnowledgeFigureItem[] }
+}
+
+export interface KnowledgeReadResult extends KnowledgeFigures {
   status: string
   message?: string
   content: string
@@ -1203,7 +1219,7 @@ export interface KnowledgeGraph {
   links: Array<{ source: string; target: string }>
 }
 
-export interface KnowledgeCatalogPage {
+export interface KnowledgeCatalogPage extends KnowledgeFigures {
   page_id: string
   page_version: string
   publish_id?: string
@@ -1248,7 +1264,7 @@ export interface KnowledgeHistory {
   legacy_content: string
 }
 
-export interface KnowledgeVersion {
+export interface KnowledgeVersion extends KnowledgeFigures {
   page_id: string
   page_version: string
   publish_id: string

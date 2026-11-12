@@ -64,7 +64,7 @@ class _ReadSource:
                 source.close()
             self.snapshot.execute('PRAGMA query_only=ON')
             version = self.snapshot.execute('PRAGMA user_version').fetchone()[0]
-            if version not in (1, 2):
+            if version not in (1, 2, 3):
                 raise TaskError('version_conflict')
             required = {
                 'documents': {'id', 'current', 'state', 'purpose', 'validity', 'publication'},
@@ -83,7 +83,7 @@ class _ReadSource:
             for table, columns in required.items():
                 if not columns.issubset({r[1] for r in self.snapshot.execute('PRAGMA table_info(' + table + ')')}):
                     raise TaskError('storage_failed')
-            if version == 2:
+            if version >= 2 and (version == 2 or self.snapshot.execute("SELECT 1 FROM sqlite_master WHERE name='reading_records'").fetchone()):
                 tables = {r[0] for r in self.snapshot.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 if not {'reading_records', 'reading_aliases', 'reading_submissions',
                         'reading_parse_heads', 'reading_resumes'}.issubset(tables):
@@ -92,6 +92,9 @@ class _ReadSource:
                     record = json.loads(row[0])
                     if not isinstance(record, dict) or record.get('schema_version') != 1:
                         raise TaskError('version_conflict')
+            if version == 3:
+                from agent.knowledge.figures import validate_schema
+                validate_schema(self.snapshot)
         except BaseException as exc:
             self.close()
             if isinstance(exc, sqlite3.Error):
@@ -446,6 +449,79 @@ def _decorate(task):
             result['reading_progress'] = _reading_progress(task)
         except (ValueError, OSError, KeyError, TypeError):
             result['reading_progress'] = {'schema_version': 1, 'unavailable': True}
+    if 'figure_publication' in task or 'figure_requirement' in task.get('payload', {}):
+        # 只读台账与请求内来源快照；不运行恢复、写事务或 PNG 校验。
+        from agent.knowledge.figure_publication import _load as load_figures, figure_required
+        from config import get_data_root
+        progress = dict(schema_version=1, targets=[], pending=[], ready=[], published_batches=0,
+                        gaps={}, paused_outside_targets=[], task_complete=False)
+        try:
+            required = figure_required(task)
+            db_path = Path(get_data_root()).resolve() / 'personal' / 'tasks.sqlite3'
+            db = sqlite3.connect(db_path.as_uri() + '?mode=ro', uri=True)
+            try:
+                db.execute('PRAGMA query_only=ON')
+                ledger = load_figures(db, task)
+            finally:
+                db.close()
+            required_pages = set(task['payload']['figure_requirement'].get('page_ids', [])) if required else set()
+            if ledger is None:
+                progress['targets'] = sorted(required_pages)
+                progress['pending'] = sorted(required_pages)
+                progress['gaps'] = {p: ['selection_required'] for p in required_pages} or {'task': ['selection_required']}
+            else:
+                targets = ledger['targets'].values()
+                page_ids = {t['page_id'] for t in targets}
+                progress['targets'] = sorted(page_ids | required_pages)
+                progress['published_batches'] = sum(b['status'] == 'published' for b in ledger['batches'].values())
+                service = _source_service()
+                wiki = _wiki_service()
+                for target in targets:
+                    page_id = target['page_id']
+                    gaps = []
+                    location = (db_path.parent / target['workspace']).resolve()
+                    current = wiki.current(page_id) if location == service.workspace else None
+                    if not current or current.get('publish_id') != target['published_version']:
+                        gaps.append('publication_invalid')
+                    elif current.get('figure_manifest') != target['manifest']:
+                        gaps.append('manifest_changed')
+                    elif any(i['state'] == 'pending' for i in target['manifest']['items']):
+                        gaps.append('pending')
+                    # 屏障已发现的字节缺口保留；GET 不重新读取图片文件。
+                    gaps.extend(g for g in target.get('gaps', []) if g == 'unavailable' and g not in gaps)
+                    if gaps:
+                        progress['gaps'][page_id] = gaps
+                    else:
+                        progress['ready'].append(page_id)
+                for page_id in required_pages - page_ids:
+                    progress['gaps'][page_id] = ['selection_required']
+                progress['pending'] = sorted(progress['gaps'])
+                progress['ready'] = sorted(set(progress['ready']) - set(progress['pending']))
+                # 只沿目标依赖边读取内存快照，不刷新全库投影。
+                with service.transaction() as source_db:
+                    visited, frontier = set(), list(page_ids)
+                    while frontier:
+                        upstream = frontier.pop()
+                        if upstream in visited:
+                            continue
+                        visited.add(upstream)
+                        for row in source_db.execute('SELECT p.id,p.current,p.status,p.reason FROM wiki_pages p '
+                                'JOIN wiki_dependencies d ON d.publication=p.current WHERE d.page=?', (upstream,)):
+                            if row['id'] not in visited:
+                                frontier.append(row['id'])
+                            if row['id'] not in page_ids and row['status'] != 'active':
+                                paused = dict(page_id=row['id'], page_version=row['current'], reason=row['reason'])
+                                if paused not in progress['paused_outside_targets']:
+                                    progress['paused_outside_targets'].append(paused)
+                progress['task_complete'] = (task['status'] == 'succeeded' and not progress['gaps']
+                    and progress['published_batches'] == len(ledger['batches']))
+        except (ValueError, OSError, KeyError, TypeError, sqlite3.Error):
+            progress.update(unavailable=True, task_complete=False)
+            progress['gaps']['task'] = ['unavailable']
+        result['figure_progress'] = progress
+        if result.get('reading_progress'):
+            result['reading_progress']['task_complete'] = bool(
+                result['reading_progress'].get('task_complete') and progress['task_complete'])
     return result
 
 
@@ -646,12 +722,26 @@ def _reorganize(store, task_id, attempt, body):
     if (not isinstance(request_id, str) or not request_id or len(request_id) > 200 or
             type(state) is not int or state < 0):
         raise TaskError('invalid_request')
+    requirement = None
+    if 'figure_requirement' in body:
+        raw = body['figure_requirement']
+        if (not isinstance(raw, dict) or set(raw) - {'schema_version', 'page_ids'}
+                or type(raw.get('schema_version')) is not int or raw['schema_version'] != 1):
+            raise TaskError('invalid_request')
+        requirement = {'schema_version': 1}
+        if 'page_ids' in raw:
+            pages = raw['page_ids']
+            if (not isinstance(pages, list) or not pages or len(pages) > 4096
+                    or any(not isinstance(p, str) or not p or len(p) > 512 for p in pages)
+                    or len(set(pages)) != len(pages)):
+                raise TaskError('invalid_request')
+            requirement['page_ids'] = sorted(pages)
     service = _source_service()
     from models.config_revision import capture_config_revision
     from common.personal_tasks import now
     from uuid import uuid4
     revision_config = capture_config_revision()
-    with service.transaction() as source_db, store._transaction() as db:
+    with store.lock, service.transaction() as source_db, store._transaction() as db:
         parent = store._read(db, OWNER, task_id)
         if parent['attempt'] != attempt:
             raise TaskError('version_conflict')
@@ -663,7 +753,8 @@ def _reorganize(store, task_id, attempt, body):
             raise TaskError('forbidden')
         directive = dict(document_id=document_id, revision_id=ref.get('revision_id'), expected_state=state)
         key = f'reorganize:{task_id}:{attempt}:{request_id}'
-        fingerprint = hashlib.sha256(json.dumps(directive, sort_keys=True).encode()).hexdigest()
+        identity = directive if requirement is None else dict(directive, figure_requirement=requirement)
+        fingerprint = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
         previous = db.execute('SELECT fingerprint,record FROM tasks WHERE owner=? AND request_id=?', (OWNER, key)).fetchone()
         if previous:
             if previous[0] != fingerprint:
@@ -697,6 +788,14 @@ def _reorganize(store, task_id, attempt, body):
             attachments.append(dict(attachment))
         if not attachments:
             raise TaskError('forbidden')
+        if requirement is not None and 'page_ids' in requirement:
+            current_pages = {r[0] for r in source_db.execute(
+                'SELECT DISTINCT p.id FROM wiki_pages p JOIN wiki_publications v ON v.id=p.current '
+                'JOIN wiki_sources s ON s.publication=v.id '
+                "WHERE p.status='active' AND v.verified=1 AND s.document=? AND s.revision=?",
+                (document_id, directive['revision_id']))}
+            if not set(requirement['page_ids']).issubset(current_pages):
+                raise TaskError('forbidden')
         payload = {'reorganize': directive, 'text':
             '请重新整理此已登记长期资料。先读取 knowledge-wiki 技能、原附件和已有相关知识，'
             '根据真实证据提炼、命名、分类并提交主题知识页，每页提交基于正文的一句话 summary；'
@@ -704,6 +803,19 @@ def _reorganize(store, task_id, attempt, body):
             '调用 knowledge_ingest，保留下述 document_id、revision_id，'
             '核对 expected_state。不得以原文拼接代替整理，不调用 knowledge_source_action republish，'
             '不得改变临时或撤回权限。新发布失败时保留旧有效知识。\n' + json.dumps(directive, ensure_ascii=False)}
+        if requirement is not None:
+            payload['figure_requirement'] = requirement
+            payload['text'] += (
+                '\n这是显式图文重整任务。固定目标：' + json.dumps(requirement, ensure_ascii=False)
+                + '。必须覆盖全部目标主题；每个正文块显式提交 figures，无需图为[]，不得漏交目标。'
+                '保留既有主题身份、summary、分类和关系；正文沿用content_keep语义，'
+                '可保留旧sources并追加read alias图源。'
+                '关键页先由主Agent原生read实际交付，提交completed阅读段的visual_interpretation证据；'
+                '原生read会固定全PDF物理页目标，必须按系统remaining完成所有批次并提交对应已核验reading_coverage，'
+                '尽量复用旧正文，不用工具参数缩小目标；预算不足按原配置重试，不调整全局agent_max_steps。'
+                'legacy视觉缓存不能直接配图。按主题选择参考平面、端口方向等关键原图，'
+                '优先裁图并保留标号、箭头和图例；整页兜底或扩大裁区前须补读。'
+                '图注和真实出处一致；未读和待补图分别报告，文字发布不能当作全部完成。')
         task = dict(schema_version=1, receipt_id=uuid4().hex, task_id=uuid4().hex, request_id=key,
                     owner_id=OWNER, origin={'channel': 'web', 'channel_instance_id': 'desktop', 'parent_task_id': task_id},
                     payload=payload, status='queued', stage='receive', attempt=1, config_revision=revision_config,

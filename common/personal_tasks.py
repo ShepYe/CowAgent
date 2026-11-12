@@ -61,11 +61,16 @@ class TaskStore:
             self.lock = _locks.setdefault(str(self.db), threading.RLock())
         with self._transaction() as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1, 2):
-                raise TaskError("version_conflict", f"任务库需要 schema {version}，当前支持 1/2")
+            if version not in (0, 1, 2, 3):
+                raise TaskError("version_conflict", f"任务库需要 schema {version}，当前支持 1/2/3")
+            if version == 3:
+                columns = {r[1] for r in db.execute('PRAGMA table_info(figure_publications)')}
+                if not {'task_id', 'record'}.issubset(columns):
+                    raise TaskError('version_conflict', 'v3 补图台账结构不完整')
             db.execute("CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, owner TEXT NOT NULL, request_id TEXT NOT NULL, fingerprint TEXT NOT NULL, record TEXT NOT NULL, UNIQUE(owner,request_id))")
             db.execute("CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, at TEXT NOT NULL, record TEXT NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS reading_publications (task_id TEXT PRIMARY KEY, record TEXT NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS figure_publications (task_id TEXT PRIMARY KEY, record TEXT NOT NULL)")
             db.execute("PRAGMA user_version=" + str(max(1, version)))
 
     @contextmanager
@@ -209,10 +214,22 @@ class TaskStore:
     def complete(self, owner, task_id, attempt, outcome, result_refs):
         if outcome not in {"published", "transient", "duplicate"}:
             raise TaskError("invalid_request")
+        with self.commit_guard(owner, task_id, attempt) as current:
+            if "figure_publication" in current or "figure_requirement" in current.get("payload", {}):
+                from agent.knowledge.figure_publication import completion_guard
+                with completion_guard(self, current):
+                    return self._complete_record(owner, task_id, attempt, outcome, result_refs)
+            return self._complete_record(owner, task_id, attempt, outcome, result_refs)
+
+    def _complete_record(self, owner, task_id, attempt, outcome, result_refs):
         with self._transaction() as db:
             r = self._read(db, owner, task_id)
             if r["attempt"] != attempt or r["status"] != "running":
                 raise TaskError("version_conflict")
+            if "figure_publication" in r:
+                if outcome != "published":
+                    raise TaskError("figure_incomplete")
+                result_refs = r["result_refs"]
             if "reading_publication" in r:
                 from agent.knowledge.reading_publication import _load, _satisfied
                 ledger = _load(db, r)
@@ -220,6 +237,16 @@ class TaskStore:
                     raise TaskError("reading_incomplete")
                 # 调用方不能用最后一批回执覆盖之前的成果。
                 result_refs = r["result_refs"]
+            if "figure_publication" in r or "reading_publication" in r:
+                result_refs = list(result_refs)
+                # 仅接纳可信附件决定中的临时回执；不复制调用方提供的成果，
+                # 也不以旧长期回执替换发布台账中的新版本。
+                for attachment in r['attachments']:
+                    decision = (r.get('attachment_decisions') or {}).get(attachment['attachment_id'], {})
+                    ref = decision.get('result_ref')
+                    if (decision.get('purpose') == 'transient' and decision.get('ready') and ref
+                            and ref not in result_refs):
+                        result_refs.append(ref)
             r.update(status="succeeded", stage="done", outcome=outcome, result_refs=result_refs, error=None)
             return self._save(db, r)
 
@@ -237,6 +264,9 @@ class TaskStore:
                 raise TaskError("version_conflict")
             if "reading_publication" in r:
                 from agent.knowledge.reading_publication import reconcile_committed
+                reconcile_committed(self, r)
+            if "figure_publication" in r:
+                from agent.knowledge.figure_publication import reconcile_committed
                 reconcile_committed(self, r)
             return self._change(owner, task_id, attempt, {"queued", "running", "waiting_input"}, status="cancelled")
 
@@ -264,7 +294,7 @@ class TaskStore:
         for r in self.list():
             if r["status"] == "running":
                 updates = {"status": "needs_reconcile"}
-                if "reading_publication" in r:
+                if "reading_publication" in r or "figure_publication" in r:
                     # 重启隔离旧回调；持久候选由可信恢复器关联新 attempt。
                     updates["attempt"] = r["attempt"] + 1
                 self._change(OWNER, r["task_id"], r["attempt"], {"running"}, **updates)

@@ -5,6 +5,7 @@ new documents.
 """
 
 import json
+import re
 
 import web
 
@@ -123,6 +124,9 @@ class KnowledgeReadHandler:
                 _get_workspace_root(agent_id=_request_agent_id(params))
             )
             result = svc.read_file(params.path)
+            if str(result['path']).startswith('wiki/'):
+                version = svc.version(path=result['path'])
+                result.update({key: version[key] for key in ('page_id', 'publish_id', 'figure_state', 'figure_manifest') if key in version})
             # Absolute directory of the doc (posix separators), so clients can
             # resolve image srcs that are relative to the doc into /api/file
             # URLs. Additive field; read_file itself stays untouched.
@@ -134,6 +138,97 @@ class KnowledgeReadHandler:
         except Exception as e:
             logger.error(f"[WebChannel] Knowledge read error: {e}")
             return json.dumps({"status": "error", "message": str(e)})
+
+
+def _figure_params():
+    from agent.knowledge.parser import SourceError
+    params = web.input(agent_id='', publish_id='', figure_id='', figure_key='', view='current', material='original')
+    if any(getattr(params, key, None) is not None for key in ('path', 'owner', 'owner_id', 'reading_id', 'parse_id')):
+        raise SourceError('invalid_request', '图片请求不接受文件路径或内部身份')
+    if not isinstance(params.publish_id, str) or params.material not in ('original', 'reading-copy') or params.view not in ('current', 'history') or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', params.publish_id):
+        raise SourceError('invalid_request', '图片视图或发布身份无效')
+    return params
+
+
+def _figure_error(exc):
+    web.header('Content-Type', 'application/json; charset=utf-8')
+    web.header('Cache-Control', 'no-store')
+    code = getattr(exc, 'code', 'storage_failed')
+    web.ctx.status = {'invalid_request': '400 Bad Request', 'forbidden': '403 Forbidden',
+                      'version_conflict': '409 Conflict'}.get(code, '422 Unprocessable Entity')
+    return json.dumps(dict(status='error', code=code, message='知识图片请求无法完成'), ensure_ascii=False)
+
+
+class KnowledgeFigureHandler:
+    def GET(self):
+        _require_auth()
+        try:
+            from agent.knowledge.parser import SourceError
+            params = _figure_params()
+            if not isinstance(params.figure_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', params.figure_id):
+                raise SourceError('invalid_request', '图片身份无效')
+            workspace = _get_workspace_root(agent_id=_request_agent_id(params))
+            from agent.knowledge.figures import resolve_figure
+            result = resolve_figure(workspace, params.publish_id, params.figure_id, view=params.view)
+            web.header('Content-Type', result['mime_type'])
+            web.header('Cache-Control', 'no-store')
+            web.header('X-Content-Type-Options', 'nosniff')
+            return result['data']
+        except KeyError:
+            from agent.knowledge.parser import SourceError
+            return _figure_error(SourceError('forbidden', '图片作用域无效'))
+        except (ValueError, OSError) as exc:
+            return _figure_error(exc)
+
+
+class KnowledgeFigureOriginalHandler:
+    def GET(self):
+        _require_auth()
+        try:
+            import mimetypes
+            from pathlib import Path
+            from agent.knowledge.parser import SourceError
+            from agent.knowledge.wiki import WikiService
+            params = _figure_params()
+            if not isinstance(params.figure_key, str) or not params.figure_key or len(params.figure_key) > 256:
+                raise SourceError('invalid_request', '图片键无效')
+            wiki = WikiService(_get_workspace_root(agent_id=_request_agent_id(params)))
+            ref = wiki.read_reference(params.publish_id, historical=params.view == 'history')
+            manifest = ref.get('figure_manifest', {})
+            if manifest.get('schema_version') != 1:
+                raise SourceError('invalid_request', '图片清单版本无效')
+            item = next((i for i in manifest['items'] if i['figure_key'] == params.figure_key), None)
+            if item is None:
+                raise SourceError('invalid_request', '图片不存在')
+            identity = ('document_id', 'revision_id', 'parse_id', 'ordinal')
+            ordinal = next((i for i, source in enumerate(ref['sources'])
+                            if all(source.get(k) == item['source'].get(k) for k in identity)), None)
+            if ordinal is None:
+                raise SourceError('invalid_request', '图片出处不存在')
+            source = wiki.read_reference(params.publish_id, ordinal, historical=params.view == 'history')
+            if params.material == 'reading-copy':
+                import hashlib
+                from agent.knowledge.reading import _read
+                from agent.knowledge.reading_materials import load_pdf_materials, _relative
+                with wiki.source.transaction() as db:
+                    reading = _read(db, item['reading_id'])
+                    material = load_pdf_materials(wiki.workspace, reading['manifest'], expected_manifest_hash=reading['manifest_hash'])
+                    data = _relative(wiki.workspace, material.original_relpath).read_bytes()
+                    if hashlib.sha256(data).hexdigest() != material.original_hash or not data.startswith(b'%PDF-'):
+                        raise SourceError('storage_failed', '阅读副本校验失败')
+                mime_type = 'application/pdf'
+            else:
+                data = Path(source['original']).read_bytes()
+                mime_type = mimetypes.guess_type(source.get('filename', ''))[0] or 'application/octet-stream'
+            web.header('Content-Type', mime_type)
+            web.header('Cache-Control', 'no-store')
+            web.header('X-Content-Type-Options', 'nosniff')
+            return data
+        except KeyError:
+            from agent.knowledge.parser import SourceError
+            return _figure_error(SourceError('forbidden', '图片作用域无效'))
+        except (ValueError, OSError) as exc:
+            return _figure_error(exc)
 
 
 class KnowledgeGraphHandler:

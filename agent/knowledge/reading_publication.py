@@ -78,7 +78,7 @@ def register_target(store, task, targets):
         if ledger is not None:
             if ledger["targets"] != targets:
                 raise TaskError("idempotency_conflict", "任务目标不可缩小或替换")
-            db.execute("PRAGMA user_version=2")
+            db.execute("PRAGMA user_version=" + str(max(2, db.execute("PRAGMA user_version").fetchone()[0])))
             return current
         if current.get("wiki_batch_id") or current.get("result_refs"):
             raise TaskError("version_conflict", "已有旧路径发布，不可中途改为阅读任务")
@@ -88,7 +88,7 @@ def register_target(store, task, targets):
         _save(db, ledger)
         # 库级写屏障阻止不识别阅读目标的旧 worker 把部分批次误 complete。
         # task record 本身继续 schema v1；无阅读记录的旧库不升级。
-        db.execute("PRAGMA user_version=2")
+        db.execute("PRAGMA user_version=" + str(max(2, db.execute("PRAGMA user_version").fetchone()[0])))
         return store._save(db, current)
 
 
@@ -152,6 +152,8 @@ def prepare_publication(store, task, submission_id, coverage, pages, workspace):
             if candidate["fingerprint"] != old["fingerprint"]:
                 raise TaskError("version_conflict")
             return candidate
+        from agent.knowledge.figure_publication import require_explicit_figures
+        require_explicit_figures(store.get(task["owner_id"], task["task_id"]), pages)
         candidate = wiki.prepare(pages, task_id=task["task_id"])
         register_batch(store, task, submission_id, coverage, candidate["batch_id"], workspace, pages)
         return candidate
@@ -168,9 +170,19 @@ def register_batch(store, task, submission_id, coverage, batch_id, workspace, pa
         if state is None or not set(coverage).issubset(state["targets"]):
             raise TaskError("invalid_request", "提交范围超出任务目标")
         candidate, _ = _candidate(WikiService(workspace, task["owner_id"]), task, batch_id)
+        from agent.knowledge.figure_publication import register_batch as register_figures
         location = os.path.relpath(Path(workspace).resolve(), store.root)
         digest = hashlib.sha256(_json(dict(coverage=coverage, batch_id=batch_id,
                     workspace=location, fingerprint=candidate["fingerprint"], payload=payload)).encode()).hexdigest()
+        # 先验证阅读提交身份，避免冲突提交在补图台账留下孤立目标。
+        old = state['batches'].get(submission_id)
+        if old and old['digest'] != digest:
+            raise TaskError('idempotency_conflict')
+        if not old and any(b['batch_id'] == batch_id for b in state['batches'].values()):
+            raise TaskError('idempotency_conflict')
+        if not old and len(state['batches']) >= MAX_BATCHES:
+            raise TaskError('limit_exceeded')
+        register_figures(store, task, submission_id, batch_id, workspace)
         with store._transaction() as db:
             current = _current(store, db, task)
             ledger = _load(db, current)
@@ -208,7 +220,8 @@ def _receipt(store, task, submission_id, refs):
 
 
 def publish_batch(store, task, submission_id):
-    with store.commit_guard(task["owner_id"], task["task_id"], task["attempt"]):
+    from agent.knowledge.figure_publication import figure_required, publish_candidate, reconcile_committed as reconcile_figures
+    with store.commit_guard(task["owner_id"], task["task_id"], task["attempt"]) as current:
         state = publication_state(store, task)
         if state is None or submission_id not in state["batches"]:
             raise TaskError("invalid_request")
@@ -225,7 +238,13 @@ def publish_batch(store, task, submission_id):
         preview = json.loads(_json({k: v for k, v in state.items() if k != "remaining"}))
         preview["batches"][submission_id].update(status="published", refs=_committed_refs(wiki, candidate))
         _encode(preview)
-        refs = _committed_refs(wiki, candidate, validate=True) if committed else wiki.publish(batch["batch_id"])
+        if committed:
+            refs = _committed_refs(wiki, candidate, validate=True)
+        elif figure_required(current) or any('figure_manifest' in page for page in candidate['pages']):
+            refs = publish_candidate(wiki, batch["batch_id"], current)
+        else:
+            refs = wiki.publish(batch["batch_id"])
+        reconcile_figures(store, task)
         # 此处崩溃时 wiki 已提交，重启按稳定 batch_id 补回执。
         return _receipt(store, task, submission_id, refs)
 
@@ -265,7 +284,12 @@ def finish_publication(store, task):
     with store.commit_guard(task["owner_id"], task["task_id"], task["attempt"]):
         state = publication_state(store, task)
         if state is not None and not state["remaining"]:
-            return store.complete(task["owner_id"], task["task_id"], task["attempt"], "published", [])
+            try:
+                return store.complete(task["owner_id"], task["task_id"], task["attempt"], "published", [])
+            except TaskError as exc:
+                if exc.code != "figure_incomplete":
+                    raise
+                store.stage(task["owner_id"], task["task_id"], task["attempt"], "publish")
         return store.get(task["owner_id"], task["task_id"])
 
 

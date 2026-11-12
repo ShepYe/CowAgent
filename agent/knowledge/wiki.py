@@ -35,6 +35,10 @@ def _index_text(text):
     return re.sub(r'([\\`*_{}\[\]()#!|~])', r'\\\1', html.escape(text, quote=False))
 
 
+def publication_markdown(record):
+    return '# ' + record['title'] + '\n\n' + '\n\n'.join(b['content'] for b in record['blocks']) + '\n'
+
+
 def ensure_schema(db):
     # Additive tables deliberately keep the source/backup v1 contract intact.
     statements = (
@@ -155,6 +159,9 @@ def _valid(db, service, publication, seen=None):
         if not page or page['current'] != publication['id'] or page['status'] != 'active' or not publication['verified']:
             return False
         record = json.loads(publication['record'])
+        if (record['page_id'] != publication['page'] or record['page_version'] != publication['id']
+                or record['path'] != publication['path'] or _hash(publication_markdown(record).encode()) != publication['hash']):
+            return False
         path = service.workspace / publication['path']
         if not path.resolve().is_relative_to(service.knowledge.resolve()):
             return False
@@ -175,6 +182,8 @@ def _valid(db, service, publication, seen=None):
             upstream = db.execute('SELECT * FROM wiki_publications WHERE id=?', (version,)).fetchone()
             if not _valid(db, service, upstream, seen):
                 return False
+        from agent.knowledge.figures import validate_manifest
+        validate_manifest(db, service, record, check_bytes=False)
         return True
     except (SourceError, OSError, ValueError, KeyError, TypeError, IndexError):
         return False
@@ -278,7 +287,16 @@ def _ref(record, source_ordinal=0, db=None):
                 page_version=record['page_version'], publish_id=record['page_version'], path=record['path'],
                 sources=sources, related_page_ids=record['related_page_ids'], depends_on=record['depends_on'],
                 task_id=record['task_id'], outcome='published', searchable=True, index_mode='keyword',
-                indexed_units=len(record['blocks']), source_ordinal=source_ordinal, schema_version=1)
+                indexed_units=len(record['blocks']), source_ordinal=source_ordinal, schema_version=1,
+                figure_state=figure_state(record), **({'figure_manifest': record['figure_manifest']} if 'figure_manifest' in record else {}))
+
+
+def figure_state(record):
+    manifest = record.get('figure_manifest')
+    if manifest is None:
+        return 'none'
+    items = manifest['items']
+    return 'pending' if any(item['state'] == 'pending' for item in items) else ('ready' if items else 'none')
 
 
 class WikiService:
@@ -326,10 +344,15 @@ class WikiService:
                     raise SourceError('invalid_request', '知识页分类无效')
                 if not isinstance(blocks, list) or not blocks:
                     raise SourceError('invalid_request', '知识页正文不能为空')
+                figure_contract = any(isinstance(b, dict) and 'figures' in b for b in blocks)
+                if figure_contract and any(not isinstance(b, dict) or 'figures' not in b for b in blocks):
+                    raise SourceError('invalid_request', '图文页每个正文块必须显式提交 figures，可用空数组表示无图')
                 source_map, normalized = {}, []
                 for block in blocks:
                     if not isinstance(block, dict) or not isinstance(block.get('content'), str) or not block['content'].strip() or not isinstance(block.get('sources'), list) or not block['sources']:
                         raise SourceError('invalid_request', '每个正文块必须有内容及出处')
+                    if 'knowledge-figure:' in block['content'].lower():
+                        raise SourceError('invalid_request', '受控图片引用须由 figures 清单生成')
                     indices = []
                     for source in block['sources']:
                         snap = _source(db, self.source, source)
@@ -338,6 +361,8 @@ class WikiService:
                             source_map[key] = (len(source_map), snap)
                         indices.append(source_map[key][0])
                     normalized.append(dict(content=block['content'], source_ordinals=sorted(set(indices))))
+                    if figure_contract:
+                        normalized[-1].update(figures=block['figures'], content_without_figures=block['content'])
                 related = page.get('related_page_ids', [])
                 dependencies = page.get('depends_on', [])
                 if not isinstance(related, list) or not all(isinstance(p, str) for p in related) or not isinstance(dependencies, list):
@@ -360,6 +385,10 @@ class WikiService:
                               depends_on=[dict(page_id=p, page_version=v) for p, v in sorted(deps.items())], task_id=task_id,
                               created_at=datetime.now(timezone.utc).isoformat())
                 record['source_heads'] = {s['document_id']: source_head(db, s['document_id']) for s in record['sources']}
+                if figure_contract:
+                    from agent.knowledge.figures import prepare_manifest, render_blocks
+                    record['figure_manifest'] = prepare_manifest(db, self.source, normalized, record['sources'])
+                    record['blocks'] = render_blocks(normalized, record['figure_manifest'], version)
                 records.append(record)
             known = ids | {r[0] for r in db.execute('SELECT id FROM wiki_pages')}
             if any(p not in known for r in records for p in r['related_page_ids']):
@@ -430,6 +459,8 @@ class WikiService:
                 for dep in record['depends_on']:
                     if dep['page_id'] in changed_ids or not _valid(db, self.source, db.execute('SELECT * FROM wiki_publications WHERE id=? AND page=?', (dep['page_version'], dep['page_id'])).fetchone()):
                         raise SourceError('version_conflict', '上游页版本已变化；须基于新版本重新核验')
+                from agent.knowledge.figures import validate_manifest
+                validate_manifest(db, self.source, record, check_bytes=True)
             # Immutable paths mean failed/crashed candidates never overwrite an
             # old effective page. Uncommitted files are rejected by guard_path.
             for record in records:
@@ -438,7 +469,7 @@ class WikiService:
                 if organization['category_mode'] == 'manual':
                     record['category'] = organization['category']
                 record['created_at'] = datetime.now(timezone.utc).isoformat()
-                text = '# ' + record['title'] + '\n\n' + '\n\n'.join(b['content'] for b in record['blocks']) + '\n'
+                text = publication_markdown(record)
                 target = self.workspace / record['path']
                 if (not target.resolve().is_relative_to((self.knowledge / 'wiki').resolve())
                         or not target.resolve().is_relative_to(self.knowledge.resolve())):
@@ -454,6 +485,8 @@ class WikiService:
                 self._verify_index(db, record)
                 db.execute('INSERT INTO wiki_publications VALUES(?,?,?,?,?,1,?)',
                            (version, record['page_id'], batch_id, record['path'], digest, _json(record)))
+                from agent.knowledge.figures import attach_publication
+                attach_publication(db, self.source, record)
                 for ordinal, source in enumerate(record['sources']):
                     db.execute('INSERT INTO wiki_sources VALUES(?,?,?,?,?)', (version, ordinal, source['document_id'], source['revision_id'], _json(source)))
                     db.execute('INSERT OR IGNORE INTO wiki_legacy_retirements VALUES(?,?)', (source['document_id'], version))
@@ -484,6 +517,26 @@ class WikiService:
             refresh(db, self.source)
             pub = db.execute('SELECT v.* FROM wiki_pages p JOIN wiki_publications v ON v.id=p.current WHERE p.id=?', (page_id,)).fetchone()
             return _ref(json.loads(pub['record']), db=db) if _valid(db, self.source, pub) else None
+
+    def prepare_figure_update(self, page_id, expected_version, *, task_id):
+        """只补原来固定的插图目标；新发布沿用正文、摘要、出处与关系。"""
+        with self.source.transaction() as db:
+            pub = db.execute('SELECT v.* FROM wiki_pages p JOIN wiki_publications v ON v.id=p.current WHERE p.id=?', (page_id,)).fetchone()
+            if not _valid(db, self.source, pub) or pub['id'] != expected_version:
+                raise SourceError('version_conflict', '补图目标已被替代或失效')
+            record = json.loads(pub['record'])
+            if 'figure_manifest' not in record:
+                raise SourceError('invalid_request', '旧页须由主 Agent 显式选择插图目标')
+            from agent.knowledge.catalog import metadata
+            category = metadata(db, record)['category']
+            blocks = []
+            for block in record['blocks']:
+                blocks.append(dict(content=block['content_without_figures'], figures=block['figures'], sources=[
+                    {key: record['sources'][i][key] for key in ('document_id', 'revision_id', 'parse_id', 'ordinal')}
+                    for i in block['source_ordinals']]))
+            page = dict(page_id=page_id, expected_version=expected_version, title=record['title'], summary=record['summary'],
+                        category=category, blocks=blocks, depends_on=record['depends_on'], related_page_ids=record['related_page_ids'])
+        return self.prepare([page], task_id=task_id)
 
     def catalog(self):
         from agent.knowledge.catalog import catalog

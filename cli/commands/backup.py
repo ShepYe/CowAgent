@@ -110,6 +110,7 @@ def _iter_workspace_files(
             if (name not in _SKIP_DIRS or (complete and name == "tmp"))
             and not (current_path / name).is_symlink()
             and (current_path / name).resolve() not in pruned
+            and (current_path / name).resolve() not in excluded
         ]
         for name in filenames:
             path = current_path / name
@@ -121,7 +122,33 @@ def _iter_workspace_files(
                 yield path
 
 
-def _require_personal_stopped(data_root: Path) -> None:
+def _is_startup_launcher(pid, startup_pid):
+    """Windows venv 启动器只等待本子进程，不能误认成另一实例。"""
+    import sys
+    if (os.name != 'nt' or startup_pid != os.getpid() or pid != os.getppid()
+            or getattr(sys, 'frozen', False) or sys.prefix == sys.base_prefix):
+        return False
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    kernel.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel.OpenProcess(0x1000, False, pid)
+    if not handle:
+        return False
+    try:
+        buffer = ctypes.create_unicode_buffer(32768)
+        size = wintypes.DWORD(len(buffer))
+        return bool(kernel.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size))
+                    and Path(buffer.value).resolve() == Path(sys.executable).resolve())
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def _require_personal_stopped(data_root: Path, *, startup_pid=None) -> None:
     """完整实例备份仅允许离线运行；逐库 backup API 不是跨库事务。"""
     from cli.commands.process import _is_pid_alive
 
@@ -133,7 +160,7 @@ def _require_personal_stopped(data_root: Path) -> None:
             pid = int(path.read_text(encoding="utf-8").strip())
         except (ValueError, OSError) as exc:
             raise ValueError("个人实例 PID 记录不可核验，请先退出后端再备份/恢复") from exc
-        if pid > 0 and _is_pid_alive(pid):
+        if pid > 0 and pid != startup_pid and not _is_startup_launcher(pid, startup_pid) and _is_pid_alive(pid):
             raise ValueError(f"个人实例后端仍在运行（PID {pid}），请先退出桌面后端再执行完整备份/恢复；不支持跨数据库在线快照")
 
 
@@ -143,6 +170,7 @@ def create_backup_archive(
     workspace: Path,
     excluded_paths: Optional[Iterable[Path]] = None,
     complete: Optional[bool] = None,
+    _startup_pid: Optional[int] = None,
 ) -> dict:
     """Create a portable archive containing config and every agent workspace."""
     output = Path(output).expanduser().resolve()
@@ -151,6 +179,8 @@ def create_backup_archive(
     output.parent.mkdir(parents=True, exist_ok=True)
     excluded = {Path(path).expanduser().resolve() for path in (excluded_paths or [])}
     excluded.add(output)
+    excluded.add(data_root / 'recovery')
+    excluded.add(workspace / '.personal_sources/recovery')
 
     config_path = data_root / "config.json"
     config = _read_config(data_root)
@@ -161,7 +191,9 @@ def create_backup_archive(
     if complete is None:
         complete = config.get("personal_instance") is True or config.get("personal_assistant_enabled") is True
     if complete:
-        _require_personal_stopped(data_root)
+        if _startup_pid is not None and _startup_pid != os.getpid():
+            raise ValueError("startup snapshot requires current process identity")
+        _require_personal_stopped(data_root, startup_pid=_startup_pid)
     legacy_path = _legacy_user_data_path(data_root, config)
     profiles, explicit_registry, default_agent_id = _configured_workspaces(config, workspace)
     sources = {
@@ -521,13 +553,24 @@ def _validate_schemas(root: Path) -> None:
             with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
                 schema_version = db.execute("PRAGMA user_version").fetchone()[0]
                 tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-                known_reading = (schema_version == 2 and path.name == 'sources.sqlite3'
+                known_reading = (schema_version in (2, 3) and path.name == 'sources.sqlite3'
                     and path.parent.name == '.personal_sources'
                     and {'reading_records', 'reading_aliases', 'reading_submissions',
                          'reading_parse_heads', 'reading_resumes'}.issubset(tables))
-                known_tasks = (schema_version == 2 and path.name == 'tasks.sqlite3'
+                if schema_version == 3 and path.name == 'sources.sqlite3' and path.parent.name == '.personal_sources':
+                    known_reading = {'figure_assets', 'figure_publications'}.issubset(tables)
+                known_tasks = (schema_version in (2, 3) and path.name == 'tasks.sqlite3'
                     and path.parent.name == 'personal'
                     and {'tasks', 'events', 'reading_publications'}.issubset(tables))
+                if schema_version == 3:
+                    if known_reading:
+                        from agent.knowledge.figures import validate_schema
+                        try:
+                            validate_schema(db)
+                        except (ValueError, TypeError, KeyError) as exc:
+                            raise ValueError('unsupported figure schema') from exc
+                    if known_tasks and 'figure_publications' not in tables:
+                        raise ValueError('missing figure task ledger')
                 if schema_version > 1 and not (known_reading or known_tasks):
                     raise ValueError(f"unsupported SQLite schema: {path.name}")
                 if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":

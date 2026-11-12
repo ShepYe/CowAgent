@@ -14,6 +14,53 @@ READING_SOURCE_SCHEMA = {'type': 'object', 'properties': {
     'required': ['reading_id', 'evidence_key'], 'additionalProperties': False}
 
 
+def _figure_pages(pages):
+    """验证模型输入；缺省保留旧契约，不把省略伪装成显式无图。"""
+    import copy
+    import math
+    import re
+    import unicodedata
+    result = copy.deepcopy(pages)
+    for page in result:
+        keys = set()
+        for block in page.get('blocks', []):
+            if re.search(r'knowledge-figure\s*:', block.get('content', ''), re.I):
+                raise SourceError('invalid_request', '受控图片引用只能由图片清单生成')
+            if 'figures' not in block:
+                continue
+            if not isinstance(block['figures'], list):
+                raise SourceError('invalid_request', 'figures须为数组，明确无图请传[]')
+            for figure in block['figures']:
+                if (not isinstance(figure, dict) or not {'figure_key', 'caption', 'source'} <= set(figure)
+                        or set(figure) - {'figure_key', 'caption', 'source', 'region'}):
+                    raise SourceError('invalid_request', '图片只接受figure_key/caption/source/region')
+                for field, maximum in (('figure_key', 128), ('caption', 512)):
+                    text = figure[field]
+                    if not isinstance(text, str):
+                        raise SourceError('invalid_request', '图片标识和图注须为单行纯文本')
+                    text = text.strip()
+                    if (not 1 <= len(text) <= maximum or any(
+                            unicodedata.category(c).startswith('C') or c in '\r\n\u2028\u2029' for c in text)):
+                        raise SourceError('invalid_request', '图片标识和图注须为有效单行纯文本')
+                    figure[field] = text
+                if figure['figure_key'] in keys:
+                    raise SourceError('invalid_request', '同页figure_key重复')
+                keys.add(figure['figure_key'])
+                source = figure['source']
+                if not isinstance(source, dict) or set(source) not in (
+                        {'reading_id', 'evidence_key'}, {'document_id', 'revision_id', 'parse_id', 'ordinal'}):
+                    raise SourceError('invalid_request', '图片出处须为四元身份或互斥阅读别名')
+                if source not in block.get('sources', []):
+                    raise SourceError('invalid_request', '图片出处须与所属正文块出处一致')
+                if 'region' in figure:
+                    region = figure['region']
+                    if (not isinstance(region, list) or len(region) != 4 or any(
+                            type(v) not in (int, float) or not math.isfinite(v) or not 0 <= v <= 1 for v in region)
+                            or region[0] >= region[2] or region[1] >= region[3]):
+                        raise SourceError('invalid_request', '图片区域须为0到1内正面积有限数字矩形')
+    return result
+
+
 def _check_batch_limits(attachments, decisions):
     if len(attachments) > MAX_BATCH_FILES or sum(d.get("parsed_bytes", 0) for d in decisions.values()) > MAX_BATCH_TEXT_BYTES:
         raise SourceError("limit_exceeded", "资料发布批次超过 100 件或 200 MiB 文本预算")
@@ -63,6 +110,17 @@ class KnowledgeIngest(BaseTool):
                 'required': ['reading_id', 'segment_id'], 'additionalProperties': False}})
         source = properties['pages']['items']['properties']['blocks']['items']['properties']['sources']
         source['items'] = {'oneOf': [dict(source['items'], additionalProperties=False), READING_SOURCE_SCHEMA]}
+        block = properties['pages']['items']['properties']['blocks']['items']
+        block['properties']['figures'] = {'type': 'array', 'description':
+            '选择支撑正文的关键原图。无图显式[]；局部扩大或整页兜底前须补读并保存具体视觉观察。pending须继续补图。',
+            'items': {'type': 'object', 'properties': {
+                'figure_key': {'type': 'string', 'minLength': 1, 'maxLength': 128},
+                'caption': {'type': 'string', 'minLength': 1, 'maxLength': 512},
+                'source': source['items'],
+                'region': {'type': 'array', 'items': {'type': 'number', 'minimum': 0, 'maximum': 1},
+                           'minItems': 4, 'maxItems': 4}},
+                'required': ['figure_key', 'caption', 'source'], 'additionalProperties': False}}
+        block['required'].append('figures')
 
     def execute(self, args):
         owner = current_identity().user_id
@@ -78,6 +136,7 @@ class KnowledgeIngest(BaseTool):
             if 'pages' in args:
                 from agent.knowledge.wiki import validate_page_summaries
                 validate_page_summaries(args['pages'])
+                args = dict(args, pages=_figure_pages(args['pages']))
             if not task_id:
                 if args.get("purpose") != "long_term" or not args.get("pages"):
                     raise SourceError("invalid_request", "没有接收任务时须提交带已登记有效出处的长期知识 pages")
@@ -92,6 +151,9 @@ class KnowledgeIngest(BaseTool):
                 if task["status"] == "queued":
                     task = store.claim(owner, task_id)
             task = store.get(owner, task_id)
+            if args.get('pages'):
+                from agent.knowledge.figure_publication import require_explicit_figures
+                require_explicit_figures(task, args['pages'])
             if task["status"] == "succeeded":
                 if task.get('reading_publication') and args.get('pages'):
                     submission = args.get('reading_submission_id')
@@ -127,7 +189,12 @@ class KnowledgeIngest(BaseTool):
                 from common import state_dir
                 workspace = self.config.get("workspace_root") or self.config.get("cwd") or state_dir.state_root()
                 with store.commit_guard(owner, task_id, attempt):
+                    if task.get('wiki_batch_id'):
+                        stage = 'pending_index'
+                        return ToolResult.success(resume_publication(task, store))
                     batch = WikiService(workspace, owner).prepare(args["pages"], task_id=task_id)
+                    from agent.knowledge.figure_publication import register_batch
+                    register_batch(store, task, batch['batch_id'], batch['batch_id'], workspace)
                     task = store._change(owner, task_id, attempt, {"running"}, stage="pending_index",
                         wiki_batch_id=batch["batch_id"], wiki_workspace=str(workspace))
                     stage = "pending_index"
@@ -249,7 +316,7 @@ class KnowledgeIngest(BaseTool):
                         return ToolResult.success(dict(task, organization_required=True,
                             source_materials=[dict(d["source"], parse_id=d.get("parse_id"), state_revision=d["state_revision"],
                                 visual_coverage=d.get("visual_coverage")) for d in long_term],
-                            next_action="实际读取 knowledge-wiki 和原文，按主题提炼后携带完整 pages 再调用本工具；无需向用户询问是否收录。"
+                            next_action="实际读取 knowledge-wiki 和原文，按主题提炼后携带完整 pages 再调用本工具；每块显式figures（无选图[]），选关键图、扩大前补读，pending继续补图。"
                                 + ("PDF原生首次读取只传path/pages/visual=true，不传parse_id、offset或limit；"
                                    "返回reading_id后按segment和真实观察提交reading_evidence及reading_coverage。"
                                    if enabled(self.config) or any(office_enabled(self.config, d['source']['filename'])
@@ -259,6 +326,8 @@ class KnowledgeIngest(BaseTool):
                         raise SourceError("invalid_request", "整理成品缺少本次长期资料的出处")
                     from agent.knowledge.wiki import WikiService
                     batch = WikiService(workspace, owner).prepare(pages, task_id=task_id)
+                    from agent.knowledge.figure_publication import register_batch
+                    register_batch(store, task, batch['batch_id'], batch['batch_id'], workspace)
                     for decision in long_term:
                         decision["ready"] = True
                     task = store._change(owner, task_id, attempt, {"running"}, stage="pending_index",
@@ -342,6 +411,12 @@ class KnowledgeIngest(BaseTool):
                         else:
                             raise SourceError('invalid_request', '出处须为四元身份或互斥阅读别名')
                     block['sources'] = sources
+                    for figure in block.get('figures', []):
+                        source = figure['source']
+                        if set(source) == {'reading_id', 'evidence_key'}:
+                            figure['source'] = dict(aliases[(source['reading_id'], source['evidence_key'])])
+                        if figure['source'] not in sources:
+                            raise SourceError('invalid_request', '图片出处与正文块不一致')
             if used != set(aliases):
                 raise SourceError('invalid_request', '图文观察与正文出处不对应')
             prepare_publication(store, task, submission, sorted(coverage), pages, workspace)
@@ -380,9 +455,40 @@ def resume_publication(task, store):
                 doc = SourceService(decision["workspace"], owner).get(decision["source"]["document_id"])
                 if doc["state"] != decision["state_revision"] or doc["purpose"] != decision["purpose"]:
                     raise SourceError("version_conflict", "来源用途或有效状态已变化")
-            refs = WikiService(current["wiki_workspace"], owner).publish(current["wiki_batch_id"])
+            from agent.knowledge.figure_publication import (
+                publish_candidate, reconcile_committed, register_batch, resume_publication as resume_figures,
+            )
+            reconcile_committed(store, current)
+            registered = register_batch(store, current, current['wiki_batch_id'], current['wiki_batch_id'], current['wiki_workspace'])
+            # 补图已形成新版本时，原正文批次作为历史保留，恢复不可重新发布它。
+            if registered and registered['status'] == 'published':
+                refs = list(registered['refs'])
+            else:
+                wiki = WikiService(current['wiki_workspace'], owner)
+                refs = (publish_candidate(wiki, current['wiki_batch_id'], current) if registered
+                        else wiki.publish(current['wiki_batch_id']))
             refs.extend(d["result_ref"] for d in decisions.values() if d["purpose"] == "transient")
-            return store.complete(owner, task_id, attempt, "published", refs)
+            reconcile_committed(store, current)
+            current = store.get(owner, task_id)
+            # 临时回执来自已核验的用途决定；在补图/完成屏障前持久保存，
+            # pending、部分发布及失败重试均须保留。长期成果仍以台账为准。
+            durable_refs = list(current['result_refs'])
+            for decision in decisions.values():
+                if decision['purpose'] == 'transient' and decision['result_ref'] not in durable_refs:
+                    durable_refs.append(decision['result_ref'])
+            current = store._change(owner, task_id, attempt, {'running'}, result_refs=durable_refs)
+            if 'figure_publication' in current:
+                current = resume_figures(store, current)
+                # 图片接续可能产生新版本，以台账最新回执交给最终完成屏障。
+                refs = current['result_refs']
+            try:
+                return store.complete(owner, task_id, attempt, "published", refs)
+            except ValueError as exc:
+                if getattr(exc, 'code', None) != 'figure_incomplete':
+                    raise
+                # 和原生阅读完成器一致：预算由受信 worker 管理，工具保留可接续任务。
+                store.stage(owner, task_id, attempt, 'publish')
+                return store.get(owner, task_id)
     if "attachment_decisions" not in task:
         return resume_legacy_publication(task, store)
     owner, task_id, attempt = task["owner_id"], task["task_id"], task["attempt"]

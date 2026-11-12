@@ -175,6 +175,9 @@ def verify_archive(db, source, pub):
         if not pub or not pub['verified']:
             raise ValueError()
         record = json.loads(pub['record'])
+        from agent.knowledge.wiki import publication_markdown
+        if _hash(publication_markdown(record).encode()) != pub['hash']:
+            raise ValueError()
         path = source.workspace / pub['path']
         if not path.resolve().is_relative_to(source.knowledge.resolve()) or _hash(path.read_bytes()) != pub['hash']:
             raise ValueError()
@@ -204,6 +207,8 @@ def verify_archive(db, source, pub):
                 metadata = verify_reading_unit(db, source, unit, snap)
                 if any(snap.get(key) != value for key, value in metadata.items()):
                     raise ValueError()
+        from agent.knowledge.figures import validate_manifest
+        validate_manifest(db, source, record, check_bytes=False)
         return record, path.read_text(encoding='utf-8')
     except (OSError, ValueError, KeyError, IndexError, TypeError) as exc:
         raise SourceError('storage_failed', '历史发布正文或出处核验失败') from exc
@@ -233,7 +238,7 @@ def _publication_path(wiki, path):
 
 
 def version(wiki, publish_id=None, *, path=None):
-    from agent.knowledge.wiki import refresh
+    from agent.knowledge.wiki import refresh, figure_state
     if (any(value is not None and not isinstance(value, str) for value in (publish_id, path))
             or bool(publish_id) == bool(path)):
         raise SourceError('invalid_request', 'publish_id 与 path 必须二选一')
@@ -250,6 +255,9 @@ def version(wiki, publish_id=None, *, path=None):
         record, content = verify_archive(db, wiki.source, pub)
         result = dict(page_id=record['page_id'], page_version=pub['id'], publish_id=pub['id'], title=record['title'], summary=record.get('summary', ''),
                       category=record['category'], path=Path(wiki.workspace / pub['path']).relative_to(wiki.knowledge).as_posix(), content=content, created_at=record.get('created_at'), **status(db, wiki.source, pub))
+        result['figure_state'] = figure_state(record)
+        if 'figure_manifest' in record:
+            result['figure_manifest'] = record['figure_manifest']
         if result['searchable']:
             result.update(metadata(db, record))
         current = db.execute('SELECT v.* FROM wiki_pages p JOIN wiki_publications v ON v.id=p.current WHERE p.id=?', (pub['page'],)).fetchone()

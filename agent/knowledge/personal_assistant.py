@@ -37,9 +37,9 @@ class SourceService:
         self.db = self.root / "sources.sqlite3"
         with self.transaction() as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1, 2):
+            if version not in (0, 1, 2, 3):
                 raise SourceError("version_conflict", f"不支持来源 schema {version}")
-            if version == 2:
+            if version >= 2 and (version == 2 or db.execute("SELECT 1 FROM sqlite_master WHERE name='reading_records'").fetchone()):
                 # 原生证据写入后，旧后端（只识别1）不得继续操作本数据根。
                 tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 if not {'reading_records', 'reading_aliases', 'reading_submissions',
@@ -79,7 +79,10 @@ class SourceService:
                         if valid:
                             db.execute("UPDATE documents SET publication=? WHERE id=?", (publication["id"], document["id"]))
                             break
-            db.execute(f"PRAGMA user_version={2 if version == 2 else 1}")
+            if version == 3:
+                from agent.knowledge.figures import validate_schema
+                validate_schema(db)
+            db.execute(f"PRAGMA user_version={max(1, version)}")
 
     @contextmanager
     def transaction(self):

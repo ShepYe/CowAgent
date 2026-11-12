@@ -123,7 +123,7 @@ class Read(BaseTool):
         "properties": {
             "path": {
                 "type": "string",
-                "description": "Path to the file to read. IMPORTANT: Relative paths are based on workspace directory. To access files outside workspace, use absolute paths starting with ~ or /."
+                "description": "文件路径或knowledge-figure:<publish_id>/<figure_id>；显式历史回看可附?view=history。图片须visual=true，通过主模型实际媒体读取后才回答视觉细节。相对文件路径基于工作区。"
             },
             "offset": {
                 "type": "integer",
@@ -183,6 +183,9 @@ class Read(BaseTool):
         # Support 'location' as alias for 'path' (LLM may use it from skill listing)
         path = args.get("path", "") or args.get("location", "")
         path = path.strip() if isinstance(path, str) else ""
+        # 逻辑图片身份绝不进入普通文件路径解析，包括非法 URI。
+        if path.lower().startswith('knowledge-figure:'):
+            return self._read_knowledge_figure(path, args)
         offset = args.get("offset")
         limit = args.get("limit")
         pages = args.get("pages")
@@ -325,6 +328,121 @@ class Read(BaseTool):
         # Read text file (with truncation for large files)
         return self._read_text(absolute_path, path, offset, limit)
     
+    def _read_knowledge_figure(self, path, args):
+        """只从发布清单取图；字节在真实主模型请求边界重新授权和读取。"""
+        import copy
+        import hashlib
+        from agent.protocol.tool_media import ToolMediaReference, ToolMediaContent, ToolMediaError
+        from common.runtime_identity import current_identity
+        from common.personal_tasks import current_task_id, TaskStore
+        from models.config_revision import capture_config_revision, require_config_revision
+        from agent.knowledge.reading_capabilities import capability_identity
+        match = re.fullmatch(r'knowledge-figure:([A-Za-z0-9_-]{1,256})/([A-Za-z0-9_-]{1,256})(\?view=history)?', path)
+        if not match or any(args.get(k) is not None for k in (
+                'pages', 'region', 'offset', 'limit', 'parse_id', 'worksheet', 'objects')):
+            return ToolResult.fail(dict(code='invalid_request', message='图片引用只接受publish_id/figure_id及可选?view=history'))
+        if args.get('visual', True) is not True:
+            return ToolResult.fail(dict(code='visual_disabled', media_attached=False, message='未看图：visual=false禁止新增视觉调用'))
+        identity, task_id = current_identity(), current_task_id()
+        if identity.user_id != 'local-owner':
+            return ToolResult.fail(dict(code='forbidden', message='未看图：无权读取此图片'))
+        from common import state_dir
+        base = Path(self.config.get('workspace_root') or self.cwd).resolve()
+        workspace = Path(state_dir.knowledge_dir(base=base)).resolve().parent
+        publish_id, figure_id = match.group(1, 2)
+        view = 'history' if match.group(3) else 'current'
+        model = getattr(self, 'model', None)
+        try:
+            from agent.knowledge.figures import resolve_figure
+            revision = capture_config_revision()
+            provider = capability_identity(model, revision) if model is not None else None
+            store = (self.config.get('task_store') or TaskStore()) if task_id else None
+            task = store.get(identity.user_id, task_id) if store else None
+            attempt = task['attempt'] if task else None
+
+            def authorize():
+                require_config_revision(revision)
+                if (current_identity() != identity or current_task_id() != task_id
+                        or Path(self.config.get('workspace_root') or self.cwd).resolve() != base
+                        or Path(state_dir.knowledge_dir(base=base)).resolve().parent != workspace
+                        or capability_identity(getattr(self, 'model', None), revision) != provider):
+                    raise ToolMediaError('media_context_lost')
+                if store:
+                    with store.commit_guard(identity.user_id, task_id, attempt) as current:
+                        if current['config_revision'] != revision:
+                            raise ToolMediaError('config_unavailable')
+
+            def check_budget(data):
+                from agent.knowledge.reading_materials import PdfBudget
+                budget = self.config.get('reading_pdf_budget') or PdfBudget()
+                value = lambda name: budget.get(name, getattr(PdfBudget(), name)) if isinstance(budget, dict) else getattr(budget, name)
+                if (len(data) > min(8 * 1024 * 1024, value('max_original_bytes'))
+                        or 4 * ((len(data) + 2) // 3) + value('request_overhead_bytes') > value('max_request_bytes')
+                        or value('reserved_input_tokens') + value('reserved_output_tokens')
+                            + value('estimated_tokens_per_page') > value('max_context_tokens')):
+                    raise ToolMediaError('reading_budget_exceeded')
+                if not data.startswith(b'\x89PNG\r\n\x1a\n'):
+                    raise ToolMediaError('invalid_tool_media')
+
+            # 即使能力不支持，也先验证所请求的发布和来源资格。
+            initial = resolve_figure(workspace, publish_id, figure_id, view=view)
+            if initial['mime_type'] != 'image/png' or not isinstance(initial['data'], bytes):
+                raise ToolMediaError('invalid_tool_media')
+            binding = copy.deepcopy(initial['item'])
+            digest = hashlib.sha256(initial['data']).hexdigest()
+            check_budget(initial['data'])
+            if provider is None:
+                raise ToolMediaError('attachment_unsupported')
+            authorize()
+            meta = getattr(model, 'catalog_model_meta', None)
+            per_model = getattr(getattr(model, 'bot', None), 'model_supports_vision', None)
+            capable = (callable(meta) and 'vision' in ((meta() or {}).get('capabilities') or [])) or (
+                callable(per_model) and per_model(getattr(model, 'model', '')) is True)
+            if not capable:
+                from agent.knowledge.image_reading_capabilities import ensure_image_capability
+                capable = ensure_image_capability(workspace, model, revision, 'image/png')
+            if not capable:
+                raise ToolMediaError('attachment_unsupported')
+
+            def supports(context):
+                try:
+                    authorize()
+                    return (context.get('protocol') == 'responses' and context.get('model') == provider['model']
+                        and context.get('provider') == provider['provider']
+                        and context.get('transport', 'inline') == 'inline'
+                        and context.get('config_revision') == revision and context.get('identity') == identity
+                        and context.get('task_id') == task_id
+                        and hashlib.sha256(str(context.get('api_base') or '').rstrip('/').encode()).hexdigest()
+                            == provider['endpoint_hash'])
+                except Exception:
+                    return False
+
+            def load(context):
+                if not supports(context):
+                    raise ToolMediaError('attachment_unsupported')
+                try:
+                    current = resolve_figure(workspace, publish_id, figure_id, view=view)
+                    data = current['data']
+                    if (current['item'] != binding or current['mime_type'] != 'image/png'
+                            or hashlib.sha256(data).hexdigest() != digest):
+                        raise ToolMediaError('media_validation_failed')
+                    check_budget(data)
+                    if not supports(context):
+                        raise ToolMediaError('attachment_unsupported')
+                    return ToolMediaContent('image/png', data)
+                except ToolMediaError:
+                    raise
+                except Exception:
+                    raise ToolMediaError('media_validation_failed') from None
+
+            authorize()
+            return ToolResult.success(dict(path=path, publish_id=publish_id, figure_id=figure_id,
+                view=view, media_attached=True, message='图片仅在紧接的主模型请求提供；请依据实际画面回答，后轮新视觉问题需再次read。'),
+                media=(ToolMediaReference(load, supports),))
+        except Exception as exc:
+            code = getattr(exc, 'code', None) or (str(exc) if isinstance(exc, ToolMediaError) else 'media_validation_failed')
+            return ToolResult.fail(dict(code=code, media_attached=False, message='未看图：图片或配置核验失败，不能仅凭图注断言视觉细节'))
+
     def _read_task_attachment(self, absolute_path, offset, limit, pages=None, *, visual=True, parse_id=None, region=None,
                               worksheet=None, objects=None):
         """Read authorized hash blobs using their registered original filename.
@@ -412,6 +530,10 @@ class Read(BaseTool):
                 from agent.knowledge.reading_capabilities import ensure_pdf_capability
                 if ensure_pdf_capability(workspace, self.model, task['config_revision']):
                     return self._read_native_pdf(store, task, workspace, receipt, page_range, region=region)
+                from agent.knowledge.figure_publication import figure_required
+                if figure_required(task) or 'figure_publication' in task:
+                    return ToolResult.fail(dict(code='attachment_unsupported', media_attached=False, retryable=True,
+                        message='未看图：当前配置的原生PDF能力尚未成功验证，请重试同一附件的原生read；图文任务不能用旧视觉缓存替代成功阅读凭据。'))
             if region is not None:
                 return ToolResult.fail(dict(code='attachment_unsupported', message='当前格式或配置尚未支持局部补读'))
             if is_pdf and not parse_id:
