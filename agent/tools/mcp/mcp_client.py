@@ -18,6 +18,7 @@ import urllib.error
 from typing import Optional
 
 from common.log import logger
+from common.deployment import is_desktop
 
 
 # System env vars a stdio MCP subprocess legitimately needs to run
@@ -26,6 +27,10 @@ from common.log import logger
 _STDIO_ENV_PASSTHROUGH = (
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE",
     "TERM", "TZ", "TMPDIR", "NODE_PATH", "NVM_DIR", "PYTHONPATH", "PYTHONHOME",
+    # Package mirrors, so npx / uvx can fetch the server where the default
+    # registries are slow or blocked.
+    "NPM_CONFIG_REGISTRY", "npm_config_registry", "PIP_INDEX_URL",
+    "PIP_EXTRA_INDEX_URL", "UV_INDEX_URL", "UV_DEFAULT_INDEX",
     # Windows essentials
     "SYSTEMROOT", "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT", "APPDATA",
     "LOCALAPPDATA", "USERPROFILE", "PROGRAMFILES", "PROGRAMFILES(X86)",
@@ -912,7 +917,7 @@ class McpClient:
             f"    {auth_url}"
         )
         # On a machine with a local browser (desktop/dev), open it directly.
-        if os.environ.get("COW_DESKTOP") == "1" or not os.environ.get("COW_HEADLESS"):
+        if is_desktop() or not os.environ.get("COW_HEADLESS"):
             try:
                 import webbrowser
                 webbrowser.open(auth_url)

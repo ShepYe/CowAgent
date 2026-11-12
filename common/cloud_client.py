@@ -58,6 +58,16 @@ PEER_RESULT_ACTION = "agent_invoke_result"
 # report normally arrives before we give up on our side.
 _PEER_GRACE_SECONDS = 15.0
 
+
+class AgentRegistryUnavailable(RuntimeError):
+    """A named Agent could not be resolved because the registry is down.
+
+    Distinct from an unknown Agent (``KeyError``): a registry that cannot be
+    loaded during a config reload or with a missing optional dependency is a
+    transient server-side failure. It must be reported as an error, never as
+    "no Agent was requested", which would answer with another Agent's data.
+    """
+
 # Guest pages rendered by the console and answered by the guest runtime here.
 GUEST_MSG_TYPE = "GUEST"
 
@@ -1223,7 +1233,14 @@ class CloudClient(LinkAIClient):
         """A SkillService over the requested agent's skills: its own set when it
         has one, else the shared set. Falls back to the process-wide service when
         no agent is requested, so single-agent installs are unaffected."""
-        workspace = self._agent_workspace(agent_id)
+        try:
+            workspace = self._agent_workspace(agent_id)
+        except KeyError:
+            raise
+        except Exception as e:
+            logger.error(f"[CloudClient] Cannot resolve agent workspace: {e}")
+            # A requested agent must never be answered with the default agent's data.
+            return None
         if workspace is None:
             return self.skill_service
         try:
@@ -1266,7 +1283,14 @@ class CloudClient(LinkAIClient):
         so single-agent installs are unaffected. A failed build for a requested
         agent yields None so the caller reports it rather than serving the
         default agent's data."""
-        workspace = self._agent_workspace(agent_id)
+        try:
+            workspace = self._agent_workspace(agent_id)
+        except KeyError:
+            raise
+        except Exception as e:
+            logger.error(f"[CloudClient] Cannot resolve agent workspace: {e}")
+            # A requested agent must never be answered with the default agent's data.
+            return None
         if workspace is None:
             return self.memory_service
         try:
@@ -1309,7 +1333,14 @@ class CloudClient(LinkAIClient):
         own knowledge/ reads that; otherwise it transparently reads the shared one.
         A failed build for a requested agent yields None so the caller reports it
         rather than serving the default agent's data."""
-        workspace = self._agent_workspace(agent_id)
+        try:
+            workspace = self._agent_workspace(agent_id)
+        except KeyError:
+            raise
+        except Exception as e:
+            logger.error(f"[CloudClient] Cannot resolve agent workspace: {e}")
+            # A requested agent must never be answered with the default agent's data.
+            return None
         if workspace is None:
             return self.knowledge_service
         try:
@@ -1354,7 +1385,14 @@ class CloudClient(LinkAIClient):
         requested, so single-agent installs are unaffected. A failed build for
         a requested agent yields None so the caller reports it rather than
         serving the default agent's data."""
-        workspace = self._agent_workspace(agent_id)
+        try:
+            workspace = self._agent_workspace(agent_id)
+        except KeyError:
+            raise
+        except Exception as e:
+            logger.error(f"[CloudClient] Cannot resolve agent workspace: {e}")
+            # A requested agent must never be answered with the default agent's data.
+            return None
         if workspace is None:
             return self.workspace_service
         try:
@@ -1593,11 +1631,16 @@ class CloudClient(LinkAIClient):
             return None
 
     def _agent_workspace(self, agent_id):
-        """Resolve a requested agent id to its workspace root, or None to keep
-        the default-agent behaviour when no agent is requested. An agent that is
-        requested but unknown raises KeyError rather than silently serving the
-        default agent's data (see AgentRegistry.get_addressed for the ids that
-        are tolerated)."""
+        """Resolve a requested agent id to its workspace root.
+
+        ``None`` means *no Agent was requested* and is the only case in which a
+        builder may use the process-wide default-agent service. A requested but
+        unknown Agent raises ``KeyError`` so the caller answers 404. A requested
+        Agent whose registry cannot be loaded raises ``AgentRegistryUnavailable``:
+        returning ``None`` here used to make every builder dispatch against the
+        default Agent's service and report success (the contract #3914 fixed in
+        the builders themselves still has to hold at their shared input).
+        """
         agent_id = str(agent_id).strip() if agent_id is not None else ""
         if not agent_id:
             return None
@@ -1605,8 +1648,7 @@ class CloudClient(LinkAIClient):
             from agent.registry import get_agent_registry
             registry = get_agent_registry()
         except Exception as e:
-            logger.warning(f"[CloudClient] agent registry unavailable, using default: {e}")
-            return None
+            raise AgentRegistryUnavailable(f"agent registry unavailable: {e}") from e
         return registry.get_addressed(agent_id, require_enabled=False).workspace
 
     @staticmethod
@@ -1853,6 +1895,10 @@ def get_deployment_id() -> str:
 
 def _deployment_base_url() -> str:
     """Return the URL prefix the deployment's websites/ dir is served at."""
+    base_url = str(conf().get("websites_base_url") or "").strip().rstrip("/")
+    if base_url.startswith(("http://", "https://")):
+        return base_url
+
     deployment_id = get_deployment_id()
     if not deployment_id:
         return ""
@@ -1904,7 +1950,7 @@ def get_publish_dir(workspace_dir: str = "", ensure: bool = False) -> str:
 def get_website_base_url(workspace_dir: str = "") -> str:
     """Return the URL prefix that maps to an Agent's websites/ dir.
 
-    Do nothing when in local env.
+    Empty unless ``websites_base_url`` or a deployment id says where it is served.
 
     The route serves the default Agent's directory at the root, so every other
     Agent is addressed by where its own directory sits relative to the instance
@@ -2012,9 +2058,9 @@ def _display_path(path: str) -> str:
 
 
 def build_website_prompt(workspace_dir: str) -> list:
-    """Build system prompt lines for cloud website/file sharing rules.
+    """Build system prompt lines for the website/file sharing rules.
 
-    Returns an empty list when cloud deployment is not configured,
+    Returns an empty list when the websites/ dir has no public address,
     so callers can safely do ``lines.extend(build_website_prompt(...))``.
 
     The directory is named absolutely rather than as a bare ``websites/``: each
@@ -2027,9 +2073,11 @@ def build_website_prompt(workspace_dir: str) -> list:
     pub = _display_path(get_publish_dir(workspace_dir))
 
     return [
-        "**文件分享与网页生成规则** (非常重要 — 当前为云部署模式):",
+        "**文件分享与网页生成规则** (非常重要):",
         "",
-        f"云端已为工作空间的 `{pub}/` 目录配置好公网路由映射，访问地址前缀为: `{base_url}`",
+        f"工作空间的 `{pub}/` 目录已配置公网访问，访问地址前缀为: `{base_url}`",
+        "",
+        "该目录下的文件任何拿到链接的人都能打开，**不要**放入密钥、配置文件或隐私数据",
         "",
         f"1. **网页/网站**: 编写网页、H5页面等前端代码时，**必须**将文件放到 `{pub}/` 目录中",
         f"   - 例如: `{pub}/index.html` → `{base_url}/index.html`",

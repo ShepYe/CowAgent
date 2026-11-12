@@ -143,6 +143,7 @@ class Bridge(object):
             v = (conf().get(k) or "").strip()
             return v != "" and v not in ("YOUR API KEY", "YOUR_API_KEY")
 
+        # CowAgent 的语音能力须显式设置 voice_to_text，不复用聊天密钥自动启用。
         for key, provider in (
             ("open_ai_api_key", "openai"),
             ("dashscope_api_key", "dashscope"),

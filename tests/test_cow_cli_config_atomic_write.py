@@ -91,3 +91,25 @@ def test_a_failed_uninstall_keeps_the_existing_records(tmp_path, monkeypatch):
     assert _read(config_path) == EXISTING
     # nothing of the aborted replacement is left beside the file
     assert _leftover(config_path) == ["skills_config.json"]
+
+
+@pytest.mark.parametrize('provider', ['custom:relay', 'custom', 'linkai', 'cowagent'])
+@pytest.mark.parametrize('model', ['gpt-6.1-sol', 'claude-sonnet-5-5', 'gemini-4-argon'])
+def test_model_command_preserves_aggregator_binding(tmp_path, monkeypatch, provider, model):
+    import config
+    settings = config.Config({'bot_type': provider, 'model': 'old',
+                              'custom_providers': [{'id': 'relay', 'api_type': 'responses',
+                                                    'api_base': 'https://relay.example.invalid/v1',
+                                                    'api_key': 'fixture-key'}]})
+    path = tmp_path / 'config.json'
+    path.write_text(json.dumps(settings), encoding='utf-8')
+    monkeypatch.setattr(config, 'get_data_root', lambda: str(tmp_path))
+    monkeypatch.setattr(config, 'load_config', lambda: None)
+    monkeypatch.delenv('MODEL', raising=False)
+    monkeypatch.delenv('model', raising=False)
+    with config.config_scope(settings):
+        CowCliPlugin()._config_set('model', model)
+    saved = _read(path)
+    assert saved['model'] == model
+    assert saved['bot_type'] == provider
+    assert saved['custom_providers'] == settings['custom_providers']

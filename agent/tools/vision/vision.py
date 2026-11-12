@@ -85,6 +85,9 @@ _MODEL_PREFIX_TO_PROVIDER = [
     ("deepseek-", "DeepSeek"),
 ]
 
+# Vision model of the CowAgent API when the user has not pinned one.
+_COWAGENT_VISION_MODEL = "deepseek-v4.1-flash"
+
 # Model prefixes that natively belong to OpenAI / LinkAI (raw HTTP providers).
 _OPENAI_MODEL_PREFIXES = ("gpt-", "o1-", "o3-", "o4-", "chatgpt-")
 
@@ -94,6 +97,7 @@ _OPENAI_MODEL_PREFIXES = ("gpt-", "o1-", "o3-", "o4-", "chatgpt-")
 _PROVIDER_ID_TO_DISPLAY = {
     "openai": "OpenAI",
     "linkai": "LinkAI",
+    "cowagent": "CowAgent",
     "moonshot": "Moonshot",
     "doubao": "Doubao",
     "dashscope": "DashScope",
@@ -264,6 +268,7 @@ class Vision(BaseTool):
         if preferred:
             providers.extend(preferred)
 
+        # CowAgent 只由上面的显式绑定加入，不凭聊天密钥进入自动候选。
         # Step 2: auto-discovery chain as fallback
         existing = {p.name for p in providers}
         fallback: List[VisionProvider] = []
@@ -399,6 +404,9 @@ class Vision(BaseTool):
             return [p] if p else None
         if provider_id == "linkai":
             p = self._build_linkai_provider(user_model)
+            return [p] if p else None
+        if provider_id == "cowagent":
+            p = self._build_cowagent_provider(user_model)
             return [p] if p else None
 
         # Discoverable bot-backed providers.
@@ -620,6 +628,9 @@ class Vision(BaseTool):
             bot = self.model.bot
         except Exception:
             return None
+        # 主聊天模型的视觉能力不等于工具授权；CowAgent 须走显式视觉绑定。
+        if getattr(bot, "_bot_type", None) == "cowagent":
+            return None
         if not hasattr(bot, 'call_vision'):
             return None
         if not self._main_bot_supports_vision(bot):
@@ -681,6 +692,19 @@ class Vision(BaseTool):
             api_base=self._ensure_v1(api_base),
             extra_headers=extra,
             model_override=preferred_model,
+        )
+
+    def _build_cowagent_provider(self, preferred_model: Optional[str] = None) -> Optional[VisionProvider]:
+        """为显式绑定创建 CowAgent 视觉客户端，未指定模型时使用本站默认模型。"""
+        from models.cowagent_provider import resolve_cowagent_credentials
+        api_key, api_base = resolve_cowagent_credentials()
+        if not api_key:
+            return None
+        return VisionProvider(
+            name="CowAgent",
+            api_key=api_key,
+            api_base=self._ensure_v1(api_base),
+            model_override=preferred_model or _COWAGENT_VISION_MODEL,
         )
 
     def _build_custom_provider(self, provider_id: str, preferred_model: Optional[str] = None) -> Optional[VisionProvider]:

@@ -38,7 +38,7 @@ def create_default_embedding_provider():
 
 
 def _init_legacy_provider():
-    """Legacy auto-init path: OpenAI -> LinkAI."""
+    """旧配置只沿用 OpenAI -> LinkAI，CowAgent 须显式绑定。"""
     from agent.memory.embedding.provider import create_embedding_provider
     from config import conf
 
@@ -170,6 +170,10 @@ def _resolve_api_key(provider_key: str) -> str:
                 return entry.get("api_key", "")
         return ""
 
+    if provider_key == "cowagent":
+        from models.cowagent_provider import resolve_cowagent_credentials
+        return resolve_cowagent_credentials()[0]
+
     key_map = {
         "openai":    "open_ai_api_key",
         "linkai":    "linkai_api_key",
@@ -198,6 +202,10 @@ def _resolve_api_base(provider_key: str, default_base: str) -> str:
             if entry and entry.get("api_base"):
                 return entry["api_base"]
         return default_base
+
+    if provider_key == "cowagent":
+        from models.cowagent_provider import resolve_cowagent_credentials
+        return resolve_cowagent_credentials()[1]
 
     base_map = {
         "openai":    "open_ai_api_base",

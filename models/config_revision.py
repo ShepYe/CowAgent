@@ -30,13 +30,18 @@ def _revision(snapshot):
     return "cfg1-" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _snapshot():
+    from models.cowagent_provider import bind_cowagent_config
+    return bind_cowagent_config(copy.deepcopy(dict(conf())))
+
+
 def capture_config_revision() -> str:
     """Capture before receipt commit; do not hold config_lock at the call site."""
     pinned = _pinned_config.get()
     if pinned is not None:
         return pinned[0]
     with config_lock:
-        return _revision(conf())
+        return _revision(_snapshot())
 
 
 def require_config_revision(revision: str) -> None:
@@ -61,7 +66,7 @@ def use_config_revision(revision: str):
             yield
         return
     with config_lock:
-        snapshot = copy.deepcopy(dict(conf()))
+        snapshot = _snapshot()
         if revision != _revision(snapshot):
             raise ConfigUnavailable()
     token = _pinned_config.set((revision, copy.deepcopy(snapshot)))

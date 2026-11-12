@@ -29,7 +29,7 @@ _SERVER = """for line in sys.stdin:
 @contextmanager
 def native_client(tmp_path, call_result=None, pages=None):
     script = tmp_path / "server.py"
-    script.write_text(f"import json,sys\ncall={call_result!r}\npages={pages!r}\n" + _SERVER)
+    script.write_text(f"import json,sys\ncall={call_result!r}\npages={pages!r}\n" + _SERVER, encoding='utf-8')
     client = McpClient({"name": "fixture", "type": "stdio", "command": sys.executable, "args": [str(script)], "timeout": 3})
     assert client.initialize()
     try:

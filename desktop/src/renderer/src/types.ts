@@ -729,6 +729,13 @@ export interface ModelCatalogEntry {
   alias?: string
 }
 
+export interface ApiBasePreset {
+  label: LocalizedLabel
+  value: string
+  /** Where keys for this base are created. */
+  keys_url?: string
+}
+
 export interface ModelProvider {
   id: string
   label: LocalizedLabel
@@ -741,8 +748,12 @@ export interface ModelProvider {
   api_base_field?: string | null
   api_key_masked?: string
   api_base?: string
+  /** 应用运行时默认值前的配置地址；空值表示未填写，旧 API 可省略。 */
+  configured_api_base?: string
   api_base_default?: string
   api_base_placeholder?: string
+  /** One-click bases offered next to the API Base field. */
+  api_base_presets?: ApiBasePreset[]
   // The model catalog is an OVERLAY on the presets, not a replacement:
   // - `catalog` is the user's raw overrides (edited/added entries),
   // - `hidden` is the preset names the user removed (tombstones),

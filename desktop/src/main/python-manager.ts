@@ -803,6 +803,7 @@ export class PythonBackend extends EventEmitter {
         PATH: this.resolveEnvPath(),
         PYTHONUNBUFFERED: '1',
         COW_DESKTOP: '1',
+        COW_DEPLOYMENT: 'desktop',
         // The shell owns the port: tell the backend to bind exactly here so the
         // two sides can never disagree (and we avoid the 9899 web-console clash).
         COW_WEB_PORT: String(this.port),

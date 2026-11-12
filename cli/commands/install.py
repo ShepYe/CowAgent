@@ -66,14 +66,22 @@ def _get_glibc_version():
         return None
 
 
+_CHINA_MIRROR_KEYWORDS = ("tsinghua", "aliyun", "npmmirror", "douban", "ustc", "huawei", "tencentyun")
+
+
 def _is_china_network() -> bool:
+    # Containers usually set the mirror through the environment, not pip.conf.
+    for name in ("PIP_INDEX_URL", "UV_INDEX_URL", "UV_DEFAULT_INDEX", "NPM_CONFIG_REGISTRY", "npm_config_registry"):
+        url = (os.environ.get(name) or "").lower()
+        if any(kw in url for kw in _CHINA_MIRROR_KEYWORDS):
+            return True
     try:
         out = subprocess.check_output(
             [sys.executable, "-m", "pip", "config", "get", "global.index-url"],
             stderr=subprocess.DEVNULL,
         )
         url = out.decode().strip().lower()
-        return any(kw in url for kw in ("tsinghua", "aliyun", "npmmirror", "douban", "ustc", "huawei", "tencentyun"))
+        return any(kw in url for kw in _CHINA_MIRROR_KEYWORDS)
     except Exception:
         return False
 
@@ -373,7 +381,8 @@ def run_install_browser(
     except Exception:
         pass
 
-    use_mirror = _is_china_network()
+    # Only an automatically selected mirror may fall back to the official CDN.
+    use_mirror = not env.get("PLAYWRIGHT_DOWNLOAD_HOST") and _is_china_network()
     if use_mirror:
         env["PLAYWRIGHT_DOWNLOAD_HOST"] = CHINA_MIRROR
         stream(f"  (using China mirror: {CHINA_MIRROR})", None)
