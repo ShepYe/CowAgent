@@ -15,7 +15,7 @@ from agent.protocol.cancel import AgentCancelledError
 from agent.protocol.models import LLMRequest, LLMModel
 from agent.protocol.message_utils import (
     sanitize_claude_messages,
-    compress_turn_to_text_only,
+    compress_turn_to_text_only as _compress_turn_to_text_only,
     identify_complete_turns,
     build_compaction_summary_text,
     find_first_user_text_block,
@@ -23,6 +23,37 @@ from agent.protocol.message_utils import (
 from agent.tools.base_tool import BaseTool, ToolResult, is_tool_available, renders_own_cards
 from common.log import logger
 from common.i18n import t as _t
+
+
+def compress_turn_to_text_only(turn):
+    """压缩仍保留非敏感阅读标识；重新读取须由服务重新校验并创建引用。"""
+    compressed = _compress_turn_to_text_only(turn)
+    reading_ids = []
+    for msg in turn.get("messages", []):
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            try:
+                result = json.loads(block.get("content", ""))
+            except (TypeError, ValueError):
+                result = {}
+            reading_id = result.get("reading_id") if isinstance(result, dict) else None
+            if not reading_id:
+                marker = re.search(r"\[Reading reference: ([A-Za-z0-9_-]{1,128})\]", str(block.get("content", "")))
+                reading_id = marker.group(1) if marker else None
+            if (isinstance(reading_id, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", reading_id)
+                    and reading_id not in reading_ids):
+                reading_ids.append(reading_id)
+    if reading_ids:
+        note = {"type": "text", "text": "[Reading references: " + ", ".join(reading_ids) + "]"}
+        if compressed["messages"] and compressed["messages"][-1]["role"] == "assistant":
+            compressed["messages"][-1]["content"].append(note)
+        else:
+            compressed["messages"].append({"role": "assistant", "content": [note]})
+    return compressed
 
 # Optional: repair malformed JSON args from non-strict providers (e.g. unescaped quotes in long content).
 try:
@@ -325,6 +356,7 @@ class AgentStreamExecutor:
 
         # Message history - use provided messages or create new list
         self.messages = messages if messages is not None else []
+        self._pending_tool_media = {}
         # This run's user query, the anchor callers use to find the messages
         # the run added (see run_start_index).
         self.run_user_message = None
@@ -1293,6 +1325,11 @@ class AgentStreamExecutor:
                                 f"\n\n[Output truncated: {truncated_len} chars total, showing first {MAX_CURRENT_TURN_RESULT_CHARS} chars]"
                             logger.info(f"📎 Truncated tool result for '{tool_call['name']}': {truncated_len} -> {MAX_CURRENT_TURN_RESULT_CHARS} chars")
 
+                        if tool_call["id"] in self._pending_tool_media:
+                            reading_id = (result.get("result") or {}).get("reading_id") if isinstance(result.get("result"), dict) else None
+                            if isinstance(reading_id, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", reading_id):
+                                result_content += "\n[Reading reference: " + reading_id + "]"
+
                         tool_result_block = {
                             "type": "tool_result",
                             "tool_use_id": tool_call["id"],
@@ -1426,6 +1463,7 @@ class AgentStreamExecutor:
             raise
 
         finally:
+            self._pending_tool_media.clear()
             _ACTIVE_RUN_MODELS.reset(_active_token)
             if _run_token is not None:
                 clear_agent_run_id(_run_token)
@@ -1746,8 +1784,10 @@ class AgentStreamExecutor:
         stop_reason = None  # Track why the stream stopped
         stream_usage = None  # Real token usage from the provider, if reported
 
+        stream = None
         try:
-            stream = self.model.call_stream(request)
+            from agent.protocol.tool_media import stream_with_tool_media
+            stream = stream_with_tool_media(self.model, request, self._pending_tool_media)
 
             # Probe cancel every N chunks to bound reaction time without
             # checking on every token.
@@ -1922,6 +1962,8 @@ class AgentStreamExecutor:
             raise
 
         except Exception as e:
+            if stream is not None and hasattr(stream, "close"):
+                stream.close()
             error_str = str(e)
             error_str_lower = error_str.lower()
 
@@ -2101,6 +2143,10 @@ class AgentStreamExecutor:
             else:
                 logger.error(f"❌ LLM call error (non-retryable): {e}", exc_info=True)
             raise
+
+        finally:
+            if stream is not None and hasattr(stream, "close"):
+                stream.close()
 
         # Persist the provider-reported usage (if any) so the context-usage
         # indicator can show a real prompt_tokens count instead of the estimate.
@@ -2517,6 +2563,8 @@ class AgentStreamExecutor:
                 self._emit_event("tool_execution_start", start_event)
                 self._emit_event("tool_execution_end", end_event)
 
+            if result.status == "success" and getattr(result, "media", None):
+                self._pending_tool_media[tool_id] = result.media
             return result_dict
 
         except Exception as e:
@@ -2684,6 +2732,9 @@ class AgentStreamExecutor:
                     original_len = len(result_str)
                     block["content"] = result_str[:MAX_HISTORY_RESULT_CHARS] + \
                         f"\n\n[Historical output truncated: {original_len} -> {MAX_HISTORY_RESULT_CHARS} chars]"
+                    marker = re.search(r"\[Reading reference: [A-Za-z0-9_-]{1,128}\]", result_str)
+                    if marker and marker.group(0) not in block["content"]:
+                        block["content"] += "\n" + marker.group(0)
                     truncated_count += 1
 
         if truncated_count > 0:

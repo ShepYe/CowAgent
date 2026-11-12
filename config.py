@@ -20,6 +20,12 @@ from cli.config_json import deep_merge_dicts as _deep_merge_dicts, merge_duplica
 # They merely document the expected format — put real values in config.json.
 available_setting = {
     "personal_assistant_enabled": False,
+    # 按格式验收后启用；PDF与Office分别放行，不迁移旧任务。
+    "document_reading_native_pdf_enabled": False,
+    "document_reading_native_docx_enabled": False,
+    "document_reading_native_pptx_enabled": False,
+    "document_reading_soffice": "soffice",
+    "document_reading_conversion_timeout": 120,
     "personal_feishu_binding": {},
     # global UI language for CLI, startup logs, error messages, agent prompts
     # and channel replies. Options: "auto" (detect from system locale, default),
@@ -32,6 +38,8 @@ available_setting = {
     "open_ai_api_base": "https://api.openai.com/v1",
     # openai api protocol: "auto" (GPT major version >= 6 defaults to Responses), "chat" or "responses"
     "open_ai_api_type": "auto",
+    # 兼容不接受缓存路由提示的Responses网关；关闭不改变对话或观察缓存。
+    "responses_prompt_cache_enabled": True,
     "claude_api_base": "https://api.anthropic.com/v1",  # claude api base
     # Prompt cache TTL for the system prompt + tools in agent mode: "1h" or "5m".
     # Use "5m" if the endpoint rejects the 1h TTL; the conversation always uses 5m.

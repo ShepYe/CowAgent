@@ -59,6 +59,7 @@ for _sub in ('api', 'core'):
 # Agent tools and model providers are imported lazily in places; collect their
 # submodules so nothing is missed at runtime.
 hiddenimports += collect_submodules('agent.tools')
+hiddenimports += collect_submodules('agent.knowledge')
 hiddenimports += collect_submodules('models')
 hiddenimports += collect_submodules('voice')
 hiddenimports += collect_submodules('bridge')
@@ -118,6 +119,8 @@ hiddenimports += [
     'docx',           # python-docx
     'pptx',           # python-pptx
     'openpyxl',
+    'PIL.Image',
+    'PIL.PngImagePlugin',  # XLSX 嵌图及 PDFium 区域补读的 PNG 编解码。
 ]
 hiddenimports += collect_submodules('pypdf')
 hiddenimports += collect_submodules('docx')

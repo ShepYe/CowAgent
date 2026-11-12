@@ -106,6 +106,12 @@ def test_cache_key_omitted_without_session():
         assert make_key("gpt-6.1-sol", {}, {}) is None
 
 
+def test_responses_cache_routing_can_be_disabled_for_gateway():
+    from config import Config, config_scope
+    with config_scope(Config({'responses_prompt_cache_enabled': False})), identity_scope(session_id='gateway-session'):
+        assert OpenAICompatibleBot._responses_prompt_cache_key('gpt-6.1-sol', {}, {}) is None
+
+
 @pytest.mark.parametrize("model", ["gpt-5.4", "gpt-6.2-sol", "gpt-7-sol", "gateway-next-model"])
 def test_responses_cache_key_does_not_require_known_model(model):
     assert OpenAICompatibleBot._responses_prompt_cache_key(model, {}, {"session_id": "session-a"})

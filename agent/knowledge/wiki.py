@@ -111,7 +111,7 @@ def _source(db, service, source, *, published=False):
         if not row or revision not in allowed or doc['purpose'] != 'long_term' or doc['validity'] != 'active':
             raise SourceError('version_conflict', '来源版本或用途已失效')
         record = json.loads(row['record'])
-        if _hash(Path(record['original']).read_bytes()) != record['sha256']:
+        if _hash((service.root / 'originals' / record['sha256']).read_bytes()) != record['sha256']:
             raise SourceError('storage_failed', '原件哈希不符')
         raw = (service.root / 'parses' / f'{parse_id}.json').read_bytes()
         parsed = json.loads(raw)
@@ -126,6 +126,9 @@ def _source(db, service, source, *, published=False):
         result = dict(document_id=document, revision_id=revision, parse_id=parse_id, ordinal=ordinal,
                       location=unit['location'], filename=record['filename'], source_state_snapshot=doc,
                       text=unit['text'], parse_hash=_hash(raw))
+        if 'reading_provenance' in unit:
+            from agent.knowledge.reading import verify_reading_unit
+            result.update(verify_reading_unit(db, service, unit, result))
         # Never trust model supplied locations, filenames or snapshots.
         return result
     except SourceError:
@@ -520,7 +523,8 @@ class WikiService:
                 raise SourceError('invalid_request', '出处下标不存在')
             source = _public_source(record['sources'][ordinal])
             revision = json.loads(db.execute('SELECT record FROM revisions WHERE id=?', (source['revision_id'],)).fetchone()[0])
-            original = revision['original']
+            original = (str(self.source.root / 'originals' / revision['sha256'])
+                        if 'reading_id' in source else revision['original'])
             if _hash(Path(original).read_bytes()) != revision['sha256']:
                 raise SourceError('storage_failed', '原件哈希不符')
             page = db.execute('SELECT * FROM wiki_pages WHERE id=?', (record['page_id'],)).fetchone()

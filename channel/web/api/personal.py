@@ -2,7 +2,12 @@
 import hashlib
 import json
 import mimetypes
+import re
+import sqlite3
 import tempfile
+from contextlib import contextmanager
+from contextvars import ContextVar
+from functools import wraps
 from pathlib import Path
 from urllib.parse import quote
 
@@ -16,6 +21,232 @@ from channel.web.core._common import (
 from common.personal_tasks import TaskStore, TaskError, OWNER
 
 MAX_FILE = 100 * 1024 * 1024
+_read_context = ContextVar('personal_api_read_context', default=None)
+
+
+def _read_request(function):
+    """一次 GET 共用只读快照；不把服务或核验结果缓存到后续请求。"""
+    @wraps(function)
+    def read(*args, **kwargs):
+        if _read_context.get() is not None:
+            return function(*args, **kwargs)
+        context = dict(source=None, wiki=None, parses={})
+        token = _read_context.set(context)
+        try:
+            return function(*args, **kwargs)
+        finally:
+            if context['source'] is not None:
+                context['source'].close()
+            _read_context.reset(token)
+    return read
+
+
+class _ReadSource:
+    """API 只读视图：原库仅用于 SQLite backup，耗时文件核验使用内存副本。
+
+    不运行 SourceService 初始化、schema 迁移、parse 或投影刷新；写入口仍
+    使用原服务。复用现有来源和 Wiki 核验器，不降低 hash／身份检查。
+    """
+    def __init__(self, workspace):
+        self.owner = OWNER
+        self.workspace = Path(workspace).resolve()
+        self.root = self.workspace / '.personal_sources'
+        self.knowledge = self.workspace / 'knowledge'
+        self.db = self.root / 'sources.sqlite3'
+        self.snapshot = sqlite3.connect(':memory:')
+        self.snapshot.row_factory = sqlite3.Row
+        self.parses = {}
+        try:
+            source = sqlite3.connect(self.db.as_uri() + '?mode=ro', uri=True)
+            try:
+                source.backup(self.snapshot)
+            finally:
+                source.close()
+            self.snapshot.execute('PRAGMA query_only=ON')
+            version = self.snapshot.execute('PRAGMA user_version').fetchone()[0]
+            if version not in (1, 2):
+                raise TaskError('version_conflict')
+            required = {
+                'documents': {'id', 'current', 'state', 'purpose', 'validity', 'publication'},
+                'revisions': {'id', 'document', 'record'},
+                'publications': {'id', 'document', 'revision', 'parse', 'path', 'hash', 'record'},
+                'keyword_units': {'publication', 'ordinal', 'text', 'location'},
+                'wiki_pages': {'id', 'current', 'status', 'reason'},
+                'wiki_publications': {'id', 'page', 'path', 'hash', 'verified', 'record'},
+                'wiki_units': {'publication', 'ordinal', 'text'},
+                'wiki_sources': {'publication', 'ordinal', 'document', 'revision', 'record'},
+                'wiki_dependencies': {'publication', 'page', 'version'},
+                'wiki_source_heads': {'document', 'revision', 'generation'},
+                'wiki_legacy_retirements': {'document', 'publish_id'},
+                'wiki_categories': {'page', 'category', 'mode', 'revision'},
+            }
+            for table, columns in required.items():
+                if not columns.issubset({r[1] for r in self.snapshot.execute('PRAGMA table_info(' + table + ')')}):
+                    raise TaskError('storage_failed')
+            if version == 2:
+                tables = {r[0] for r in self.snapshot.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                if not {'reading_records', 'reading_aliases', 'reading_submissions',
+                        'reading_parse_heads', 'reading_resumes'}.issubset(tables):
+                    raise TaskError('version_conflict')
+                for row in self.snapshot.execute('SELECT record FROM reading_records'):
+                    record = json.loads(row[0])
+                    if not isinstance(record, dict) or record.get('schema_version') != 1:
+                        raise TaskError('version_conflict')
+        except BaseException as exc:
+            self.close()
+            if isinstance(exc, sqlite3.Error):
+                raise TaskError('storage_failed') from exc
+            raise
+
+    def close(self):
+        self.snapshot.close()
+
+    @contextmanager
+    def transaction(self):
+        try:
+            yield self.snapshot
+        except sqlite3.Error as exc:
+            raise TaskError('storage_failed') from exc
+
+    @staticmethod
+    def _document(db, document_id):
+        from agent.knowledge.personal_assistant import SourceService
+        return SourceService._document(db, document_id)
+
+    def get(self, document_id):
+        return self._document(self.snapshot, document_id)
+
+    def registered_revision(self, document_id, revision_id=None):
+        from agent.knowledge.personal_assistant import SourceService
+        return SourceService.registered_revision(self, document_id, revision_id)
+
+    def _valid(self, document, publication, db=None):
+        from agent.knowledge.personal_assistant import SourceService
+        return SourceService._valid(self, document, publication, db)
+
+    def current_publication(self, document_id, revision_id):
+        db = self.snapshot
+        rows = db.execute('SELECT DISTINCT v.* FROM wiki_publications v JOIN wiki_sources s ON s.publication=v.id '
+                          'JOIN wiki_pages p ON p.current=v.id WHERE s.document=? AND s.revision=? ORDER BY v.rowid DESC',
+                          (document_id, revision_id)).fetchall()
+        wiki = _wiki_service()
+        for row in rows:
+            current = wiki.current(row['page'])
+            if current and current['publish_id'] == row['id']:
+                from agent.knowledge.wiki import _ref
+                record = json.loads(row['record'])
+                ordinal = next(i for i, s in enumerate(record['sources'])
+                               if s['document_id'] == document_id and s['revision_id'] == revision_id)
+                return _ref(record, ordinal, db=db)
+        document = self.get(document_id)
+        for row in db.execute('SELECT * FROM publications WHERE document=? AND revision=? ORDER BY rowid DESC',
+                              (document_id, revision_id)):
+            if self._valid(document, row, db):
+                return json.loads(row['record'])
+        return None
+
+    def read_reference(self, publish_id, ordinal, *, historical=False):
+        if self.snapshot.execute('SELECT 1 FROM wiki_publications WHERE id=?', (publish_id,)).fetchone():
+            return _wiki_service().read_reference(publish_id, ordinal, historical)
+        from agent.knowledge.personal_assistant import SourceService
+        return SourceService.read_reference(self, publish_id, ordinal, historical=historical)
+
+    def parse(self, revision_id):
+        """显示已有离线解析进度；GET 不创建解析或更新解析稿。"""
+        if revision_id not in self.parses:
+            row = self.snapshot.execute('SELECT document,record FROM revisions WHERE id=?', (revision_id,)).fetchone()
+            if not row:
+                raise TaskError('invalid_request')
+            revision = json.loads(row['record'])
+            from agent.knowledge.personal_assistant import _hash, _json
+            best = None
+            for path in (self.root / 'parses').glob('*.json'):
+                try:
+                    parsed = json.loads(path.read_text(encoding='utf-8'))
+                    if any(parsed.get(k) != v for k, v in dict(parse_id=path.stem, document_id=row['document'],
+                            revision_id=revision_id, sha256=revision['sha256']).items()):
+                        continue
+                    payload = {k: v for k, v in parsed.items() if k not in ('parse_id', 'document_id', 'revision_id', 'sha256')}
+                    if _hash(_json([revision['sha256'], payload]).encode()) != path.stem:
+                        continue
+                    coverage = parsed.get('visual_coverage', [])
+                    rank = (sum(bool(p.get('ocr') or p.get('visual_interpretation')) for p in coverage),
+                            sum(p.get('status') == 'processed' for p in coverage),
+                            len(parsed.get('units', [])), sum(p.get('attempts', 0) for p in coverage),
+                            path.stat().st_mtime_ns, path.stem)
+                    if best is None or rank > best[0]:
+                        best = rank, parsed
+                except (OSError, ValueError, TypeError, AttributeError):
+                    continue
+            self.parses[revision_id] = best[1] if best else None
+        return self.parses[revision_id]
+
+
+class _ReadWiki:
+    """当前／历史页面只读核验；不在轮询或引用回读中 refresh 全库投影。"""
+    def __init__(self, source):
+        self.source = source
+        self.verified = {}
+        self.currents = {}
+
+    def _publication(self, publish_id):
+        if publish_id not in self.verified:
+            from agent.knowledge.catalog import verify_archive
+            from agent.knowledge.wiki import _valid
+            with self.source.transaction() as db:
+                pub = db.execute('SELECT * FROM wiki_publications WHERE id=?', (publish_id,)).fetchone()
+                record, _ = verify_archive(db, self.source, pub)
+                self.verified[publish_id] = record, _valid(db, self.source, pub)
+        return self.verified[publish_id]
+
+    def current(self, page_id):
+        from agent.knowledge.wiki import _ref, _valid
+        if page_id in self.currents:
+            return self.currents[page_id]
+        with self.source.transaction() as db:
+            pub = db.execute('SELECT v.* FROM wiki_pages p JOIN wiki_publications v ON v.id=p.current WHERE p.id=?',
+                             (page_id,)).fetchone()
+            self.currents[page_id] = _ref(json.loads(pub['record']), db=db) if _valid(db, self.source, pub) else None
+        return self.currents[page_id]
+
+    def read_reference(self, publish_id, ordinal=0, historical=False):
+        from agent.knowledge.wiki import _ref, _public_source
+        record, valid = self._publication(publish_id)
+        if not valid and not historical:
+            raise TaskError('version_conflict')
+        if type(ordinal) is not int or not 0 <= ordinal < len(record['sources']):
+            raise TaskError('invalid_request')
+        with self.source.transaction() as db:
+            source = _public_source(record['sources'][ordinal])
+            revision = json.loads(db.execute('SELECT record FROM revisions WHERE document=? AND id=?',
+                                  (source['document_id'], source['revision_id'])).fetchone()[0])
+            original = (self.source.root / 'originals' / revision['sha256']
+                        if source.get('reading_id') else Path(revision['original']))
+            if hashlib.sha256(original.read_bytes()).hexdigest() != revision['sha256']:
+                raise TaskError('storage_failed')
+            page = db.execute('SELECT * FROM wiki_pages WHERE id=?', (record['page_id'],)).fetchone()
+            result = _ref(record, db=db) if valid else _ref(record)
+            result.update(source)
+            result.update(source_ordinal=ordinal, original=str(original), valid=valid, searchable=valid,
+                          current_status='current' if valid else ('superseded' if page['current'] != publish_id else 'paused'),
+                          pause_reason=page['reason'], blocks=record['blocks'],
+                          content='\n\n'.join(b['content'] for b in record['blocks']))
+            return result
+
+    def references(self, publish_id):
+        from agent.knowledge.wiki import source_head
+        ref = self.read_reference(publish_id, historical=True)
+        with self.source.transaction() as db:
+            sources = []
+            for i, source in enumerate(ref['sources']):
+                state = self.source._document(db, source['document_id'])
+                head = source_head(db, source['document_id'])
+                status = state['validity'] if state['validity'] != 'active' else (
+                    'current' if state == source['source_state_snapshot'] and head and head[0] == source['revision_id']
+                    else 'superseded_or_changed')
+                sources.append(dict(source, source_ordinal=i, valid=ref['valid'], current_status=ref['current_status'],
+                                    source_state=state, source_status=status))
+            return sources
 
 
 def _reply(**data):
@@ -47,11 +278,21 @@ def _body():
 
 
 def _source_service():
+    context = _read_context.get()
+    if context is not None:
+        if context['source'] is None:
+            context['source'] = _ReadSource(_get_workspace_root())
+        return context['source']
     from agent.knowledge.personal_assistant import SourceService
     return SourceService(_get_workspace_root(), owner_id=OWNER)
 
 
 def _wiki_service():
+    context = _read_context.get()
+    if context is not None:
+        if context['wiki'] is None:
+            context['wiki'] = _ReadWiki(_source_service())
+        return context['wiki']
     from agent.knowledge.wiki import WikiService
     return WikiService(_get_workspace_root(), owner_id=OWNER)
 
@@ -62,15 +303,70 @@ def _task_source_refs(task):
 
 
 def _display_parse(source, service, cache):
-    """视觉展示使用本修订最佳离线解析；引用的不可变 parse_id 不变。"""
-    key = (source.get('document_id'), source.get('revision_id'))
+    """native 仅加载引用解析稿；旧来源沿用本修订最佳离线解析。"""
+    native = bool(source.get('reading_id'))
+    key = (source.get('document_id'), source.get('revision_id'), source.get('parse_id') if native else None)
     if key not in cache:
         parse = getattr(service, 'parse', None)
-        parsed = parse(source['revision_id']) if callable(parse) else None
+        parsed = None if native else parse(source['revision_id']) if callable(parse) else None
         if not isinstance(parsed, dict):
+            if not isinstance(source.get('parse_id'), str) or not re.fullmatch(r'[\w-]+', source['parse_id']):
+                raise TaskError('invalid_request')
             parsed = json.loads((service.root / 'parses' / (source['parse_id'] + '.json')).read_text(encoding='utf-8'))
         cache[key] = parsed
     return cache[key]
+
+
+def _public_reading_source(source):
+    """材料路径只留在受信服务端，不交给浏览器选择文件。"""
+    result = dict(source)
+    if isinstance(result.get('reading_copy'), dict):
+        result['reading_copy'] = {k: v for k, v in result['reading_copy'].items() if k != 'path'}
+    if isinstance(result.get('sources'), list):
+        result['sources'] = [_public_reading_source(s) for s in result['sources']]
+    return result
+
+
+@_read_request
+def _reading_progress(task):
+    if 'reading_publication' not in task:
+        return None
+    from agent.knowledge.reading_publication import publication_state
+    ledger = publication_state(TaskStore(), task)
+    if ledger is None:
+        raise TaskError('version_conflict')
+    targets = set(ledger['targets'])
+    delivered, unknown, prepared = set(), set(), set()
+    service = _source_service()
+    with service.transaction() as db:
+        exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='reading_records'").fetchone()
+        records = db.execute('SELECT record FROM reading_records').fetchall() if exists else []
+        for row in records:
+            record = json.loads(row[0])
+            if record.get('owner_id') != OWNER or record.get('task_id') != task['task_id']:
+                continue
+            if record.get('schema_version') != 1:
+                raise TaskError('version_conflict')
+            from agent.knowledge.reading import _materials
+            materials = _materials(service.workspace, record)
+            if any(record.get(key) != getattr(materials, key) for key in ('document_id', 'revision_id', 'config_revision')):
+                raise TaskError('version_conflict')
+            for segment in record['segments']:
+                pages = set(materials.coverage_keys(segment['target_pages'])) & targets
+                if segment['state'] == 'completed' and segment.get('delivery_receipt_id'):
+                    delivered.update(pages)
+                elif segment['state'] in ('sent', 'unknown'):
+                    unknown.update(pages)
+                else:
+                    prepared.update(pages)
+    # 送达与语义理解分开；已发布范围只取受信发布台账。
+    published = targets - set(ledger['remaining'])
+    return dict(schema_version=1, targets=sorted(targets), delivered=sorted(delivered),
+                unknown=sorted(unknown - delivered), prepared=sorted(prepared - delivered - unknown),
+                pending=sorted(targets - delivered), published=sorted(published),
+                remaining=ledger['remaining'], published_batches=sum(
+                    b['status'] == 'published' for b in ledger['batches'].values()),
+                task_complete=task['status'] == 'succeeded' and not ledger['remaining'])
 
 
 def _decorate_source(source, service, parse_cache):
@@ -94,9 +390,10 @@ def _decorate_source(source, service, parse_cache):
     return source
 
 
+@_read_request
 def _decorate(task):
     refs = []
-    parse_cache = {}
+    parse_cache = _read_context.get()['parses']
     for ref in task.get('result_refs', []):
         ref = dict(ref)
         if ref.get('page_id'):
@@ -130,7 +427,8 @@ def _decorate(task):
                 warnings = []
                 seen_revisions = set()
                 for source in ref.get('sources') or [ref]:
-                    key = (source.get('document_id'), source.get('revision_id'))
+                    key = (source.get('document_id'), source.get('revision_id'),
+                           source.get('parse_id') if source.get('reading_id') else None)
                     if source.get('parse_id') and key not in seen_revisions:
                         seen_revisions.add(key)
                         parsed = _display_parse(source, service, parse_cache)
@@ -141,10 +439,17 @@ def _decorate(task):
             except (ValueError, OSError):
                 ref['source_state'] = None
                 ref['current_searchable'] = False
-        refs.append(ref)
-    return {**task, 'result_refs': refs, 'attachments': _decorate_attachments(task)}
+        refs.append(_public_reading_source(ref))
+    result = {**task, 'result_refs': refs, 'attachments': _decorate_attachments(task)}
+    if 'reading_publication' in task:
+        try:
+            result['reading_progress'] = _reading_progress(task)
+        except (ValueError, OSError, KeyError, TypeError):
+            result['reading_progress'] = {'schema_version': 1, 'unavailable': True}
+    return result
 
 
+@_read_request
 def _decorate_attachments(task):
     """逻辑身份来自受信登记决定，字节校验只验证该关联。"""
     attachments = []
@@ -172,6 +477,7 @@ def _decorate_attachments(task):
 
 
 class PersonalTasksHandler:
+    @_read_request
     def GET(self):
         _require_auth()
         try:
@@ -194,7 +500,7 @@ class PersonalTasksHandler:
                 raise TaskError('invalid_request')
             uploaded = files[0]
             filename = Path((getattr(uploaded, 'filename', '') or '').replace('\\', '/')).name
-            if Path(filename).suffix.lower() not in {'.pdf', '.docx', '.xlsx', '.md', '.txt'}:
+            if Path(filename).suffix.lower() not in {'.pdf', '.docx', '.pptx', '.xlsx', '.md', '.txt'}:
                 raise TaskError('invalid_request')
             content = _read_uploaded_file_bytes_limited(uploaded, MAX_FILE)
             if len(content) > MAX_FILE:
@@ -450,43 +756,84 @@ class PersonalOriginalHandler:
             return _error(exc)
 
 
+@_read_request
+def _reference_data(task_id, publish_id, ordinal):
+    """按任务发布回执授权，目录 ordinal 与解析 ordinal 分开处理。"""
+    if type(ordinal) is not int or ordinal < 0:
+        raise TaskError('invalid_request')
+    task = TaskStore().get(OWNER, task_id)
+    if not any(ref.get('publish_id') == publish_id for ref in task['result_refs']):
+        raise TaskError('forbidden')
+    service = _source_service()
+    reference = service.read_reference(publish_id, ordinal, historical=True)
+    if reference.get('page_id'):
+        units = _wiki_service().references(publish_id)
+        units = [dict(unit, ordinal=i, source_ordinal=unit['ordinal'] if unit['ordinal'] != i else unit.get('source_ordinal', unit['ordinal']))
+                 for i, unit in enumerate(units)]
+        if ordinal >= len(units):
+            raise TaskError('invalid_request')
+        source = units[ordinal]
+        revision = service.registered_revision(source['document_id'], source['revision_id'])
+        original = service.root / 'originals' / revision['sha256'] if source.get('reading_id') else Path(revision['original'])
+        if hashlib.sha256(original.read_bytes()).hexdigest() != revision['sha256']:
+            raise TaskError('storage_failed')
+        parsed = _display_parse(source, service, {}) if source.get('reading_id') else json.loads(
+            (service.root / 'parses' / (source['parse_id'] + '.json')).read_text(encoding='utf-8'))
+        unit = parsed['units'][source['source_ordinal']]
+        reference.update(text=unit['text'], location=source['location'], ordinal=ordinal,
+                         source_ordinal=source['source_ordinal'], sources=units)
+    else:
+        parsed = json.loads((service.root / 'parses' / (reference['parse_id'] + '.json')).read_text(encoding='utf-8'))
+        units = parsed['units']
+        unit = units[ordinal]
+        source = dict(reference, ordinal=ordinal)
+    reference.update(type=unit.get('type', 'text'), origin=unit.get('origin', 'source'))
+    reference.pop('reading_copy', None)
+    if unit.get('reading_provenance'):
+        from agent.knowledge.reading import verify_reading_unit
+        with service.transaction() as db:
+            proof = verify_reading_unit(db, service, unit, dict(source, ordinal=source.get('source_ordinal', ordinal)))
+        reference.update(proof)
+    reference['units'] = [{**{k: item[k] for k in (
+        'document_id', 'revision_id', 'parse_id', 'location', 'filename', 'source_ordinal', 'source_status', 'type', 'origin') if k in item},
+        'ordinal': i} for i, item in enumerate(units)]
+    reference['unit_count'] = len(units)
+    reference.pop('original', None)
+    return reference
+
+
+class PersonalReadingCopyHandler:
+    @_read_request
+    def GET(self, task_id, publish_id):
+        _require_auth()
+        try:
+            params = web.input(ordinal='0')
+            if any(key in params for key in ('path', 'owner', 'owner_id', 'parse_id', 'reading_id')):
+                raise TaskError('invalid_request')
+            reference = _reference_data(task_id, publish_id, int(params.ordinal))
+            copy = reference.get('reading_copy')
+            if not copy:
+                raise TaskError('forbidden')
+            from agent.knowledge.reading_materials import _relative
+            data = _relative(_source_service().workspace, copy['path']).read_bytes()
+            if hashlib.sha256(data).hexdigest() != copy['sha256'] or not data.startswith(b'%PDF-'):
+                raise TaskError('storage_failed')
+            web.header('Content-Type', 'application/pdf')
+            web.header('Content-Disposition', 'inline; filename="reading-copy.pdf"')
+            web.header('Cache-Control', 'no-store')
+            web.header('X-Content-Type-Options', 'nosniff')
+            return data
+        except (ValueError, OSError, KeyError, TypeError, IndexError) as exc:
+            return _error(exc)
+
+
 class PersonalReferenceHandler:
     def GET(self, task_id, publish_id):
         _require_auth()
         try:
-            task = TaskStore().get(OWNER, task_id)
-            if not any(ref.get('publish_id') == publish_id for ref in task['result_refs']):
-                raise TaskError('forbidden')
-            ordinal = int(web.input(ordinal='0').ordinal)
-            if ordinal < 0:
-                raise TaskError('invalid_request')
-            service = _source_service()
-            reference = service.read_reference(publish_id, ordinal, historical=True)
-            # 位置目录来自已发布版本的解析稿，不接受客户端指定 parse 路径。
-            if reference.get('page_id'):
-                units = _wiki_service().references(publish_id)
-                # 兼容此前把两种 ordinal 反向命名的返回；对外统一目录索引与解析索引。
-                units = [dict(unit, ordinal=i, source_ordinal=unit['ordinal'] if unit['ordinal'] != i else unit.get('source_ordinal', unit['ordinal']))
-                         for i, unit in enumerate(units)]
-                unit = units[ordinal]
-                revision = service.registered_revision(unit['document_id'], unit['revision_id'])
-                if hashlib.sha256(Path(revision['original']).read_bytes()).hexdigest() != revision['sha256']:
-                    raise TaskError('storage_failed')
-                parsed = json.loads((service.root / 'parses' / (unit['parse_id'] + '.json')).read_text(encoding='utf-8'))
-                reference['text'] = parsed['units'][unit['source_ordinal']]['text']
-                reference['location'] = unit['location']
-                reference['ordinal'] = ordinal
-                reference['source_ordinal'] = unit['source_ordinal']
-                reference['sources'] = units
-            else:
-                parsed = json.loads((service.root / 'parses' / (reference['parse_id'] + '.json')).read_text(encoding='utf-8'))
-                units = parsed['units']
-            reference['units'] = [{**{k: unit[k] for k in ('document_id', 'revision_id', 'parse_id', 'location', 'filename', 'source_ordinal', 'source_status') if k in unit},
-                                   'ordinal': i} for i, unit in enumerate(units)]
-            reference['unit_count'] = len(units)
-            reference.pop('original', None)
-            return _reply(status='success', reference=reference)
-        except (ValueError, OSError) as exc:
+            reference = _reference_data(task_id, publish_id, int(web.input(ordinal='0').ordinal))
+            return _reply(status='success', reference=_public_reading_source(reference))
+        except (ValueError, OSError, KeyError, TypeError, IndexError) as exc:
             return _error(exc)
 
 

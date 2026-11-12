@@ -61,11 +61,12 @@ class TaskStore:
             self.lock = _locks.setdefault(str(self.db), threading.RLock())
         with self._transaction() as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1):
-                raise TaskError("version_conflict", f"任务库需要 schema {version}，当前支持 1")
+            if version not in (0, 1, 2):
+                raise TaskError("version_conflict", f"任务库需要 schema {version}，当前支持 1/2")
             db.execute("CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, owner TEXT NOT NULL, request_id TEXT NOT NULL, fingerprint TEXT NOT NULL, record TEXT NOT NULL, UNIQUE(owner,request_id))")
             db.execute("CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, at TEXT NOT NULL, record TEXT NOT NULL)")
-            db.execute("PRAGMA user_version=1")
+            db.execute("CREATE TABLE IF NOT EXISTS reading_publications (task_id TEXT PRIMARY KEY, record TEXT NOT NULL)")
+            db.execute("PRAGMA user_version=" + str(max(1, version)))
 
     @contextmanager
     def _transaction(self):
@@ -208,7 +209,19 @@ class TaskStore:
     def complete(self, owner, task_id, attempt, outcome, result_refs):
         if outcome not in {"published", "transient", "duplicate"}:
             raise TaskError("invalid_request")
-        return self._change(owner, task_id, attempt, {"running"}, status="succeeded", stage="done", outcome=outcome, result_refs=result_refs, error=None)
+        with self._transaction() as db:
+            r = self._read(db, owner, task_id)
+            if r["attempt"] != attempt or r["status"] != "running":
+                raise TaskError("version_conflict")
+            if "reading_publication" in r:
+                from agent.knowledge.reading_publication import _load, _satisfied
+                ledger = _load(db, r)
+                if outcome != "published" or not _satisfied(ledger):
+                    raise TaskError("reading_incomplete")
+                # 调用方不能用最后一批回执覆盖之前的成果。
+                result_refs = r["result_refs"]
+            r.update(status="succeeded", stage="done", outcome=outcome, result_refs=result_refs, error=None)
+            return self._save(db, r)
 
     def wait_input(self, owner, task_id, attempt, question):
         return self._change(owner, task_id, attempt, {"running"}, status="waiting_input", stage="decide", question=question)
@@ -218,7 +231,14 @@ class TaskStore:
                             error={"code": code, "stage": stage, "message": code, "retryable": retryable})
 
     def cancel(self, owner, task_id, attempt):
-        return self._change(owner, task_id, attempt, {"queued", "running", "waiting_input"}, status="cancelled")
+        with self.lock:
+            r = self.get(owner, task_id)
+            if r["attempt"] != attempt or r["status"] not in {"queued", "running", "waiting_input"}:
+                raise TaskError("version_conflict")
+            if "reading_publication" in r:
+                from agent.knowledge.reading_publication import reconcile_committed
+                reconcile_committed(self, r)
+            return self._change(owner, task_id, attempt, {"queued", "running", "waiting_input"}, status="cancelled")
 
     def retry(self, owner, task_id, attempt):
         r = self.get(owner, task_id)
@@ -243,7 +263,11 @@ class TaskStore:
         """本地下载/决策可幂等重做；发布阶段须查知识登记后明确接续。"""
         for r in self.list():
             if r["status"] == "running":
-                self._change(OWNER, r["task_id"], r["attempt"], {"running"}, status="needs_reconcile")
+                updates = {"status": "needs_reconcile"}
+                if "reading_publication" in r:
+                    # 重启隔离旧回调；持久候选由可信恢复器关联新 attempt。
+                    updates["attempt"] = r["attempt"] + 1
+                self._change(OWNER, r["task_id"], r["attempt"], {"running"}, **updates)
         return self.list()
 
 

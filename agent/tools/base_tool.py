@@ -19,19 +19,21 @@ class ToolResult:
     """
 
     def __init__(self, status: str = None, result: Any = None, ext_data: Any = None,
-                 display: Optional[str] = None):
+                 display: Optional[str] = None, media=None):
         self.status = status
         self.result = result
         self.ext_data = ext_data
         self.display = display
+        # Opaque runtime references; never part of result/ext_data or events.
+        self.media = tuple(media or ())
 
     @staticmethod
-    def success(result, ext_data: Any = None, display: Optional[str] = None):
-        return ToolResult(status="success", result=result, ext_data=ext_data, display=display)
+    def success(result, ext_data: Any = None, display: Optional[str] = None, media=None):
+        return ToolResult(status="success", result=result, ext_data=ext_data, display=display, media=media)
 
     @staticmethod
-    def fail(result, ext_data: Any = None, display: Optional[str] = None):
-        return ToolResult(status="error", result=result, ext_data=ext_data, display=display)
+    def fail(result, ext_data: Any = None, display: Optional[str] = None, media=None):
+        return ToolResult(status="error", result=result, ext_data=ext_data, display=display, media=media)
 
 
 def _as_int(value) -> Optional[int]:

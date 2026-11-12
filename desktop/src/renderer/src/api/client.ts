@@ -1403,6 +1403,10 @@ class ApiClient {
     return this.request(`/api/personal/tasks/${encodeURIComponent(taskId)}/reference/${encodeURIComponent(publishId)}?ordinal=${ordinal}`)
   }
 
+  personalReadingCopy(taskId: string, publishId: string, ordinal: number, batchPage: number): string {
+    return this.withToken(`${this.baseUrl}/api/personal/tasks/${encodeURIComponent(taskId)}/reading-copy/${encodeURIComponent(publishId)}?ordinal=${ordinal}`) + `#page=${batchPage}`
+  }
+
   personalOriginal(taskId: string, attachmentId: string): string {
     return this.withToken(`${this.baseUrl}/api/personal/tasks/${encodeURIComponent(taskId)}/original/${encodeURIComponent(attachmentId)}`)
   }
@@ -1717,6 +1721,11 @@ export interface PersonalTask {
   payload?: { text?: string; filename?: string; source_action?: Record<string, unknown>; reorganize?: { document_id: string; revision_id: string; expected_state: number } }
   attachments: { attachment_id: string; filename: string; sha256: string; source_document_id?: string; source_revision_id?: string }[]
   result_refs: Record<string, unknown>[]
+  reading_progress?: {
+    schema_version: number; unavailable?: boolean; targets?: string[]; delivered?: string[];
+    prepared?: string[]; unknown?: string[]; pending?: string[]; published?: string[];
+    remaining?: string[]; published_batches?: number; task_complete?: boolean
+  }
 }
 export interface PersonalResponse { status: string; message?: string; code?: string; task?: PersonalTask }
 export interface PersonalBinding { channel_instance_id: string; app_id: string; tenant_id: string; sender_open_id: string }
@@ -1748,6 +1757,10 @@ export interface PersonalSourceAction {
   request_id?: string
 }
 export interface PersonalReference {
+  type?: string
+  origin?: string
+  reading_id?: string
+  reading_copy?: { page_map: number[]; sha256: string; manifest_hash: string; source_page_map?: Record<string, unknown>[]; source_format?: string; coverage_gaps?: string[] }
   title?: string
   category?: string
   filename?: string
@@ -1757,5 +1770,5 @@ export interface PersonalReference {
   ordinal: number
   source_ordinal?: number
   unit_count: number
-  units: { ordinal: number; source_ordinal?: number; filename?: string; location: Record<string, unknown> }[]
+  units: { ordinal: number; source_ordinal?: number; filename?: string; type?: string; origin?: string; location: Record<string, unknown> }[]
 }

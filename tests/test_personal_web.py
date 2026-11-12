@@ -54,6 +54,27 @@ def test_upload_archives_before_dispatch_and_deduplicates(api, monkeypatch):
     assert conflict['code'] == 'idempotency_conflict'
 
 
+def test_upload_accepts_pptx_original_without_changing_bytes(api, monkeypatch):
+    from pptx import Presentation
+    content = io.BytesIO()
+    deck = Presentation()
+    deck.slides.add_slide(deck.slide_layouts[6])
+    deck.save(content)
+    raw = content.getvalue()
+    mod, store, enqueue = api
+    monkeypatch.setattr(mod, '_multipart_lists', lambda _: {
+        'file': [SimpleNamespace(filename='演示.pptx', file=io.BytesIO(raw))],
+        'request_id': ['pptx-upload'], 'text': ['整理可见幻灯片'],
+    })
+    response = json.loads(mod.PersonalTasksHandler().POST())
+    assert response['status'] == 'success', response
+    attachment = store.attachment(OWNER, response['task']['task_id'], 'file-0')
+    from pathlib import Path
+    assert Path(attachment['path']).read_bytes() == raw
+    assert attachment['filename'] == '演示.pptx'
+    enqueue.assert_called_once()
+
+
 def test_attempt_conflict_returns_latest_and_no_dispatch(api, monkeypatch):
     mod, store, enqueue = api
     task = store.submit(OWNER, 'r', {}, {'channel': 'web'}, 'cfg')

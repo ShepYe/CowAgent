@@ -33,7 +33,7 @@ def recover():
     for r in records:
         if r["status"] == "needs_reconcile":
             # 知识发布的恢复由知识登记核对；不盲目重新调用模型。
-            if r.get("wiki_batch_id") or r.get("source_candidates") or r.get("attachment_decisions") or r["stage"] in {"receive", "download", "decide"}:
+            if "reading_publication" in r or r.get("wiki_batch_id") or r.get("source_candidates") or r.get("attachment_decisions") or r["stage"] in {"receive", "download", "decide"}:
                 r = store._change(OWNER, r["task_id"], r["attempt"], {"needs_reconcile"}, status="queued")
             else:
                 store.fail(OWNER, r["task_id"], r["attempt"], "needs_reconcile", r["stage"])
@@ -61,17 +61,32 @@ def _notify(store, task, text):
 
 def _run(task_id):
     store = TaskStore()
+    running_attempt = None
     try:
         task = store.get(OWNER, task_id)
         if task["status"] == "succeeded":
             _notify(store, task, task.get("response") or "处理已完成，请在桌面查看结果。")
             return
         task = store.claim(OWNER, task_id)
+        running_attempt = task["attempt"]
         from models.config_revision import require_config_revision
         require_config_revision(task["config_revision"])
         decisions = task.get("attachment_decisions") or {}
         fully_decided = bool(decisions) and len(decisions) == len(task["attachments"]) and all(d.get("ready") for d in decisions.values())
-        if task.get("wiki_batch_id") or task.get("source_candidates") or fully_decided:
+        if "reading_publication" in task:
+            # 只从受信持久检查点恢复阅读登记，不能采用模型工具参数中的目录。
+            from agent.knowledge.reading import ReadingService
+            workspaces = {d["workspace"] for d in decisions.values() if d.get("workspace")}
+            if not workspaces and task.get("wiki_workspace"):
+                workspaces.add(task["wiki_workspace"])
+            for workspace in sorted(workspaces):
+                ReadingService(workspace, task_store=store).resume_all(task)
+            from agent.knowledge.reading_publication import resume_publication as resume_reading
+            task = resume_reading(store, task)
+            if task["status"] == "succeeded":
+                _notify(store, task, "资料索引与发布已完成，可检索。")
+                return
+        elif task.get("wiki_batch_id") or task.get("source_candidates") or fully_decided:
             from agent.tools.knowledge_ingest import resume_publication
             store.stage(OWNER, task_id, task["attempt"], "pending_index")
             resume_publication(task, store)
@@ -98,11 +113,19 @@ def _run(task_id):
         store.stage(OWNER, task_id, task["attempt"], "decide")
         response = run_agent(task)
         task = store.get(OWNER, task_id)
+        if task["attempt"] != running_attempt:
+            return
         if task["status"] == "cancelled":
             _notify(store, task, "任务已取消。原始记录与附件保留。")
             return
         if task["status"] == "running":
-            if task["attachments"]:
+            if "reading_publication" in task:
+                from agent.knowledge.reading_publication import resume_publication as resume_reading
+                task = resume_reading(store, task)
+                if task["status"] == "running":
+                    store.fail(OWNER, task_id, running_attempt, "reading_incomplete", "parse")
+                    response = "阅读范围尚未全部完成，已发布成果保留，可继续重试。"
+            elif task["attachments"]:
                 # 只有 Agent 明确调用 waiting 才向用户追问；缺少整理成品属于处理未完成。
                 store.fail(OWNER, task_id, task["attempt"], "organization_incomplete", "publish")
             else:
@@ -114,7 +137,7 @@ def _run(task_id):
         _notify(store, task, response or "处理记录已保存，请在桌面查看。")
     except Exception as exc:
         task = store.get(OWNER, task_id)
-        if task["status"] == "running":
+        if task["status"] == "running" and task["attempt"] == running_attempt:
             code = getattr(exc, "code", "processing_failed")
             from common.log import logger
             logger.warning('[PersonalTask] task=%s attempt=%s stage=%s failed code=%s',
@@ -132,6 +155,13 @@ def run_agent(task):
     from common.runtime_identity import identity_scope
     query = task["payload"].get("text", "")
     query += "\n" + task.get("clarification", "")
+    if "reading_publication" in task:
+        import json
+        from agent.knowledge.reading_publication import publication_state
+        state = publication_state(TaskStore(), task)
+        query += ("\n[系统阅读目标] 继续未完成范围；已成功发布的批次不得重复提交。目标不可缩小。\n"
+                  + json.dumps({"targets": state["targets"], "remaining": state["remaining"],
+                                "result_refs": task["result_refs"]}, ensure_ascii=False))
     if task["attachments"]:
         import json
         query += ("\n[系统接收记录] task_id=" + task["task_id"] +

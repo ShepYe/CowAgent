@@ -1,5 +1,11 @@
 {
   "cow_lang": "auto",
+  "document_reading_native_pdf_enabled": true,
+  "document_reading_native_docx_enabled": false,
+  "document_reading_native_pptx_enabled": false,
+  "document_reading_soffice": "soffice",
+  "document_reading_conversion_timeout": 120,
+  "responses_prompt_cache_enabled": false,
   "channel_type": "web",
   "model": "deepseek-flash",
   "deepseek_api_key": "",

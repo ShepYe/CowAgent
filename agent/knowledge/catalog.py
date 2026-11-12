@@ -137,6 +137,11 @@ def verify_archive(db, source, pub):
             unit = parsed['units'][snap['ordinal']]
             if unit['text'] != snap['text'] or unit['location'] != snap['location'] or revision['filename'] != snap['filename']:
                 raise ValueError()
+            if 'reading_provenance' in unit:
+                from agent.knowledge.reading import verify_reading_unit
+                metadata = verify_reading_unit(db, source, unit, snap)
+                if any(snap.get(key) != value for key, value in metadata.items()):
+                    raise ValueError()
         return record, path.read_text(encoding='utf-8')
     except (OSError, ValueError, KeyError, IndexError, TypeError) as exc:
         raise SourceError('storage_failed', '历史发布正文或出处核验失败') from exc

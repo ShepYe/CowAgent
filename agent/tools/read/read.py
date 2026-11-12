@@ -4,6 +4,7 @@ Supports text files, images (jpg, png, gif, webp), and PDF files
 """
 
 import os
+import re
 import shlex
 import stat
 import sys
@@ -134,10 +135,17 @@ class Read(BaseTool):
             },
             "pages": {
                 "type": "string",
-                "description": f"PDF only: page range to extract, e.g. \"3\", \"1-5\" or \"10-\". Defaults to the first {PDF_MAX_PAGES_PER_READ} pages; at most {PDF_MAX_PAGES_PER_READ} pages are read per call."
+                "description": f"PDF物理页／Word或PPT阅读副本页范围，如3、1-5、10-。默认前{PDF_MAX_PAGES_PER_READ}页；实际媒体批次受预算约束，按next_pages继续。PPT原件slide位置见source_locations。"
             },
-            "parse_id": {"type": "string", "description": "个人 PDF 续读时回传上次 parse_id，复用已登记视觉结果和 ordinal；继续视觉批次也使用此基线。"},
-            "visual": {"type": "boolean", "description": "个人 PDF 是否显式处理下一批待视觉页，默认 true。仅分页读取已有解析稿时传 false，避免重复模型调用。"}
+            "region": {
+                "type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4,
+                "description": "局部放大补读：归一化[left,top,right,bottom]，左上为原点。须同时用pages指定单页；PDF为原件页，Word/PPT为阅读副本页。不替代整页覆盖。"
+            },
+            "worksheet": {"type": "string", "description": "XLSX精确工作表名，可缩小嵌图和公式结构回执。"},
+            "objects": {"type": "array", "items": {"type": "string"},
+                        "description": "XLSX局部看图：先read取得spreadsheet.images的object_key，再显式选择这些键。空选择只返回结构；图表不重算、不当作已渲染。"},
+            "parse_id": {"type": "string", "description": "显式回读旧解析稿与ordinal，或旧视觉批次续处理时使用；原生PDF首次及按pages续读不传此字段。"},
+            "visual": {"type": "boolean", "description": "默认true，能力允许时直接提供原生PDF；原生读取只传path/pages，不加offset/limit/parse_id。false禁止新增媒体及视觉调用，仅返回文字／已有缓存。"}
         },
         "required": ["path"]
     }
@@ -178,6 +186,13 @@ class Read(BaseTool):
         offset = args.get("offset")
         limit = args.get("limit")
         pages = args.get("pages")
+        region = args.get("region")
+        if region is not None and (args.get('worksheet') is not None or args.get('objects') is not None):
+            return ToolResult.fail(dict(code='invalid_request', message='region与XLSX对象选择不可混用'))
+        if region is not None and (args.get('visual', True) is not True or args.get('parse_id')
+                or offset is not None or limit is not None or not isinstance(pages, str)
+                or not re.fullmatch(r'[1-9]\d*', pages)):
+            return ToolResult.fail(dict(code='invalid_request', message='局部补读须指定单页pages，且visual=true、不带offset/limit/parse_id'))
 
         if not path:
             return ToolResult.fail("Error: path parameter is required")
@@ -209,7 +224,8 @@ class Read(BaseTool):
             return ToolResult.fail(DENIED_MESSAGE)
 
         attachment_result = self._read_task_attachment(absolute_path, offset, limit, pages,
-            visual=args.get("visual", True), parse_id=args.get("parse_id"))
+            visual=args.get("visual", True), parse_id=args.get("parse_id"), region=region,
+            worksheet=args.get('worksheet'), objects=args.get('objects'))
         if attachment_result is not None:
             return attachment_result
         
@@ -250,6 +266,8 @@ class Read(BaseTool):
         # Check file type
         file_ext = Path(absolute_path).suffix.lower()
         file_size = os.path.getsize(absolute_path)
+        if file_ext != '.xlsx' and (args.get('worksheet') is not None or args.get('objects') is not None):
+            return ToolResult.fail(dict(code='invalid_request', message='worksheet/objects仅用于XLSX'))
         
         # Check if image - return metadata for sending
         if file_ext in self.image_extensions:
@@ -265,16 +283,50 @@ class Read(BaseTool):
         
         # Check if PDF
         if file_ext in self.pdf_extensions:
+            from agent.knowledge.reading_flow import enabled
+            if (enabled(self.config) and args.get('visual', True) is True and not args.get('parse_id')
+                    and offset is None and limit is None):
+                try:
+                    native = self._read_general_native_pdf(absolute_path, pages, region=region)
+                except Exception as exc:
+                    return ToolResult.fail(dict(code=getattr(exc, 'code', 'reading_failed'), message=str(exc)))
+                if native is not None:
+                    return native
+            if region is not None:
+                return ToolResult.fail(dict(code='attachment_unsupported', message='当前配置尚未支持原生PDF局部补读'))
             return self._read_pdf(absolute_path, path, offset, limit, pages)
 
         # Check if Office document (.docx, .xlsx, .pptx, etc.)
         if file_ext in self.office_extensions:
-            return self._read_office(absolute_path, path, file_ext, offset, limit)
+            from agent.knowledge.reading_flow import office_enabled
+            if (office_enabled(self.config, absolute_path) and args.get('visual', True) is True
+                    and not args.get('parse_id') and offset is None and limit is None):
+                try:
+                    native = self._read_general_native_office(absolute_path, pages, region=region)
+                    if native is not None:
+                        return native
+                except Exception as exc:
+                    return ToolResult.fail(dict(code=getattr(exc, 'code', 'conversion_failed'), message=str(exc)))
+            if region is not None:
+                return ToolResult.fail(dict(code='attachment_unsupported', message='当前格式尚未支持局部补读'))
+            text_result = self._read_office(absolute_path, path, file_ext, offset, limit)
+            if (file_ext == '.xlsx' and text_result.status == 'success'
+                    and (offset is None and limit is None or args.get('worksheet') is not None or args.get('objects') is not None)):
+                try:
+                    spreadsheet, _ = self._spreadsheet_read(absolute_path, visual=args.get('visual', True),
+                        worksheet=args.get('worksheet'), objects=args.get('objects'))
+                    return ToolResult.success(dict(text_result.result, spreadsheet=spreadsheet.result), media=spreadsheet.media)
+                except Exception as exc:
+                    return ToolResult.fail(dict(code=getattr(exc, 'code', 'parse_failed'), message=str(exc)))
+            return text_result
 
+        if region is not None:
+            return ToolResult.fail(dict(code='attachment_unsupported', message='局部补读仅支持已启用的PDF/Word/PPT阅读副本'))
         # Read text file (with truncation for large files)
         return self._read_text(absolute_path, path, offset, limit)
     
-    def _read_task_attachment(self, absolute_path, offset, limit, pages=None, *, visual=True, parse_id=None):
+    def _read_task_attachment(self, absolute_path, offset, limit, pages=None, *, visual=True, parse_id=None, region=None,
+                              worksheet=None, objects=None):
         """Read authorized hash blobs using their registered original filename.
 
         Extraction remains complete; only the returned source units are paged.
@@ -285,6 +337,7 @@ class Read(BaseTool):
         if not task_id:
             return None
         try:
+            native_window = offset is None and limit is None
             from common.runtime_identity import current_identity
             from agent.knowledge.personal_assistant import SourceService
             import json
@@ -298,6 +351,22 @@ class Read(BaseTool):
                     return ToolResult.fail({"code": "forbidden", "message": "附件不属于当前接收任务"})
                 return None
             attachment = store.attachment(owner, task_id, entry["attachment_id"])
+            if task.get('reading_publication') and task['status'] == 'succeeded':
+                # 任务完成后的复用不再展开附件；出处通过既有发布回读守卫验证。
+                from agent.knowledge.wiki import WikiService
+                workspace = self.config.get('workspace_root') or self.cwd
+                refs = task.get('result_refs', [])
+                searchable = bool(refs)
+                for ref in refs:
+                    if ref.get('publish_id'):
+                        try:
+                            WikiService(workspace, owner).read_reference(ref['publish_id'])
+                        except (ValueError, OSError):
+                            searchable = False
+                return ToolResult.success(dict(task_id=task_id, reading_state='completed',
+                    media_attached=False, result_refs=refs,
+                    next_action='复用已发布主题及出处；目标变化须建立新任务。',
+                    published=True, searchable=searchable))
             workspace = self.config.get("workspace_root") or self.cwd
             service = SourceService(workspace, owner)
             directive = task.get("payload", {}).get("reorganize") or task.get("payload", {}).get("source_action")
@@ -319,6 +388,8 @@ class Read(BaseTool):
             if document_id is None:
                 receive_args.pop("document_id")
             receipt = service.receive(attachment["path"], **receive_args)
+            if Path(attachment['filename']).suffix.lower() != '.xlsx' and (worksheet is not None or objects is not None):
+                return ToolResult.fail(dict(code='invalid_request', message='worksheet/objects仅用于XLSX'))
             is_pdf = Path(attachment["filename"]).suffix.lower() in self.pdf_extensions
             page_range = None
             if is_pdf:
@@ -331,9 +402,27 @@ class Read(BaseTool):
                 return ToolResult.fail({"code": "invalid_request", "message": "offset/limit 须为整数且 limit 大于零"})
             if type(visual) is not bool or (parse_id is not None and not isinstance(parse_id, str)):
                 return ToolResult.fail({"code": "invalid_request", "message": "visual 须为布尔值，parse_id 须为字符串"})
+            from agent.knowledge.reading_flow import enabled, office_enabled
+            if (office_enabled(self.config, attachment['filename']) and visual and not parse_id
+                    and native_window and task.get('status') == 'running'):
+                from agent.knowledge.reading_capabilities import ensure_pdf_capability
+                if ensure_pdf_capability(workspace, self.model, task['config_revision']):
+                    return self._read_native_office(store, task, workspace, receipt, pages, region=region)
+            if is_pdf and visual and not parse_id and native_window and enabled(self.config) and task.get('status') == 'running':
+                from agent.knowledge.reading_capabilities import ensure_pdf_capability
+                if ensure_pdf_capability(workspace, self.model, task['config_revision']):
+                    return self._read_native_pdf(store, task, workspace, receipt, page_range, region=region)
+            if region is not None:
+                return ToolResult.fail(dict(code='attachment_unsupported', message='当前格式或配置尚未支持局部补读'))
             if is_pdf and not parse_id:
                 parse_id = (task.get("source_read_parses") or {}).get(receipt["revision_id"])
             parse_args = {"base_parse_id": parse_id} if parse_id else {}
+            spreadsheet = None
+            if (Path(attachment['filename']).suffix.lower() == '.xlsx' and not parse_id
+                    and (native_window or worksheet is not None or objects is not None)):
+                spreadsheet, materials = self._spreadsheet_read(absolute_path, visual=visual,
+                    worksheet=worksheet, objects=objects, task_context=(store, task, receipt))
+                parse_args.update(spreadsheet_materials=materials, materials_root=workspace)
             parsed = service.parse(receipt["revision_id"], **parse_args)
             if visual and is_pdf and parsed.get("visual_coverage"):
                 from agent.tools.vision.vision import Vision
@@ -400,6 +489,8 @@ class Read(BaseTool):
             result["visual_coverage"] = coverage
             result["visual_warnings"] = parsed.get("visual_warnings", [])
             result["units"] = selected
+            if spreadsheet is not None:
+                result['spreadsheet'] = spreadsheet.result
             # Include metadata and JSON separators in the budget. Leave room
             # below the Agent's 50000-character cutoff so continuation survives.
             budget = min(DEFAULT_MAX_BYTES, 45000)
@@ -426,9 +517,259 @@ class Read(BaseTool):
             next_index = start + len(selected)
             result.update(has_more=next_index < len(units),
                           next_offset=next_index+1 if next_index < len(units) else None)
-            return ToolResult.success(result)
+            return ToolResult.success(result, media=spreadsheet.media if spreadsheet is not None else ())
         except Exception as exc:
             return ToolResult.fail({"code": getattr(exc, "code", "invalid_request"), "message": str(exc)})
+
+    def _spreadsheet_read(self, absolute_path, *, visual, worksheet, objects, task_context=None):
+        """XLSX 只按显式对象选择附图；公式与对象位置仍由本地原件核验。"""
+        import hashlib
+        from agent.knowledge.personal_assistant import guard_path, SourceService
+        from agent.knowledge.reading_materials import _store
+        from agent.knowledge.spreadsheet_materials import prepare_spreadsheet_materials
+        from agent.knowledge.spreadsheet_reading_flow import prepare_spreadsheet_read, SpreadsheetReadBudget
+        from common.runtime_identity import current_identity
+        from common.personal_tasks import current_task_id
+        from models.config_revision import capture_config_revision
+        workspace = Path(self.config.get('workspace_root') or self.cwd).resolve()
+        source = Path(absolute_path).resolve(strict=True)
+        data = source.read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        relative = f'.document_reading/spreadsheets/{digest}/source.xlsx'
+        _store(workspace, relative, data)
+        materials = prepare_spreadsheet_materials(workspace, relative)
+        identity, task_id, revision = current_identity(), current_task_id(), capture_config_revision()
+        checked_images = {}
+
+        def authorize(context, binding):
+            guard_path(source)
+            if (self._is_credential_path(str(source)) or current_identity() != identity
+                    or current_task_id() != task_id or capture_config_revision() != revision
+                    or hashlib.sha256(source.read_bytes()).hexdigest() != digest):
+                return False
+            if task_context is not None:
+                store, task, receipt = task_context
+                with store.commit_guard(task['owner_id'], task_id, task['attempt']) as current:
+                    if current['config_revision'] != revision:
+                        return False
+                    service = SourceService(workspace, identity.user_id)
+                    state = service.get(receipt['document_id'])
+                    latest = service.registered_revision(receipt['document_id'])
+                    return state['validity'] == 'active' and latest['revision_id'] == receipt['revision_id']
+            return True
+
+        def supports(context, mime):
+            if mime not in ('image/png', 'image/jpeg', 'image/webp', 'image/gif'):
+                return False
+            model = getattr(self, 'model', None)
+            meta = getattr(model, 'catalog_model_meta', None)
+            if callable(meta) and 'vision' in ((meta() or {}).get('capabilities') or []):
+                return True
+            bot = getattr(model, 'bot', None)
+            per_model = getattr(bot, 'model_supports_vision', None)
+            if callable(per_model) and per_model(getattr(model, 'model', '')) is True:
+                return True
+            if mime not in checked_images:
+                from agent.knowledge.image_reading_capabilities import ensure_image_capability
+                checked_images[mime] = ensure_image_capability(workspace, model, revision, mime)
+            return checked_images[mime]
+
+        result = prepare_spreadsheet_read(workspace, relative, worksheet=worksheet,
+            selected_objects=() if objects is None else objects, visual=visual,
+            model=getattr(self, 'model', None), media_supports=supports, authorize=authorize,
+            budget=SpreadsheetReadBudget(max_receipt_bytes=min(DEFAULT_MAX_BYTES, 40000)))
+        result.result.update(long_term_image_evidence_available=False,
+            next_action='按工作表和object_key补读图片；图内模型观察尚不支持长期发布，不能以单元格文字出处替代图片观察。')
+        return result, materials
+
+    def _read_native_pdf(self, store, task, workspace, receipt, page_range, *, region=None):
+        from agent.knowledge.reading_flow import prepare_pdf_read
+        task, parsed, materials, registry, provider = prepare_pdf_read(
+            store, task, workspace, receipt, self.model, *page_range,
+            budget=self.config.get('reading_pdf_budget'), config=self.config)
+        return self._native_read_result(store, task, workspace, receipt, parsed, materials, registry, provider, page_range, region=region)
+
+    def _read_native_office(self, store, task, workspace, receipt, pages, *, region=None):
+        from agent.knowledge.reading_flow import office_options, prepare_task_target
+        from agent.knowledge.office_reading_flow import prepare_office_read
+        task = prepare_task_target(store, task, workspace, self.config)
+        office = task['source_office_materials'][receipt['revision_id']]['manifest']
+        page_range = _parse_page_range(pages, office['page_count'])
+        task, parsed, materials, registry, provider = prepare_office_read(
+            store, task, workspace, receipt, self.model, *page_range,
+            budget=self.config.get('reading_pdf_budget'), **office_options(self.config))
+        return self._native_read_result(store, task, workspace, receipt, parsed, materials, registry, provider, page_range, region=region)
+
+    def _native_read_result(self, store, task, workspace, receipt, parsed, materials, registry, provider, page_range, *, region=None):
+        from agent.knowledge.personal_assistant import SourceService
+        from common.runtime_identity import current_identity
+        if region is not None:
+            from agent.knowledge.reading_materials import prepare_pdf_region
+            materials = prepare_pdf_region(workspace, materials, page_range[0], region)
+        record = registry.prepare(task, receipt, parsed, materials)
+        if record['attempt'] != task['attempt']:
+            record = registry.resume(task, record['reading_id'])
+        first, last = page_range
+        def select(current):
+            matches = [s for s in current['segments'] if any(first <= p <= last for p in s['target_pages'])]
+            return next((s for s in matches if s['state'] != 'completed'), matches[0] if matches else None)
+        selected = select(record)
+        if selected is None:
+            from agent.knowledge.parser import SourceError
+            raise SourceError('invalid_request', '页窗不属于本次阅读目标')
+        while selected.get('error_code') == 'reading_budget_exceeded' or selected['state'] == 'unknown':
+            if selected.get('error_code') == 'reading_budget_exceeded':
+                record = registry.replan_budget_exceeded(task, record['reading_id'], selected['segment_id'])
+            else:
+                record = registry.retry_unknown_segment(task, record['reading_id'], selected['segment_id'])
+            selected = select(record)
+        if selected['state'] == 'completed':
+            media = ()
+        else:
+            from dataclasses import replace
+            def on_error(error):
+                if error.get('code') == 'reading_budget_exceeded' and error.get('budget_kind') in ('input_bytes', 'input_context'):
+                    registry.mark_budget_exceeded(task, record['reading_id'], selected['segment_id'],
+                        error_code=error['code'], budget_kind=error['budget_kind'])
+            media = (replace(registry.media_reference(task, record['reading_id'], selected['segment_id'],
+                identity=current_identity(), provider_identity=provider), on_error=on_error),)
+        last_page = max(selected['target_pages'])
+        details = {}
+        if materials.region_supplement is not None:
+            details.update(region=materials.region_supplement['region'], supplemental=True,
+                           source_locations=[dict(reading_copy_page=1, location=materials.location(page_range[0]))],
+                           coverage_keys=[])
+        if materials.derived_source is not None:
+            office = materials.derived_source['office_manifest']
+            details.update(source_format=office['source_format'],
+                source_locations=[dict(reading_copy_page=1 if region is not None else p, location=materials.location(p))
+                                  for p in selected['page_map']],
+                notes=office['notes'], coverage_gaps=office['coverage_gaps'])
+        return ToolResult.success(dict(reading_id=record['reading_id'],
+            document_id=receipt['document_id'], revision_id=receipt['revision_id'], parse_id=parsed['parse_id'],
+            expected_current_revision=SourceService(workspace).get(receipt['document_id'])['current'],
+            segment_id=selected['segment_id'], page_map=selected['page_map'],
+            target_pages=selected['target_pages'], total_pages=materials.page_count,
+            reading_state=selected['state'], media_attached=bool(media),
+            saved_model_output=selected.get('saved_model_output', []),
+            next_pages=f'{last_page + 1}-' if last_page < materials.page_count else None,
+            has_more=last_page < materials.page_count, published=False, searchable=False,
+            next_action='本批图文只在紧接的模型响应提供。先在该响应写出带源位置的主题发现、关键数值、公式和图形关系，'
+                '或直接knowledge_ingest提交正文、summary和具体观察；再调用其他工具。不能只声明已读就先查索引。'
+                '后续复用本轮已保存输出；有明确缺口再局部补读。'
+                if media else '复用已保存观察或候选；有新缺口时明确补读，不自动重传附件。',
+            **details), media=media)
+
+    def _read_general_native_office(self, absolute_path, pages, *, region=None):
+        import hashlib
+        from dataclasses import replace
+        from common.personal_tasks import current_task_id
+        from agent.knowledge.reading_capabilities import ensure_pdf_capability
+        from agent.knowledge.reading_flow import office_options
+        from agent.knowledge.office_materials import prepare_office_materials, verify_office_materials
+        from agent.knowledge.reading_materials import _store
+        from models.config_revision import capture_config_revision
+        if current_task_id() is not None:
+            return None
+        workspace = Path(self.config.get('workspace_root') or self.cwd).resolve()
+        if not ensure_pdf_capability(workspace, self.model, capture_config_revision()):
+            return None
+        original = Path(absolute_path).resolve(strict=True)
+        data = original.read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        relative = f'.document_reading/office_originals/{digest}/source{original.suffix.lower()}'
+        _store(workspace, relative, data)
+        office = prepare_office_materials(workspace, relative, **office_options(self.config))
+        result = self._read_general_native_pdf(workspace / office.material_relpath, pages, region=region)
+        if result is None:
+            return None
+        references = []
+        for ref in result.media:
+            def load(context, base=ref.loader):
+                from agent.knowledge.personal_assistant import guard_path
+                guard_path(original)
+                if self._is_credential_path(str(original)) or hashlib.sha256(original.read_bytes()).hexdigest() != digest:
+                    raise ValueError('version_conflict')
+                verify_office_materials(workspace, office)
+                return base(context)
+            references.append(replace(ref, loader=load))
+        result.result.update(filename=original.name, source_format=office.source_format,
+            source_locations=[dict(reading_copy_page=1 if region is not None else p,
+                                   location=dict(office.location(p), region=list(region)) if region is not None else office.location(p))
+                              for p in result.result['page_map']],
+            notes=list(office.notes), coverage_gaps=list(office.coverage_gaps))
+        return ToolResult.success(result.result, media=tuple(references))
+
+    def _read_general_native_pdf(self, absolute_path, pages, *, region=None):
+        """普通阅读复用材料／媒体能力，不登记长期资料或发布授权。"""
+        import hashlib
+        import tempfile
+        from pypdf import PdfReader
+        from agent.knowledge.reading_capabilities import ensure_pdf_capability, capability_identity
+        from agent.knowledge.reading_materials import prepare_pdf_materials, _relative
+        from agent.protocol.tool_media import ToolMediaReference, ToolMediaContent
+        from common.runtime_identity import current_identity
+        from common.personal_tasks import current_task_id
+        from models.config_revision import capture_config_revision, require_config_revision
+        workspace = Path(self.config.get('workspace_root') or self.cwd).resolve()
+        if current_task_id() is not None:
+            return None
+        revision = capture_config_revision()
+        if not ensure_pdf_capability(workspace, self.model, revision):
+            return None
+        provider = capability_identity(self.model, revision)
+        identity = current_identity()
+        path = Path(absolute_path).resolve(strict=True)
+        raw = path.read_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        relative = f'.document_reading/originals/{digest}.pdf'
+        dest = workspace / relative
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if not dest.exists():
+            with tempfile.NamedTemporaryFile(dir=dest.parent, delete=False) as stream:
+                temp = Path(stream.name)
+                stream.write(raw)
+            try:
+                os.replace(temp, dest)
+            finally:
+                temp.unlink(missing_ok=True)
+        total = len(PdfReader(path).pages)
+        first, last = _parse_page_range(pages, total)
+        materials = prepare_pdf_materials(workspace, relative, document_id='general-' + digest,
+            revision_id=digest, parse_id='general-pdf-v1', config_revision=revision,
+            target_pages=range(first, last + 1), budget=self.config.get('reading_pdf_budget'))
+        if region is not None:
+            from agent.knowledge.reading_materials import prepare_pdf_region
+            materials = prepare_pdf_region(workspace, materials, first, region)
+        segment = materials.segments[0]
+
+        def supports(context):
+            return (context.get('protocol') == 'responses' and context.get('model') == provider['model']
+                and context.get('identity') == identity and context.get('config_revision') == revision
+                and context.get('task_id') is None
+                and hashlib.sha256(str(context.get('api_base') or '').rstrip('/').encode()).hexdigest() == provider['endpoint_hash'])
+
+        def load(context):
+            if not supports(context):
+                raise ValueError('attachment_unsupported')
+            require_config_revision(revision)
+            from agent.knowledge.personal_assistant import guard_path
+            guard_path(path)
+            if self._is_credential_path(str(path)) or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+                raise ValueError('version_conflict')
+            data = _relative(workspace, segment.material_relpath).read_bytes()
+            if hashlib.sha256(data).hexdigest() != segment.material_hash:
+                raise ValueError('storage_failed')
+            return ToolMediaContent('application/pdf', data)
+
+        last_page = max(segment.target_pages)
+        return ToolResult.success(dict(filename=path.name, total_pages=total,
+            page_map=list(segment.page_map), target_pages=list(segment.target_pages),
+            media_attached=True, published=False, searchable=False,
+            has_more=last_page < total, next_pages=f'{last_page + 1}-' if last_page < total else None,
+            **(dict(region=list(region), supplemental=True, coverage_keys=[],
+                    source_locations=[dict(reading_copy_page=1, location=materials.location(first))]) if region is not None else {})),
+            media=(ToolMediaReference(load, supports),))
 
     def _shared_knowledge_path(self, path: str) -> Optional[str]:
         """An existing knowledge page under the shared root, or None.

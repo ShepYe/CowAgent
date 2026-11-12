@@ -97,15 +97,68 @@ def iter_pptx_shape_text(shapes):
     for shape in shapes:
         if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
             yield from iter_pptx_shape_text(shape.shapes)
-        elif shape.has_table:
-            for row in shape.table.rows:
-                # A merged cell's origin owns the text; covered cells add none.
-                yield "\t".join(cell.text for cell in row.cells if not cell.is_spanned)
-        elif shape.has_text_frame:
-            for paragraph in shape.text_frame.paragraphs:
-                text = paragraph.text.strip()
-                if text:
-                    yield text
+        else:
+            for block in _pptx_text_blocks(shape):
+                yield block["text"]
+
+
+def _pptx_text_blocks(shape):
+    """共享文字语义；保留原段落／表格行号，不按非空文字重新编号。"""
+    if shape.has_table:
+        for number, row in enumerate(shape.table.rows, 1):
+            # 合并起点拥有文字，覆盖单元格不重复贡献文字。
+            yield dict(text="\t".join(cell.text for cell in row.cells if not cell.is_spanned), row=number)
+    elif shape.has_text_frame:
+        for number, paragraph in enumerate(shape.text_frame.paragraphs, 1):
+            text = paragraph.text.strip()
+            if text:
+                yield dict(text=text, paragraph=number)
+
+
+def iter_pptx_source_objects(shapes, *, layer="slide", group_path=()):
+    """惰性输出对象、文字与视觉缺口事件；只读 OOXML，不渲染、不读取外链。
+
+    slide 身份由调用方附加；object_id 是源 cNvPr ID，group_path 保留嵌套。
+    备注页的页码、日期、页眉页脚和幻灯片缩略图不混入独立备注正文。
+    """
+    from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
+
+    excluded = {PP_PLACEHOLDER.SLIDE_IMAGE, PP_PLACEHOLDER.SLIDE_NUMBER, PP_PLACEHOLDER.DATE,
+                PP_PLACEHOLDER.HEADER, PP_PLACEHOLDER.FOOTER}
+    for shape in shapes:
+        if layer == "speaker_notes" and shape.is_placeholder and shape.placeholder_format.type in excluded:
+            continue
+        anchor = dict(object_id=str(shape.shape_id), group_path=list(group_path))
+        yield dict(event="object", location=anchor, object_type=shape.shape_type.name)
+        if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+            yield from iter_pptx_source_objects(shape.shapes, layer=layer,
+                                                group_path=(*group_path, str(shape.shape_id)))
+            continue
+        for block in _pptx_text_blocks(shape):
+            yield dict(event="text", text=block["text"],
+                       location=dict(anchor, **{k: v for k, v in block.items() if k != "text"}))
+        # 同时捕获图片形状、形状填充图片和图表，关系按当前 part 解析。
+        references = shape._element.xpath(".//a:blip | .//c:chart")
+        for index, node in enumerate(references, 1):
+            kind = "chart" if node.tag.endswith("}chart") else "image"
+            namespace = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+            rid = node.get(namespace + "id") or node.get(namespace + "embed") or node.get(namespace + "link")
+            if not rid:
+                raise ValueError("图片／图表缺少源关系 ID")
+            relationship = shape.part.rels[rid]
+            if relationship.is_external:
+                part, reason = None, "external_resource_not_loaded"
+            else:
+                part, reason = str(relationship.target_part.partname).lstrip("/"), "visual_not_supported"
+            yield dict(event="gap", kind=kind, part=part, relationship_id=rid, reason=reason,
+                       location=dict(anchor, reference=index))
+        if not references and shape.shape_type in {
+                MSO_SHAPE_TYPE.MEDIA, MSO_SHAPE_TYPE.WEB_VIDEO, MSO_SHAPE_TYPE.EMBEDDED_OLE_OBJECT,
+                MSO_SHAPE_TYPE.LINKED_OLE_OBJECT, MSO_SHAPE_TYPE.DIAGRAM, MSO_SHAPE_TYPE.IGX_GRAPHIC}:
+            yield dict(event="gap", kind="embedded_object", reason="object_not_rendered", location=anchor)
+        elif not references and shape.shape_type in {
+                MSO_SHAPE_TYPE.AUTO_SHAPE, MSO_SHAPE_TYPE.LINE, MSO_SHAPE_TYPE.FREEFORM}:
+            yield dict(event="gap", kind="drawing", reason="visual_not_supported", location=anchor)
 
 def _sheet_rows(cached_sheet, formula_sheet):
     for cached_row, formula_row in zip(cached_sheet.iter_rows(), formula_sheet.iter_rows()):

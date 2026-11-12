@@ -9,6 +9,10 @@ from common.runtime_identity import current_identity
 MAX_BATCH_FILES = 100
 MAX_BATCH_TEXT_BYTES = 200 * 1024 * 1024
 
+READING_SOURCE_SCHEMA = {'type': 'object', 'properties': {
+    'reading_id': {'type': 'string'}, 'evidence_key': {'type': 'string'}},
+    'required': ['reading_id', 'evidence_key'], 'additionalProperties': False}
+
 
 def _check_batch_limits(attachments, decisions):
     if len(attachments) > MAX_BATCH_FILES or sum(d.get("parsed_bytes", 0) for d in decisions.values()) > MAX_BATCH_TEXT_BYTES:
@@ -43,6 +47,22 @@ class KnowledgeIngest(BaseTool):
 
     def __init__(self, config=None):
         self.config = config or {}
+        import copy
+        self.params = copy.deepcopy(type(self).params)
+        properties = self.params['properties']
+        properties.update(reading_submission_id={'type': 'string'}, reading_evidence={
+            'type': 'array', 'items': {'type': 'object', 'properties': {
+                'reading_id': {'type': 'string'}, 'evidence_key': {'type': 'string'},
+                'segment_id': {'type': 'string'}, 'location': {'type': 'object'},
+                'observation': {'type': 'string'},
+                'type': {'type': 'string', 'enum': ['ocr', 'visual_interpretation']}},
+                'required': ['reading_id', 'evidence_key', 'segment_id', 'location', 'observation', 'type'],
+                'additionalProperties': False}}, reading_coverage={
+            'type': 'array', 'items': {'type': 'object', 'properties': {
+                'reading_id': {'type': 'string'}, 'segment_id': {'type': 'string'}},
+                'required': ['reading_id', 'segment_id'], 'additionalProperties': False}})
+        source = properties['pages']['items']['properties']['blocks']['items']['properties']['sources']
+        source['items'] = {'oneOf': [dict(source['items'], additionalProperties=False), READING_SOURCE_SCHEMA]}
 
     def execute(self, args):
         owner = current_identity().user_id
@@ -73,6 +93,11 @@ class KnowledgeIngest(BaseTool):
                     task = store.claim(owner, task_id)
             task = store.get(owner, task_id)
             if task["status"] == "succeeded":
+                if task.get('reading_publication') and args.get('pages'):
+                    submission = args.get('reading_submission_id')
+                    expected = (task.get('reading_tool_submissions') or {}).get(submission)
+                    if expected != _reading_payload(args):
+                        raise SourceError('idempotency_conflict', '已完成任务的图文提交与原载荷不符')
                 refs = []
                 for ref in task.get("result_refs", []):
                     display = dict(ref)
@@ -92,6 +117,8 @@ class KnowledgeIngest(BaseTool):
             purpose = args.get("purpose")
             if purpose not in ("long_term", "transient", "waiting") or not args.get("reason"):
                 raise ValueError("invalid_request")
+            if task.get('reading_publication') and args.get('pages'):
+                return self._reading_submission(store, task, args)
             attachments = task["attachments"]
             if not attachments:
                 if not args.get("pages") or not task.get("payload", {}).get("knowledge_synthesis"):
@@ -109,7 +136,10 @@ class KnowledgeIngest(BaseTool):
             if args.get("attachment_id"):
                 selected = [store.attachment(owner, task_id, args["attachment_id"])]
             elif args.get("path"):
-                selected = [a for a in attachments if Path(a["path"]).resolve() == Path(args["path"]).resolve()]
+                selected_path = Path(args['path']).expanduser()
+                if not selected_path.is_absolute():
+                    selected_path = Path(self.config.get('cwd') or self.config.get('workspace_root') or '.') / selected_path
+                selected = [a for a in attachments if Path(a["path"]).resolve() == selected_path.resolve()]
                 if not selected:
                     raise ValueError("forbidden")
             else:
@@ -119,6 +149,7 @@ class KnowledgeIngest(BaseTool):
                 from common import state_dir
                 workspace = state_dir.state_root()
             service = SourceService(workspace, owner)
+            from agent.knowledge.reading_flow import enabled, office_enabled
             # Serialize decision merges with cancellation and concurrent subset
             # calls. Candidates remain private until every attachment is decided.
             with store.commit_guard(owner, task_id, attempt):
@@ -133,7 +164,8 @@ class KnowledgeIngest(BaseTool):
                 for entry in selected:
                     attachment_id = entry["attachment_id"]
                     previous = decisions.get(attachment_id)
-                    if previous and previous["purpose"] == purpose and (previous.get("ready") or previous.get("parse_id")):
+                    if previous and previous["purpose"] == purpose and (previous.get("ready") or previous.get("parse_id")
+                                                                         or previous.get('native_preparation_pending')):
                         doc = service.get(previous["source"]["document_id"])
                         if doc["state"] != previous["state_revision"] or doc["purpose"] != purpose:
                             raise SourceError("version_conflict", "附件用途或状态已变化")
@@ -189,9 +221,14 @@ class KnowledgeIngest(BaseTool):
                     if purpose == "long_term" and not decision["ready"]:
                         stage = "parse"
                         store.stage(owner, task_id, attempt, stage)
-                        parsed = service.parse(source["revision_id"])
-                        decision.update(parse_id=parsed["parse_id"], visual_coverage=parsed.get("visual_coverage"))
-                        decision["parsed_bytes"] = sum(len(unit["text"].encode("utf-8")) for unit in parsed["units"])
+                        if office_enabled(self.config, source['filename']):
+                            # 先登记用途；在 read 中转换并固定阅读副本后建立解析身份。
+                            decision.update(native_preparation_pending=True, parsed_bytes=0)
+                        else:
+                            pure_pdf = (enabled(self.config) and Path(source['filename']).suffix.lower() == '.pdf')
+                            parsed = service.parse(source["revision_id"], prepare_only=pure_pdf)
+                            decision.update(parse_id=parsed["parse_id"], visual_coverage=parsed.get("visual_coverage"))
+                            decision["parsed_bytes"] = sum(len(unit["text"].encode("utf-8")) for unit in parsed["units"])
                         store._change(owner, task_id, attempt, {"running"}, attachment_decisions=decisions)
                         _check_batch_limits(attachments, decisions)
                 task = store.get(owner, task_id)
@@ -210,9 +247,13 @@ class KnowledgeIngest(BaseTool):
                     if not pages:
                         task = store._change(owner, task_id, attempt, {"running"}, stage="decide", pending_attachment_ids=[])
                         return ToolResult.success(dict(task, organization_required=True,
-                            source_materials=[dict(d["source"], parse_id=d["parse_id"], state_revision=d["state_revision"],
+                            source_materials=[dict(d["source"], parse_id=d.get("parse_id"), state_revision=d["state_revision"],
                                 visual_coverage=d.get("visual_coverage")) for d in long_term],
-                            next_action="实际读取 knowledge-wiki 和原文，按主题提炼后携带完整 pages 再调用本工具；无需向用户询问是否收录。"))
+                            next_action="实际读取 knowledge-wiki 和原文，按主题提炼后携带完整 pages 再调用本工具；无需向用户询问是否收录。"
+                                + ("PDF原生首次读取只传path/pages/visual=true，不传parse_id、offset或limit；"
+                                   "返回reading_id后按segment和真实观察提交reading_evidence及reading_coverage。"
+                                   if enabled(self.config) or any(office_enabled(self.config, d['source']['filename'])
+                                                                 for d in long_term) else '')))
                     cited = {s.get("document_id") for p in pages for b in p.get("blocks", []) for s in b.get("sources", [])}
                     if any(d["source"]["document_id"] not in cited for d in long_term):
                         raise SourceError("invalid_request", "整理成品缺少本次长期资料的出处")
@@ -231,12 +272,96 @@ class KnowledgeIngest(BaseTool):
                 return ToolResult.success(resume_publication(task, store))
         except Exception as exc:
             code = getattr(exc, "code", "storage_failed" if isinstance(exc, OSError) else "invalid_request")
-            if attempt is not None and not (stage == "decide" and code in {"invalid_request", "version_conflict", "forbidden"}):
+            if attempt is not None and not (stage == "decide" and code in {
+                    "invalid_request", "version_conflict", "forbidden", "reading_incomplete", "idempotency_conflict"}):
                 try:
                     store.fail(owner, task_id, attempt, code, stage)
                 except ValueError:
                     pass
             return ToolResult.fail({"code": code, "stage": stage, "message": str(exc)})
+
+    def _reading_submission(self, store, task, args):
+        """媒体出处先还原成既有四元身份，再走现有Wiki校验及发布。"""
+        import copy
+        from agent.knowledge.reading import ReadingService
+        from agent.knowledge.reading_publication import prepare_publication, publish_batch, finish_publication
+        from common import state_dir
+        if args['purpose'] != 'long_term':
+            raise SourceError('invalid_request', '图文主题发布须沿用长期用途')
+        workspace = self.config.get('workspace_root') or self.config.get('cwd') or state_dir.state_root()
+        submission = args.get('reading_submission_id')
+        if not isinstance(submission, str) or not submission.strip():
+            raise SourceError('invalid_request', '图文发布须有reading_submission_id')
+        registry = ReadingService(workspace, task_store=store)
+        coverage_items = args.get('reading_coverage')
+        if not isinstance(coverage_items, list) or not coverage_items:
+            raise SourceError('invalid_request', '须明确本批已整理范围reading_coverage')
+        coverage = set()
+        for item in coverage_items:
+            if not isinstance(item, dict) or set(item) != {'reading_id', 'segment_id'}:
+                raise SourceError('invalid_request', '阅读覆盖形状无效')
+            record = registry.get(task, item['reading_id'])
+            segment = next((s for s in record['segments'] if s['segment_id'] == item['segment_id']), None)
+            if segment is None or segment['state'] != 'completed':
+                raise SourceError('reading_incomplete', '阅读范围尚未成功交付主模型')
+            coverage.update(registry.coverage(task, item['reading_id'], item['segment_id']))
+        pages = copy.deepcopy(args['pages'])
+        evidence = args.get('reading_evidence', [])
+        wanted = set()
+        for page in pages:
+            for block in page.get('blocks', []):
+                for source in block.get('sources', []):
+                    if isinstance(source, dict) and set(source) == {'reading_id', 'evidence_key'}:
+                        wanted.add((source['reading_id'], source['evidence_key']))
+                    elif not isinstance(source, dict) or set(source) != {'document_id', 'revision_id', 'parse_id', 'ordinal'}:
+                        raise SourceError('invalid_request', '出处须为四元身份或互斥阅读别名')
+        if not isinstance(evidence, list) or any(not isinstance(e, dict) for e in evidence):
+            raise SourceError('invalid_request', '阅读观察数组无效')
+        if wanted != {(e.get('reading_id'), e.get('evidence_key')) for e in evidence}:
+            raise SourceError('invalid_request', '图文观察与正文出处不对应')
+        with store.commit_guard(task['owner_id'], task['task_id'], task['attempt']):
+            current = store.get(task['owner_id'], task['task_id'])
+            submissions = dict(current.get('reading_tool_submissions') or {})
+            payload = _reading_payload(args)
+            if submission in submissions and submissions[submission] != payload:
+                raise SourceError('idempotency_conflict', '同一图文提交标识载荷不同')
+            aliases = registry.resolve_evidence(task, submission, evidence, submission_payload=payload)
+            used = set()
+            for page in pages:
+                for block in page.get('blocks', []):
+                    sources = []
+                    for source in block.get('sources', []):
+                        if isinstance(source, dict) and set(source) == {'reading_id', 'evidence_key'}:
+                            key = (source['reading_id'], source['evidence_key'])
+                            if key not in aliases:
+                                raise SourceError('invalid_request', '图文别名未提供同提交证据')
+                            sources.append(aliases[key])
+                            used.add(key)
+                        elif isinstance(source, dict) and set(source) == {'document_id', 'revision_id', 'parse_id', 'ordinal'}:
+                            sources.append(source)
+                        else:
+                            raise SourceError('invalid_request', '出处须为四元身份或互斥阅读别名')
+                    block['sources'] = sources
+            if used != set(aliases):
+                raise SourceError('invalid_request', '图文观察与正文出处不对应')
+            prepare_publication(store, task, submission, sorted(coverage), pages, workspace)
+            submissions[submission] = payload
+            store._change(task['owner_id'], task['task_id'], task['attempt'], {'running'},
+                          reading_tool_submissions=submissions)
+            publish_batch(store, task, submission)
+            result = finish_publication(store, task)
+            return ToolResult.success(result)
+
+
+def _reading_payload(args):
+    import hashlib
+    import json
+    payload = {k: args.get(k) for k in ('pages', 'reading_evidence', 'reading_coverage', 'purpose')}
+    for key in ('reading_evidence', 'reading_coverage'):
+        if isinstance(payload[key], list):
+            payload[key] = sorted(payload[key], key=lambda v: json.dumps(v, sort_keys=True, ensure_ascii=False))
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False,
+        separators=(',', ':'), allow_nan=False).encode()).hexdigest()
 
 
 def resume_publication(task, store):

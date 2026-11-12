@@ -131,6 +131,13 @@ class OpenAICompatibleBot:
                     api_config=api_config,
                     kwargs=kwargs,
                 )
+            from agent.protocol.tool_media import current_tool_media, ToolMediaError
+            if current_tool_media() or any(
+                m.get("role") == "tool" and isinstance(m.get("content"), list)
+                and any(b.get("type") in ("image", "image_url", "input_image", "file", "input_file", "document")
+                        for b in m["content"] if isinstance(b, dict)) for m in messages
+            ):
+                raise ToolMediaError("attachment_unsupported")
             request_params = {
                 "model": model_name,
                 "messages": messages,
@@ -227,6 +234,9 @@ class OpenAICompatibleBot:
     def _responses_prompt_cache_key(model_name, api_config, kwargs) -> Optional[str]:
         """Keep Responses cache routing stable across turns without exposing chat IDs."""
         from common.runtime_identity import current_identity
+        from config import conf
+        if conf().get('responses_prompt_cache_enabled', True) is False:
+            return None
 
         identity = current_identity()
         session_id = kwargs.get("session_id") or identity.session_id
@@ -295,38 +305,97 @@ class OpenAICompatibleBot:
 
     def _handle_responses_sync(self, payload, api_key, api_base, timeout):
         from models.openai import responses_adapter
+        from agent.protocol.tool_media import current_tool_media, expand_tool_media, media_request_error
+        pending = current_tool_media()
+        delivery = expand_tool_media(payload, pending, self._tool_media_context(payload, api_base) if pending else {})
+        completed = False
+        if delivery.refs and timeout is None:
+            timeout = (90, 240)
         try:
-            client = self._get_http_client()
-            response = client.responses(
+            delivery.start()
+            response = self._get_http_client().responses(
                 api_key=api_key, api_base=api_base, timeout=timeout,
                 stream=False, **payload,
             )
-            return responses_adapter.responses_to_chat_completion(response)
-        except OpenAIHTTPError as e:
-            logger.error(f"[{self.__class__.__name__}] responses sync error: "
-                         f"HTTP {e.status_code}: {e.message}")
-            return {"error": True, "message": e.message, "status_code": e.status_code or 500}
+            if delivery.refs and response.get("status") == "failed":
+                classified = media_request_error(response.get("error"), response.get("status_code"))
+                delivery.report_error(classified)
+                return classified
+            result = responses_adapter.responses_to_chat_completion(response)
+            if response.get("status") == "completed" and not result.get("error"):
+                delivery.save_response(response)
+                completed = True
+            return result
         except Exception as e:
-            logger.error(f"[{self.__class__.__name__}] responses sync error: {e}")
+            if delivery.refs:
+                classified = media_request_error(e)
+                delivery.report_error(classified)
+                return classified
+            if isinstance(e, OpenAIHTTPError):
+                return {"error": True, "message": e.message, "status_code": e.status_code or 500}
             return {"error": True, "message": str(e), "status_code": 500}
+        finally:
+            delivery.finish(completed)
+
+    @staticmethod
+    def _tool_media_context(payload, api_base):
+        from common.runtime_identity import current_identity
+        from common.personal_tasks import current_task_id
+        from models.config_revision import capture_config_revision
+        from agent.protocol.tool_media import current_media_provider
+        return {"provider": current_media_provider(), "mime_type": "application/pdf", "transport": "inline",
+                "protocol": "responses", "model": payload.get("model"),
+                "api_base": api_base, "identity": current_identity(),
+                "task_id": current_task_id(), "config_revision": capture_config_revision()}
 
     def _handle_responses_stream(self, payload, api_key, api_base, timeout, model_name):
         from models.openai import responses_adapter
+        from agent.protocol.tool_media import current_tool_media, expand_tool_media, media_request_error
+        pending = current_tool_media()
+        delivery = expand_tool_media(payload, pending, self._tool_media_context(payload, api_base) if pending else {})
+        completed = False
+        events = None
+        if delivery.refs and timeout is None:
+            timeout = (90, 240)
+        def tracked_events(source):
+            nonlocal completed
+            for event in source:
+                if event.get("type") == "response.completed":
+                    response = event.get("response") or {}
+                    if response.get("status") == "completed":
+                        delivery.save_response(response)
+                        completed = True
+                if event.get("type") in ("response.failed", "response.incomplete", "error") or event.get("error"):
+                    completed = False
+                # Redact service errors which may echo file_data or private paths.
+                if delivery.refs and (event.get("error") or event.get("type") in ("response.failed", "error")):
+                    error = event.get("error") or (event.get("response") or {}).get("error")
+                    status = event.get("status_code") or (error.get("status_code") if isinstance(error, dict) else None)
+                    classified = media_request_error(error, status)
+                    delivery.report_error(classified)
+                    yield classified
+                    return
+                yield event
         try:
-            client = self._get_http_client()
-            events = client.responses(
+            delivery.start()
+            events = self._get_http_client().responses(
                 api_key=api_key, api_base=api_base, timeout=timeout,
                 stream=True, **payload,
             )
-            for chunk in responses_adapter.responses_stream_to_chat_chunks(events, model_name):
-                yield chunk
-        except OpenAIHTTPError as e:
-            logger.error(f"[{self.__class__.__name__}] responses stream error: "
-                         f"HTTP {e.status_code}: {e.message}")
-            yield {"error": True, "message": e.message, "status_code": e.status_code or 500}
+            yield from responses_adapter.responses_stream_to_chat_chunks(tracked_events(events), model_name)
         except Exception as e:
-            logger.error(f"[{self.__class__.__name__}] responses stream error: {e}")
-            yield {"error": True, "message": str(e), "status_code": 500}
+            if delivery.refs:
+                classified = media_request_error(e)
+                delivery.report_error(classified)
+                yield classified
+            elif isinstance(e, OpenAIHTTPError):
+                yield {"error": True, "message": e.message, "status_code": e.status_code or 500}
+            else:
+                yield {"error": True, "message": str(e), "status_code": 500}
+        finally:
+            if events is not None and hasattr(events, "close"):
+                events.close()
+            delivery.finish(completed)
 
     def _get_http_client(self) -> OpenAIHTTPClient:
         """Build an HTTP client honoring the global proxy config.
@@ -504,9 +573,18 @@ class OpenAICompatibleBot:
                         tool_call_id = block.get("tool_use_id") or ""
                         if not tool_call_id:
                             logger.warning("[OpenAICompatible] tool_result missing tool_use_id, using empty string")
-                        # Ensure content is a string (some providers require string content)
                         result_content = block.get("content", "")
-                        if not isinstance(result_content, str):
+                        if isinstance(result_content, list) and any(
+                            b.get("type") in ("file", "input_file", "document")
+                            for b in result_content if isinstance(b, dict)
+                        ):
+                            from agent.protocol.tool_media import ToolMediaError
+                            raise ToolMediaError("attachment_unsupported")
+                        typed_image = isinstance(result_content, list) and any(
+                            b.get("type") in ("image", "image_url", "input_image")
+                            for b in result_content if isinstance(b, dict)
+                        )
+                        if not isinstance(result_content, str) and not typed_image:
                             result_content = json.dumps(result_content, ensure_ascii=False)
                         openai_messages.append({
                             "role": "tool",

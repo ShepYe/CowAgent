@@ -148,7 +148,7 @@ def messages_to_input(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             input_items.append({
                 "type": "function_call_output",
                 "call_id": msg.get("tool_call_id") or "",
-                "output": _tool_output_text(msg.get("content")),
+                "output": _tool_output_content(msg.get("content")),
             })
             continue
 
@@ -175,6 +175,36 @@ def messages_to_input(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             continue
         input_items.append({"role": role, "content": content})
     return input_items
+
+
+def _tool_output_content(content: Any) -> Any:
+    """保留真实图片类型；PDF仅由引用在HTTP边界提供。"""
+    if isinstance(content, list):
+        parts = []
+        has_image = False
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            kind = block.get("type")
+            if kind in ("text", "input_text", "output_text"):
+                parts.append({"type": "input_text", "text": block.get("text", "")})
+            elif kind in ("image_url", "input_image"):
+                image = block.get("image_url")
+                url = image.get("url") if isinstance(image, dict) else image
+                if url:
+                    parts.append({"type": "input_image", "image_url": url})
+                    has_image = True
+            elif kind == "image" and (block.get("source") or {}).get("type") == "base64":
+                source = block["source"]
+                parts.append({"type": "input_image", "image_url":
+                              "data:" + source["media_type"] + ";base64," + source["data"]})
+                has_image = True
+            elif kind in ("file", "input_file", "document"):
+                from agent.protocol.tool_media import ToolMediaError
+                raise ToolMediaError("attachment_unsupported")
+        if has_image:
+            return parts
+    return _tool_output_text(content)
 
 
 def _tool_output_text(content: Any) -> str:
@@ -207,7 +237,8 @@ def tools_to_responses(tools: Optional[List[Dict[str, Any]]]) -> Optional[List[D
                 "name": fn.get("name"),
                 "description": fn.get("description"),
                 "parameters": fn.get("parameters") or {},
-                "strict": fn.get("strict"),
+                # Responses 默认会收紧为全字段必填；现有工具的可选参数须保留。
+                "strict": fn.get("strict") if fn.get("strict") is not None else False,
             }
         else:
             # Already internally tagged / Claude-shaped fallback.
@@ -216,7 +247,7 @@ def tools_to_responses(tools: Optional[List[Dict[str, Any]]]) -> Optional[List[D
                 "name": tool.get("name"),
                 "description": tool.get("description"),
                 "parameters": tool.get("parameters") or tool.get("input_schema") or {},
-                "strict": tool.get("strict"),
+                "strict": tool.get("strict") if tool.get("strict") is not None else False,
             }
         converted.append({k: v for k, v in entry.items() if v is not None})
     return converted or None
@@ -381,9 +412,33 @@ def responses_stream_to_chat_chunks(
     """
     # output_index -> tool_calls stream index
     tool_index_map: Dict[int, int] = {}
+    tool_states: Dict[int, Dict[str, Any]] = {}
     next_tool_index = 0
     saw_tool_call = False
     finished = False
+
+    def tool_snapshot(out_idx, item=None, arguments=None):
+        """兼容仅在added/done/completed携带完整参数的网关，前缀只补一次。"""
+        nonlocal next_tool_index, saw_tool_call
+        if out_idx not in tool_index_map:
+            tool_index_map[out_idx] = next_tool_index
+            next_tool_index += 1
+        saw_tool_call = True
+        state = tool_states.setdefault(out_idx, {'header': False, 'arguments': ''})
+        if item and not state['header']:
+            state['header'] = True
+            yield _text_chunk(model, {'tool_calls': [{
+                'index': tool_index_map[out_idx], 'id': item.get('call_id') or item.get('id') or '',
+                'type': 'function', 'function': {'name': item.get('name') or '', 'arguments': ''}}]})
+        if isinstance(arguments, str):
+            previous = state['arguments']
+            if not arguments.startswith(previous):
+                raise ValueError('invalid_function_call_stream')
+            suffix = arguments[len(previous):]
+            state['arguments'] = arguments
+            if suffix:
+                yield _text_chunk(model, {'tool_calls': [{
+                    'index': tool_index_map[out_idx], 'function': {'arguments': suffix}}]})
 
     for event in events:
         if not isinstance(event, dict):
@@ -412,34 +467,36 @@ def responses_stream_to_chat_chunks(
             item = event.get("item") or {}
             if item.get("type") == "function_call":
                 out_idx = event.get("output_index", 0)
-                if out_idx not in tool_index_map:
-                    tool_index_map[out_idx] = next_tool_index
-                    next_tool_index += 1
-                saw_tool_call = True
-                yield _text_chunk(model, {"tool_calls": [{
-                    "index": tool_index_map[out_idx],
-                    "id": item.get("call_id") or item.get("id") or "",
-                    "type": "function",
-                    "function": {"name": item.get("name") or "", "arguments": ""},
-                }]})
+                yield from tool_snapshot(out_idx, item, item.get('arguments'))
             continue
 
         if etype == "response.function_call_arguments.delta":
             out_idx = event.get("output_index", 0)
-            if out_idx not in tool_index_map:
-                tool_index_map[out_idx] = next_tool_index
-                next_tool_index += 1
-                saw_tool_call = True
+            yield from tool_snapshot(out_idx)
             delta = event.get("delta")
             if delta:
+                tool_states[out_idx]['arguments'] += str(delta)
                 yield _text_chunk(model, {"tool_calls": [{
                     "index": tool_index_map[out_idx],
                     "function": {"arguments": str(delta)},
                 }]})
             continue
 
+        if etype == 'response.function_call_arguments.done':
+            yield from tool_snapshot(event.get('output_index', 0), arguments=event.get('arguments'))
+            continue
+
+        if etype == 'response.output_item.done':
+            item = event.get('item') or {}
+            if item.get('type') == 'function_call':
+                yield from tool_snapshot(event.get('output_index', 0), item, item.get('arguments'))
+            continue
+
         if etype in ("response.completed", "response.incomplete"):
             response = event.get("response") or {}
+            for out_idx, item in enumerate(response.get('output') or []):
+                if isinstance(item, dict) and item.get('type') == 'function_call':
+                    yield from tool_snapshot(out_idx, item, item.get('arguments'))
             finish_reason = _status_to_finish_reason(response, saw_tool_call)
             usage = _cc_usage(response.get("usage"))
             final_chunk = _text_chunk(model or response.get("model"), {}, finish_reason)

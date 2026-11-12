@@ -37,8 +37,20 @@ class SourceService:
         self.db = self.root / "sources.sqlite3"
         with self.transaction() as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1):
+            if version not in (0, 1, 2):
                 raise SourceError("version_conflict", f"不支持来源 schema {version}")
+            if version == 2:
+                # 原生证据写入后，旧后端（只识别1）不得继续操作本数据根。
+                tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                if not {'reading_records', 'reading_aliases', 'reading_submissions',
+                        'reading_parse_heads', 'reading_resumes'}.issubset(tables):
+                    raise SourceError('version_conflict', '原生阅读来源结构不完整')
+                for row in db.execute('SELECT record FROM reading_records'):
+                    try:
+                        if json.loads(row[0]).get('schema_version') != 1:
+                            raise ValueError()
+                    except (ValueError, TypeError, AttributeError) as exc:
+                        raise SourceError('version_conflict', '不支持的阅读记录版本') from exc
             db.execute("CREATE TABLE IF NOT EXISTS documents(id TEXT PRIMARY KEY, current TEXT, state INTEGER, purpose TEXT, validity TEXT)")
             added_publication = "publication" not in {row[1] for row in db.execute("PRAGMA table_info(documents)")}
             if added_publication:
@@ -67,7 +79,7 @@ class SourceService:
                         if valid:
                             db.execute("UPDATE documents SET publication=? WHERE id=?", (publication["id"], document["id"]))
                             break
-            db.execute("PRAGMA user_version=1")
+            db.execute(f"PRAGMA user_version={2 if version == 2 else 1}")
 
     @contextmanager
     def transaction(self):
@@ -147,12 +159,17 @@ class SourceService:
             project_indexes(db, self)
 
     def parse(self, revision_id, *, visual=False, vision=None, visual_budget=None,
-              config_revision=None, base_parse_id=None):
+              config_revision=None, base_parse_id=None, prepare_only=False,
+              spreadsheet_materials=None, materials_root=None):
         with self.transaction() as db:
             row = db.execute("SELECT * FROM revisions WHERE id=?", (revision_id,)).fetchone()
             if not row:
                 raise SourceError("invalid_request", "内容版本不存在")
             record = json.loads(row["record"])
+        spreadsheet_requested = spreadsheet_materials is not None or materials_root is not None
+        if spreadsheet_requested and (spreadsheet_materials is None or materials_root is None
+                or Path(record["filename"]).suffix.lower() != ".xlsx" or base_parse_id is not None):
+            raise SourceError("invalid_request", "XLSX 材料须与根目录成对提供，且不能与 base_parse_id 同传")
         blob = Path(record["original"])
         if _hash(blob.read_bytes()) != record["sha256"]:
             raise SourceError("storage_failed", "原件哈希校验失败")
@@ -171,6 +188,8 @@ class SourceService:
                             or cached.get("revision_id") != revision_id or cached.get("sha256") != record["sha256"]
                             or cached.get("source_identity") != source_identity
                             or cached.get("parser_id") != PARSER_ID or cached.get("parser_version") != PARSER_VERSION):
+                        continue
+                    if bool(cached.get("config", {}).get("preparation") == "native-pdf-v1") != bool(prepare_only):
                         continue
                     content = {key: value for key, value in cached.items() if key not in metadata}
                     if _hash(_json([record["sha256"], content]).encode()) != candidate.stem:
@@ -204,7 +223,12 @@ class SourceService:
             if _hash(_json([record["sha256"], result]).encode()) != base_parse_id:
                 raise SourceError("storage_failed", "解析稿哈希校验失败")
         else:
-            result = parse_source(blob, record["filename"])
+            if spreadsheet_requested:
+                from agent.knowledge.parser import parse_spreadsheet_source
+                result = parse_spreadsheet_source(blob, record["filename"], materials_root=materials_root,
+                                                  materials=spreadsheet_materials, prepare_only=prepare_only)
+            else:
+                result = parse_source(blob, record["filename"], prepare_only=prepare_only)
         # Equal bytes may belong to distinct logical documents. Bind this
         # immutable parse to its source without changing legacy hash checks.
         result.setdefault("source_identity", dict(document_id=record["document_id"], revision_id=revision_id))

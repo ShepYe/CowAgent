@@ -39,6 +39,7 @@ export default function PersonalTasksPanel({ onOpenKnowledge, onKnowledgeChanged
       const res = await apiClient.personalTasks()
       if (res.status !== 'success') throw new Error(res.message || '读取任务失败')
       setTasks(res.tasks)
+      setMessage('')
       const next = personalKnowledgeFingerprint(res.tasks)
       if (fingerprint.current !== next) { fingerprint.current = next; changedCallback.current?.() }
     } catch (e) { setMessage(e instanceof Error ? e.message : '读取任务失败') }
@@ -101,13 +102,13 @@ export default function PersonalTasksPanel({ onOpenKnowledge, onKnowledgeChanged
         onReference={(task, ref) => setReference({ taskId: task.task_id, publishId: String(ref.publish_id) })} />}
     </MaterialsLayout>}
     <Modal open={uploadOpen} title="添加资料" onClose={closeUpload} footer={<><Btn onClick={closeUpload}>取消</Btn><Btn variant="primary" disabled={!file || !!busy} onClick={() => void submit()}>{busy === 'submit' ? '接收中…' : '发送资料'}</Btn></>}>
-      <input ref={fileInput} className="hidden" tabIndex={-1} aria-label="选择资料文件" type="file" accept=".pdf,.docx,.xlsx,.md,.txt" disabled={!!busy}
+      <input ref={fileInput} className="hidden" tabIndex={-1} aria-label="选择资料文件" type="file" accept=".pdf,.docx,.pptx,.xlsx,.md,.txt" disabled={!!busy}
         onChange={e => { setFile(e.target.files?.[0] || null); requestId.current = crypto.randomUUID() }} />
       <button onClick={() => fileInput.current?.click()} disabled={!!busy} className="w-full rounded-card border border-dashed border-strong bg-inset px-5 py-7 text-content-secondary hover:border-accent transition-colors flex flex-col items-center gap-2">
         <Upload size={22} className="text-accent" /><span>{file ? readableFilename(file.name) : '选择资料文件'}</span>
       </button>
       <TextInput autoFocus aria-label="资料用途" placeholder="补充用途（可选）" value={text} disabled={!!busy} onChange={e => { setText(e.target.value); requestId.current = crypto.randomUUID() }} />
-      <Tooltip label="支持 PDF、DOCX、XLSX、MD、TXT，单件不超过 100 MiB。助手自主整理；仅临时使用时请在用途中说明。"><button aria-label="资料格式与用途说明" className="text-content-tertiary"><Info size={14} /></button></Tooltip>
+      <Tooltip label="支持 PDF、DOCX、PPTX、XLSX、MD、TXT，单件不超过 100 MiB。助手自主整理；仅临时使用时请在用途中说明。"><button aria-label="资料格式与用途说明" className="text-content-tertiary"><Info size={14} /></button></Tooltip>
     </Modal>
     <Modal open={!!reference} size="lg" title="资料出处" onClose={() => setReference(null)}>
       {reference && <ReferenceBrowser taskId={reference.taskId} publishId={reference.publishId}
@@ -221,6 +222,7 @@ export function TaskHistory({ task, busy, latest, onAction, historyResults = [],
     </summary>
     <div className="pt-3 space-y-3">
       <div className="text-xs text-content-tertiary">{stages[task.stage] || task.stage}{task.outcome ? ` · ${personalOutcomeLabel(task)}` : ''}</div>
+      <ReadingProgress task={task} />
       {task.error && <div role="alert" className="text-danger">{task.error.code === 'config_unavailable' ? '原配置不可用，可按当前配置重新处理。' : task.error.message || task.error.code}</div>}
       {task.status === 'waiting_input' && <label className="block text-content-secondary space-y-2"><span>{task.question || '补充资料用途'}</span><TextInput aria-label="补充用途" value={input} disabled={busy} onChange={e => setInput(e.target.value)} /></label>}
       <div className="flex gap-2 flex-wrap">{actions.map(name => <Btn key={name} disabled={busy || (name === 'update_input' && !input.trim())} onClick={() => void onAction(task, name, undefined, input)}>{({ resubmit: '按当前配置重新处理', retry: '重试', cancel: '取消', update_input: '补充用途' } as Record<string, string>)[name]}</Btn>)}</div>
@@ -235,6 +237,56 @@ export function TaskHistory({ task, busy, latest, onAction, historyResults = [],
 }
 
 const btn = 'px-3 py-1.5 rounded-btn border border-default text-sm disabled:opacity-50'
+
+export function ReadingProgress({ task }: { task: PersonalTask }) {
+  const progress = task.reading_progress
+  if (!progress) return null
+  if (progress.unavailable) return <div role="status" className="text-xs text-content-tertiary">阅读状态不可用 <span title="阅读台账无法核验，请刷新；不据此判定资料已读或任务完成。">?</span></div>
+  const ranges = (values?: string[]) => {
+    const groups = new Map<string, number[]>()
+    const office: string[] = []
+    for (const value of values || []) {
+      const word = value.match(/^([^:]+):word:([^:]+):(\d+)$/)
+      const slide = value.match(/^([^:]+):slide:(.+)$/)
+      if (word) { office.push(`${word[1]}：Word阅读副本页 ${word[3]}`); continue }
+      if (slide) { office.push(`${slide[1]}：幻灯片标识 ${slide[2]}`); continue }
+      const split = value.lastIndexOf(':')
+      const revision = value.slice(0, split), page = Number(value.slice(split + 1))
+      if (split < 1 || !Number.isInteger(page) || page < 1) continue
+      groups.set(revision, [...(groups.get(revision) || []), page])
+    }
+    return [...[...groups].map(([revision, pages]) => `${revision}：物理页 ${pages.sort((a, b) => a - b).join('、')}`), ...office].join('\n') || '无'
+  }
+  const partial = !!progress.published?.length && !!progress.remaining?.length
+  const detail = `已送达：${ranges(progress.delivered)}\n待补读：${ranges(progress.pending)}\n结果未知：${ranges(progress.unknown)}\n已发布：${ranges(progress.published)}\n待整理发布：${ranges(progress.remaining)}\n送达只表示请求成功，不等于每处内容已理解。部分发布不代表整任务成功。`
+  return <div aria-label="阅读覆盖" className="text-xs text-content-secondary flex flex-wrap gap-2">
+    <span>已送达 {progress.delivered?.length || 0}/{progress.targets?.length || 0} 页</span>
+    <span>待补读 {progress.pending?.length || 0} 页</span>
+    <span>{partial ? '部分已发布' : progress.task_complete ? '整理完成' : '待完成整理'}</span>
+    <span tabIndex={0} aria-label="阅读范围详情" title={detail}>?</span>
+  </div>
+}
+
+export function observationLabel(reference: Pick<PersonalReference, 'origin' | 'type' | 'reading_id'>): string {
+  if (reference.origin === 'model' || reference.reading_id) {
+    return reference.type === 'ocr' ? '模型图中文字' : reference.type === 'visual_interpretation' ? '模型视觉解释' : '模型观察'
+  }
+  return '原文文字'
+}
+
+export function ReadingCopyLink({ reference, taskId, publishId }: { reference: PersonalReference; taskId: string; publishId: string }) {
+  const physical = reference.location.physical_page
+  const location = reference.location
+  const batch = typeof physical === 'number' ? reference.reading_copy?.page_map.indexOf(physical)
+    : reference.reading_copy?.source_page_map?.findIndex(item => item.kind === location.kind && (
+      location.kind === 'slide' ? item.source_slide_id === location.source_slide_id
+        : location.kind === 'word_reading_copy_page' && item.reading_copy_page === location.reading_copy_page))
+  if (batch === undefined || batch < 0) return null
+  const label = (typeof physical === 'number' ? `物理页 ${physical}` : locationLabel(location))
+    + (Array.isArray(location.region) ? ' · 局部补读' : '')
+  return <a className={btn} href={apiClient.personalReadingCopy(taskId, publishId, reference.ordinal, batch + 1)} target="_blank" rel="noreferrer"
+    title={`${label}；本批副本第 ${batch + 1} 页`}>打开阅读副本 · {label}</a>
+}
 const validityLabels: Record<string, string> = { active: '有效', withdrawn: '已撤回', corrected: '已更正' }
 const purposeLabels: Record<string, string> = { long_term: '长期资料', transient: '临时使用', waiting: '用途待补充' }
 const visualReasons: Record<string, string> = { visual_not_requested: '尚未视觉整理', renderer_unavailable: '页面渲染不可用', render_failed: '页面渲染失败', render_budget_exceeded: '超出渲染预算', config_unavailable: '视觉配置不可用', vision_unavailable: '视觉模型不可用', vision_failed: '视觉处理失败', visual_budget_exceeded: '超出视觉预算', vision_empty: '未识别到可靠内容', vision_invalid_response: '视觉结果无法核验' }
@@ -414,6 +466,8 @@ export function SourceManager({ source, busy, onAction }: { source: SourceRef; b
 }
 
 function locationLabel(location: Record<string, unknown>): string {
+  if (location.kind === 'word_reading_copy_page') return `Word阅读副本页 ${String(location.reading_copy_page)}`
+  if (location.kind === 'slide') return `幻灯片 ${String(location.source_slide_number)} · 标识 ${String(location.source_slide_id)}`
   if (location.kind === 'docx' && typeof location.path === 'string') {
     const names: Record<string, string> = { paragraph: '段落', table: '表格', row: '行', cell: '单元格', control: '内容控件' }
     return location.path.split('/').map(part => part === 'body' ? '正文' : part.replace(/^(paragraph|table|row|cell|control)\[(\d+)\]$/, (_, kind: string, number: string) => `${names[kind]} ${number}`)).join(' · ')
@@ -451,6 +505,10 @@ function ReferenceBrowser({ taskId, publishId, version, onClose }: { taskId: str
     {error && <div role="alert" className="text-danger">{error}</div>}
     {loading ? <div role="status">读取中…</div> : reference && <>
       <div className="text-sm">{reference.filename || reference.title || '资料原文'} · {reference.current_status === 'current' ? '当前有效' : reference.current_status === 'withdrawn' ? '已撤回' : reference.current_status === 'corrected' ? '已更正' : '已替代或存在未发布变更'} · {locationLabel(reference.location)}</div>
+      <div className="flex flex-wrap items-center gap-2 text-xs text-content-secondary"><span>{observationLabel(reference)}</span>
+        {reference.origin === 'model' && <span title="模型生成的转写或解释，可打开阅读副本核对；不作为原文文字层显示。">?</span>}
+        <ReadingCopyLink reference={reference} taskId={taskId} publishId={publishId} />
+      </div>
       <details><summary className="cursor-pointer text-sm">出处目录</summary><div className="flex flex-wrap gap-2 py-2">{reference.units.slice(Math.floor(ordinal / 50) * 50, Math.floor(ordinal / 50) * 50 + 50).map(unit => <button key={unit.ordinal} className={btn} onClick={() => setOrdinal(unit.ordinal)} aria-current={unit.ordinal === ordinal}>{unit.filename ? `${unit.filename} · ` : ''}{locationLabel(unit.location)}</button>)}</div></details>
       <Markdown content={reference.text} />
     </>}

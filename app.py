@@ -7,6 +7,12 @@ import signal
 import sys
 import time
 
+# 在任何业务导入、配置加载及日志初始化前进入隔离诊断。
+if __name__ == "__main__" and "--document-reading-self-test" in sys.argv:
+    sys.dont_write_bytecode = True
+    from common.document_reading_selftest import main as document_reading_self_test
+    raise SystemExit(document_reading_self_test(sys.argv[1:]))
+
 from channel import channel_factory
 from common import const
 from common.log import logger

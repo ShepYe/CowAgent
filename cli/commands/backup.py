@@ -519,7 +519,16 @@ def _validate_schemas(root: Path) -> None:
             is_sqlite = handle.read(16) == b"SQLite format 3\0"
         if is_sqlite:
             with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
-                if db.execute("PRAGMA user_version").fetchone()[0] > 1:
+                schema_version = db.execute("PRAGMA user_version").fetchone()[0]
+                tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                known_reading = (schema_version == 2 and path.name == 'sources.sqlite3'
+                    and path.parent.name == '.personal_sources'
+                    and {'reading_records', 'reading_aliases', 'reading_submissions',
+                         'reading_parse_heads', 'reading_resumes'}.issubset(tables))
+                known_tasks = (schema_version == 2 and path.name == 'tasks.sqlite3'
+                    and path.parent.name == 'personal'
+                    and {'tasks', 'events', 'reading_publications'}.issubset(tables))
+                if schema_version > 1 and not (known_reading or known_tasks):
                     raise ValueError(f"unsupported SQLite schema: {path.name}")
                 if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                     raise ValueError(f"invalid SQLite snapshot: {path.name}")

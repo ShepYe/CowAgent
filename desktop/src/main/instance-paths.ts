@@ -25,6 +25,10 @@ export function initializePersonalInstance(): void {
       embedding_enabled: false,
       personal_instance: true,
       personal_assistant_enabled: true,
+      document_reading_native_pdf_enabled: true,
+      document_reading_native_docx_enabled: false,
+      document_reading_native_pptx_enabled: false,
+      responses_prompt_cache_enabled: false,
     }, null, 2) + '\n', { encoding: 'utf8', flag: 'wx' })
   }
   process.env.COW_HOME = instanceDataDir
