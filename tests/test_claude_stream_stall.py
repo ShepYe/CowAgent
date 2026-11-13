@@ -5,6 +5,10 @@ import socket
 import sys
 import threading
 import time
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -124,6 +128,50 @@ def test_stall_after_visible_output_is_not_retried_inside_the_bot(monkeypatch):
 
     assert len(bodies) == 1
     assert [c for c in chunks if c.get("error")]
+
+
+@pytest.mark.parametrize("reject_eager", [False, True])
+def test_ping_keeps_stream_alive_with_bounded_reads(monkeypatch, reject_eager):
+    from models.claudeapi import claude_api_bot
+
+    bot = _bot(monkeypatch, 1)
+    clock = {"now": 0.0}
+    monkeypatch.setattr(claude_api_bot, "time", SimpleNamespace(
+        monotonic=lambda: clock["now"], time=time.time))
+    watchdogs = []
+    real_watchdog = claude_api_bot._StallWatchdog
+
+    def watchdog(response):
+        result = real_watchdog(response)
+        watchdogs.append(result)
+        return result
+
+    monkeypatch.setattr(claude_api_bot, "_StallWatchdog", watchdog)
+
+    def lines():
+        # Total thinking time exceeds the stall limit; each ping refreshes it.
+        for now in (1.0, 2.0, 3.0, 4.0):
+            clock["now"] = now
+            yield b'data: {"type": "ping"}'
+            assert watchdogs[0]._last == now
+            assert not watchdogs[0].expired()
+        for event in COMPLETE:
+            yield f"data: {json.dumps(event)}".encode()
+
+    response = Mock(status_code=200)
+    response.iter_lines.side_effect = lines
+    responses = [response]
+    if reject_eager:
+        responses.insert(0, Mock(status_code=400, text=claude_api_bot.EAGER_INPUT_STREAMING))
+    post = Mock(side_effect=responses)
+    monkeypatch.setattr(claude_api_bot.requests, "post", post)
+
+    chunks = list(bot._handle_stream_response({"model": "m", "messages": []}))
+
+    assert not [chunk for chunk in chunks if chunk.get("error")]
+    assert len(watchdogs) == 1
+    assert post.call_count == (2 if reject_eager else 1)
+    assert all(call.kwargs["timeout"] == (180, 1.5) for call in post.call_args_list)
 
 
 def _captured_request(monkeypatch, stream):

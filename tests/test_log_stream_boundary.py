@@ -14,7 +14,7 @@ def log_path(tmp_path, monkeypatch):
     monkeypatch.setattr(logs, "get_data_root", lambda: str(tmp_path))
     monkeypatch.setattr(logs.web, "header", lambda *args: None)
     path = tmp_path / "run.log"
-    path.write_text("先前 café\n", encoding="utf-8")
+    path.write_bytes("先前 café\n".encode("utf-8"))
     return path
 
 
@@ -26,7 +26,7 @@ def test_line_appended_after_init_reaches_the_live_tail(log_path):
     stream = logs.LogsHandler().GET()
     try:
         assert _event(next(stream)) == {"type": "init", "content": "先前 café\n"}
-        with log_path.open("a", encoding="utf-8") as f:
+        with log_path.open("a", encoding="utf-8", newline="\n") as f:
             f.write("arrived-after-init\n")
         assert _event(next(stream)) == {"type": "line", "content": "arrived-after-init\n"}
         assert next(stream) == b": keepalive\n\n"
@@ -36,9 +36,9 @@ def test_line_appended_after_init_reaches_the_live_tail(log_path):
 
 def test_tail_lines_stops_at_the_captured_offset(tmp_path):
     path = tmp_path / "run.log"
-    path.write_text("older\ninitial\n", encoding="utf-8")
+    path.write_bytes(b"older\ninitial\n")
     boundary = path.stat().st_size
-    with path.open("a", encoding="utf-8") as f:
+    with path.open("a", encoding="utf-8", newline="\n") as f:
         f.write("later\n")
     assert tail_lines(path, 1, end_offset=boundary) == ["initial\n"]
     assert tail_lines(path, 1) == ["later\n"]

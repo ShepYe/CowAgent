@@ -3,6 +3,7 @@
 index answers the artifact view."""
 
 import json
+from pathlib import Path
 
 from agent.memory.conversation_store import ConversationStore
 from agent.protocol.artifact import collect_message_artifacts
@@ -36,7 +37,7 @@ def test_written_files_are_collected_and_internal_ones_are_not(tmp_path):
     )
     found = collect_message_artifacts(messages, str(tmp_path))
     assert [(item["kind"], item["source"]) for item in found] == [("html", "write")]
-    assert found[0]["path"].endswith("site/index.html")
+    assert Path(found[0]["path"]) == (tmp_path / "site" / "index.html").resolve()
 
 
 def test_a_written_plan_is_an_artifact(tmp_path):
@@ -44,7 +45,7 @@ def test_a_written_plan_is_an_artifact(tmp_path):
     messages = _tool_turn("write", {"path": "plans/2026-10-03-setup.md"}, {"path": "plans/2026-10-03-setup.md"})
     found = collect_message_artifacts(messages, str(tmp_path))
     assert [item["kind"] for item in found] == ["markdown"]
-    assert found[0]["path"].endswith("plans/2026-10-03-setup.md")
+    assert Path(found[0]["path"]) == (tmp_path / "plans" / "2026-10-03-setup.md").resolve()
 
 
 def test_a_failed_write_produces_nothing(tmp_path):

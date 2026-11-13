@@ -24,7 +24,7 @@ def console(tmp_path, monkeypatch):
     for name, root in roots.items():
         root.mkdir()
         if name != "project":
-            (root / "MEMORY.md").write_text(f"{name} notes\n", encoding="utf-8")
+            (root / "MEMORY.md").write_text(f"{name} notes\n", encoding="utf-8", newline="\n")
     registry = AgentRegistry([
         AgentProfile("primary", "Primary", str(roots["primary"])),
         AgentProfile("writer", "Writer", str(roots["writer"])),
@@ -77,7 +77,7 @@ def test_absolute_system_path_under_the_requested_agent_remains_editable(console
 
 def test_project_copy_and_default_agent_controls(console):
     app, roots = console
-    (roots["project"] / "MEMORY.md").write_text("project-local notes\n", encoding="utf-8")
+    (roots["project"] / "MEMORY.md").write_text("project-local notes\n", encoding="utf-8", newline="\n")
     query = urlencode({"path": "MEMORY.md", "session": "chat", "agent_id": "writer"})
     result = json.loads(app.request("/read?" + query).data)
     assert result["content"] == "project-local notes\n"
@@ -94,7 +94,7 @@ def test_agent_without_own_knowledge_can_edit_shared_knowledge(console, absolute
     shared = roots["primary"] / "knowledge"
     shared.mkdir()
     note = shared / "shared.md"
-    note.write_text("shared knowledge\n", encoding="utf-8")
+    note.write_text("shared knowledge\n", encoding="utf-8", newline="\n")
     path = str(note) if absolute else "knowledge/shared.md"
     query = urlencode({"path": path, "session": session, "agent_id": "writer"})
     loaded = json.loads(app.request("/read?" + query).data)
@@ -117,7 +117,7 @@ def test_agent_own_knowledge_takes_precedence_over_shared(console):
     app, roots = console
     for name in ("primary", "writer"):
         (roots[name] / "knowledge").mkdir()
-        (roots[name] / "knowledge" / "note.md").write_text(name + " knowledge\n")
+        (roots[name] / "knowledge" / "note.md").write_text(name + " knowledge\n", encoding="utf-8", newline="\n")
     query = urlencode({"path": "knowledge/note.md", "session": "chat", "agent_id": "writer"})
     loaded = json.loads(app.request("/read?" + query).data)
     assert loaded["status"] == "success", loaded

@@ -5,7 +5,7 @@ import threading
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
+from fs_helpers import symlink_or_skip
 
 from agent.memory.storage import MemoryChunk, MemoryStorage
 from agent.knowledge.service import KnowledgeService
@@ -99,13 +99,17 @@ def test_move_documents_rejects_overwrite_and_syncs(tmp_path):
     assert manager.synced == 1
 
 
-def test_path_traversal_and_symlink_escape_are_rejected(tmp_path):
+def test_path_traversal_is_rejected(tmp_path):
+    svc, _ = service(tmp_path)
+    assert svc.dispatch("create_category", {"path": "../bad"})["code"] == 403
+
+
+def test_symlink_escape_is_rejected(tmp_path):
     svc, _ = service(tmp_path)
     outside = tmp_path / "outside"
     outside.mkdir()
-    (tmp_path / "knowledge/link").symlink_to(outside, target_is_directory=True)
+    symlink_or_skip(tmp_path / "knowledge/link", outside, target_is_directory=True)
 
-    assert svc.dispatch("create_category", {"path": "../bad"})["code"] == 403
     assert svc.dispatch("create_category", {"path": "link/bad"})["code"] == 403
 
 
@@ -674,10 +678,7 @@ def test_build_graph_keeps_links_under_symlinked_knowledge_dir(tmp_path):
     (real / "notes/a.md").write_text("# A\n[B](./b.md)\n", encoding="utf-8")
     (real / "notes/b.md").write_text("# B\n", encoding="utf-8")
     (tmp_path / "ws").mkdir()
-    try:
-        (tmp_path / "ws/knowledge").symlink_to(real, target_is_directory=True)
-    except OSError:
-        pytest.skip("symlinks unavailable")
+    symlink_or_skip(tmp_path / "ws/knowledge", real, target_is_directory=True)
     svc = KnowledgeService(str(tmp_path / "ws"), FakeMemoryManager())
 
     edges = {(l["source"], l["target"]) for l in svc.build_graph()["links"]}

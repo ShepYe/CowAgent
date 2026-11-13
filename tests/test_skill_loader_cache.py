@@ -83,15 +83,22 @@ class TestSkillLoaderCache(unittest.TestCase):
         manager.refresh_skills(use_cache=True)
         self.assertEqual(manager.skills["alpha"].skill.description, "FIRST")
 
-    def test_edit_that_keeps_mtime_and_size_is_picked_up(self):
+    def test_edit_that_keeps_mtime_and_size_is_picked_up_by_metadata_or_ttl(self):
         manager = self._manager()
         path = self.custom / "alpha" / "SKILL.md"
         st = path.stat()
+        signature = loader_mod._file_signature(str(path))
         time.sleep(0.01)
         _write_skill(self.custom, "alpha", "FIRST")
         os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
         self.assertEqual(path.stat().st_mtime_ns, st.st_mtime_ns)
-        manager.refresh_skills(use_cache=True)
+        # Windows ctime is creation time, so restoring mtime can leave the
+        # entire signature unchanged. The documented TTL bounds that case.
+        now = time.monotonic()
+        if loader_mod._file_signature(str(path)) == signature:
+            now += loader_mod._PARSE_CACHE_TTL
+        with unittest.mock.patch.object(loader_mod.time, "monotonic", lambda: now):
+            manager.refresh_skills(use_cache=True)
         self.assertEqual(manager.skills["alpha"].skill.description, "FIRST")
 
     def test_added_and_removed_skills_are_picked_up(self):

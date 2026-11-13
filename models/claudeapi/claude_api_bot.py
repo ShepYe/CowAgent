@@ -148,9 +148,12 @@ class _StallWatchdog:
     def stop(self) -> None:
         self._stop.set()
 
+    def expired(self) -> bool:
+        return time.monotonic() - self._last >= self.limit
+
     def _run(self) -> None:
         while not self._stop.wait(self.interval):
-            if time.monotonic() - self._last > self.limit:
+            if self.expired():
                 self.tripped = True
                 _abort_response(self.response)
                 return
@@ -836,7 +839,9 @@ class ClaudeAPIBot(Bot, OpenAIImage):
                 json=request_params,
                 proxies=proxies,
                 stream=True,
-                timeout=180
+                # A cross-thread shutdown may leave recv blocked on Windows.
+                # Bound the read itself as well as watching SSE event activity.
+                timeout=(180, STREAM_STALL_SECONDS)
             )
 
             if response.status_code == 400 and EAGER_INPUT_STREAMING in response.text:
@@ -852,7 +857,7 @@ class ClaudeAPIBot(Bot, OpenAIImage):
                     json=request_params,
                     proxies=proxies,
                     stream=True,
-                    timeout=180
+                    timeout=(180, STREAM_STALL_SECONDS)
                 )
 
             if response.status_code != 200:
@@ -1021,7 +1026,7 @@ class ClaudeAPIBot(Bot, OpenAIImage):
                 raise requests.ConnectionError("stream ended after the stall watchdog fired")
 
         except Exception as e:
-            stalled = watchdog is not None and watchdog.tripped
+            stalled = watchdog is not None and (watchdog.tripped or watchdog.expired())
             if stalled:
                 message = f"Connection error: stream stalled (no data for {STREAM_STALL_SECONDS}s), aborted for retry"
                 logger.error(f"Claude {message}")

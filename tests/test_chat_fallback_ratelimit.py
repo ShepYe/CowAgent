@@ -53,6 +53,7 @@ def _executor(model, monkeypatch):
     executor.messages = []
     executor.tools = {}
     executor.system_prompt = ""
+    executor._pending_tool_media = {}
     monkeypatch.setattr(executor, "_validate_and_fix_messages", lambda: None)
     monkeypatch.setattr(executor, "_prepare_messages", lambda: [])
     monkeypatch.setattr(executor, "_identify_complete_turns", lambda: [])

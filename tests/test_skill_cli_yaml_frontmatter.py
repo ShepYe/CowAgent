@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
 import pytest
+import requests
 from click.testing import CliRunner
 
 from agent.skills.frontmatter import parse_frontmatter
@@ -25,8 +26,10 @@ from cli.utils import get_skills_dir
      "Explain these document fields:\nname: ledger\ndescription: user-visible label"),
     ("name: demo\ndescription: 'The user''s helper'", "The user's helper"),
 ])
-def test_public_url_install_preserves_loader_metadata_and_existing_skill(tmp_path, header, description):
-    payload = ("---\n" + header + "\n---\n\n# Demo\n").encode()
+@pytest.mark.parametrize("line_ending", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_public_url_install_preserves_loader_metadata_and_existing_skill(
+        tmp_path, header, description, monkeypatch, line_ending):
+    payload = ("---\n" + header + "\n---\n\n# Demo\n").replace("\n", line_ending).encode()
     assert parse_frontmatter(payload.decode()) == {"name": "demo", "description": description}
     hits = []
 
@@ -43,6 +46,16 @@ def test_public_url_install_preserves_loader_metadata_and_existing_skill(tmp_pat
             self.wfile.write(payload)
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    url = f"http://127.0.0.1:{server.server_port}/SKILL.md"
+    request = requests.sessions.Session.request
+
+    def local_request(session, method, url, **kwargs):
+        assert method.lower() == "get" and url == local_url
+        session.trust_env = False
+        return request(session, method, url, **kwargs)
+
+    local_url = url
+    monkeypatch.setattr(requests.sessions.Session, "request", local_request)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     home, data, workspace = (tmp_path / name for name in ("home", "data", "workspace"))
@@ -60,7 +73,7 @@ def test_public_url_install_preserves_loader_metadata_and_existing_skill(tmp_pat
                                      "COW_DATA_DIR": str(data)}, clear=True):
             target = Path(get_skills_dir()).resolve()
             assert os.path.commonpath([str(target), str(tmp_path.resolve())]) == str(tmp_path.resolve())
-            installed = CliRunner().invoke(skill, ["install", f"http://127.0.0.1:{server.server_port}/SKILL.md"])
+            installed = CliRunner().invoke(skill, ["install", url])
             listed = CliRunner().invoke(skill, ["list"])
         assert installed.exit_code == 0, installed.output
         assert listed.exit_code == 0, listed.output

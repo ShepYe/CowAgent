@@ -1,7 +1,11 @@
+import errno
 import hashlib
 import json
+from pathlib import Path
 
 import pytest
+
+from fs_helpers import symlink_or_skip
 
 from agent.admin import (
     AgentAdminError,
@@ -375,17 +379,23 @@ def test_read_core_file_preserves_missing_file_success(admin):
     }
 
 
-def test_read_core_file_preserves_permission_errors(admin):
+def test_read_core_file_preserves_permission_errors(admin, monkeypatch):
     service, root, _ = admin
     workspace = root / "research"
     service.create_agent("research", "Research", str(workspace))
-    path = workspace / "AGENT.md"
-    path.chmod(0)
-    try:
-        with pytest.raises(PermissionError):
-            service.read_core_file("research", "AGENT.md")
-    finally:
-        path.chmod(0o600)
+    path = (workspace / "AGENT.md").resolve()
+    original_open = Path.open
+    denied = PermissionError(errno.EACCES, "permission denied", str(path))
+
+    def open_with_permission_error(target, *args, **kwargs):
+        if target == path:
+            raise denied
+        return original_open(target, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", open_with_permission_error)
+    with pytest.raises(PermissionError) as exc:
+        service.read_core_file("research", "AGENT.md")
+    assert exc.value is denied
 
 
 def test_duplicate_or_nonempty_workspace_is_rejected_without_config_change(admin):
@@ -558,7 +568,21 @@ def test_switching_to_own_creates_a_real_knowledge_dir(admin):
     assert service.knowledge_mode("research") == "own"
 
 
-def test_switching_back_to_shared_links_the_shared_base(admin):
+@pytest.fixture(params=["symlink", "fallback"])
+def shared_link_mode(admin, monkeypatch, request):
+    _, root, _ = admin
+    if request.param == "symlink":
+        probe = symlink_or_skip(root / "link-probe", root, target_is_directory=True)
+        probe.unlink()
+    else:
+        def unavailable(*args, **kwargs):
+            raise OSError(errno.EPERM, "symlinks unavailable")
+
+        monkeypatch.setattr(Path, "symlink_to", unavailable)
+    return request.param
+
+
+def test_switching_back_to_shared_links_the_shared_base(admin, shared_link_mode):
     service, root, _ = admin
     service.create_agent("research", "Research", str(root / "research"))
     service.set_knowledge_mode("research", "own")
@@ -567,11 +591,14 @@ def test_switching_back_to_shared_links_the_shared_base(admin):
 
     assert result["mode"] == "shared"
     kdir = root / "research" / "knowledge"
-    assert kdir.is_symlink()
+    assert kdir.is_symlink() == (shared_link_mode == "symlink")
     assert service.knowledge_mode("research") == "shared"
+    from common import state_dir
+
+    assert state_dir.knowledge_dir(base=root / "research").resolve() == (root / "primary" / "knowledge").resolve()
 
 
-def test_shared_sets_aside_a_non_empty_own_base_and_own_restores_it(admin):
+def test_shared_sets_aside_a_non_empty_own_base_and_own_restores_it(admin, shared_link_mode):
     service, root, _ = admin
     service.create_agent("research", "Research", str(root / "research"))
     service.set_knowledge_mode("research", "own")
@@ -581,7 +608,8 @@ def test_shared_sets_aside_a_non_empty_own_base_and_own_restores_it(admin):
     # Shared is only a reference: the switch is allowed, the data is kept aside.
     result = service.set_knowledge_mode("research", "shared")
     assert result["mode"] == "shared" and result["changed"] is True
-    assert kdir.is_symlink()
+    assert kdir.is_symlink() == (shared_link_mode == "symlink")
+    assert service.knowledge_mode("research") == "shared"
     stash = root / "research" / "knowledge.own"
     assert (stash / "note.md").read_text(encoding="utf-8") == "keep me"
 

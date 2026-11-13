@@ -94,8 +94,13 @@ def test_acquired_stream_response_is_closed_on_early_failure(tmp_path, monkeypat
             assert result.status == "error"
             assert "HTTP 404" in result.result
         else:
-            with pytest.raises(NotADirectoryError):
+            with pytest.raises((NotADirectoryError, FileNotFoundError)) as failure_info:
                 tool.execute({"url": url})
+            # Windows reports a missing child path under a regular file as
+            # WinError 3; POSIX reports ENOTDIR for that same fixture.
+            assert isinstance(failure_info.value, NotADirectoryError) or getattr(
+                failure_info.value, "winerror", None
+            ) == 3
     finally:
         server.shutdown()
         server.server_close()

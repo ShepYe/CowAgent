@@ -155,9 +155,13 @@ def test_public_mutations_and_legacy_upgrade_preserve_fts(tmp_path, language, ac
         'HOME': str(home), 'USERPROFILE': str(home), 'COW_DATA_DIR': str(data),
         'PYTHONPATH': os.pathsep.join([str(REPO), *sys.path]),
         'PYTHONNOUSERSITE': '1', 'PYTHONDONTWRITEBYTECODE': '1',
+        'PYTHONUTF8': '1',
     }
+    # Windows needs its system directory even in an isolated child environment.
+    if 'SystemRoot' in os.environ:
+        env['SystemRoot'] = os.environ['SystemRoot']
     child = subprocess.run([sys.executable, '-c', PROGRAM, str(workspace), language, action,
                             json.dumps(LEGACY_TRIGGERS)], cwd=tmp_path, env=env,
-                           capture_output=True, text=True, timeout=30)
+                           capture_output=True, text=True, encoding='utf-8', timeout=30)
     assert child.returncode == 0, child.stdout + child.stderr
     assert json.loads(child.stdout.splitlines()[-1])['passed']

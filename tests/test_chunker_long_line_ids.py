@@ -16,6 +16,7 @@ import tempfile
 from pathlib import Path
 
 from agent.memory.chunker import TextChunker
+from agent.memory.config import MemoryConfig
 from agent.memory.manager import MemoryManager
 from agent.memory.storage import MemoryStorage
 
@@ -42,6 +43,7 @@ def _throwaway_manager():
     tmp = Path(tempfile.mkdtemp())
     manager.storage = MemoryStorage(tmp / "index.db")
     manager.workspace_dir = tmp
+    manager.config = MemoryConfig(workspace_root=str(tmp))
     return manager
 
 

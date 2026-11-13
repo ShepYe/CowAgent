@@ -9,6 +9,8 @@ second one unable to open a debug port.
 
 import os
 
+from fs_helpers import symlink_or_skip
+
 import pytest
 
 from agent.tools.browser.chrome_launcher import ChromeLauncher
@@ -21,7 +23,7 @@ def _launcher(profile) -> ChromeLauncher:
 
 
 def _write_locks(profile, owner: str):
-    os.symlink(owner, profile / "SingletonLock")
+    symlink_or_skip(profile / "SingletonLock", owner)
     (profile / "SingletonCookie").write_text("cookie")
     (profile / "SingletonSocket").write_text("socket")
 
@@ -46,7 +48,7 @@ def test_no_lock_reads_as_no_owner(tmp_path):
 
 
 def test_an_unparsable_lock_target_reads_as_no_owner(tmp_path):
-    os.symlink("myhost-notapid", tmp_path / "SingletonLock")
+    symlink_or_skip(tmp_path / "SingletonLock", "myhost-notapid")
 
     assert _launcher(tmp_path)._singleton_owner_pid() is None
 

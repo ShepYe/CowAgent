@@ -2,6 +2,8 @@ import json
 import os
 import subprocess
 import sys
+from fs_helpers import symlink_or_skip
+
 import pytest
 from agent.tools.read.read import Read
 
@@ -14,7 +16,7 @@ def test_read_fifo_returns_error_without_waiting_for_writer(tmp_path, alias):
     path = fifo
     if alias:
         path = tmp_path / "alias.txt"
-        path.symlink_to(fifo)
+        symlink_or_skip(path, fifo)
     code = "from agent.tools.read.read import Read; import json,sys; print('ready', flush=True); r=Read({'cwd':sys.argv[1]}).execute({'path':sys.argv[2]}); print(json.dumps({'status':r.status,'error':r.result}))"
     process = subprocess.Popen(
         [sys.executable, "-c", code, str(tmp_path), str(path)],
@@ -37,9 +39,13 @@ def test_read_fifo_returns_error_without_waiting_for_writer(tmp_path, alias):
             process.communicate()
 
 
-def test_regular_text_and_symlink_remain_readable(tmp_path):
+@pytest.mark.parametrize("alias", [False, True])
+def test_regular_text_and_symlink_remain_readable(tmp_path, alias):
     source = tmp_path / "text.txt"
     source.write_text("hello", encoding="utf-8")
-    link = tmp_path / "alias.txt"
-    link.symlink_to(source)
-    assert Read({"cwd": str(tmp_path)}).execute({"path": str(link)}).status == "success"
+    target = source
+    if alias:
+        target = symlink_or_skip(tmp_path / "alias.txt", source)
+    result = Read({"cwd": str(tmp_path)}).execute({"path": str(target)})
+    assert result.status == "success"
+    assert result.result["content"] == "1|hello"

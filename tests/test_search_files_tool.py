@@ -1,6 +1,8 @@
 import os
 import time
 
+from fs_helpers import symlink_or_skip
+
 import pytest
 
 from common.utils import expand_path
@@ -250,7 +252,7 @@ def test_symlink_to_credential_file_is_skipped_not_opened(tmp_path, monkeypatch)
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    (workspace / "decoy.txt").symlink_to(fake_cow / "secret.env")
+    symlink_or_skip(workspace / "decoy.txt", fake_cow / "secret.env")
     (workspace / "real.txt").write_text("API_KEY=this one is fine\n", encoding="utf-8")
 
     tool = _make_tool(workspace)
@@ -276,7 +278,7 @@ def test_symlinked_directory_pointing_at_credential_dir_is_pruned(tmp_path, monk
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    (workspace / "decoy_dir").symlink_to(fake_cow, target_is_directory=True)
+    symlink_or_skip(workspace / "decoy_dir", fake_cow, target_is_directory=True)
 
     tool = _make_tool(workspace)
     result = tool.execute({"pattern": "API_KEY"})

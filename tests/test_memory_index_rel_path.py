@@ -10,7 +10,8 @@ get does not depend on how its root happened to be spelled.
 """
 
 import asyncio
-from pathlib import Path
+
+from fs_helpers import symlink_or_skip
 
 from agent.memory.config import MemoryConfig
 from agent.memory.manager import MemoryManager, _index_rel_path
@@ -46,7 +47,7 @@ def test_a_root_reached_through_a_symlink_still_matches(tmp_path):
     real = tmp_path / "real"
     (real / "knowledge").mkdir(parents=True)
     link = tmp_path / "link"
-    link.symlink_to(real)
+    symlink_or_skip(link, real, target_is_directory=True)
 
     # Root spelled through the symlink, file spelled through the real path.
     key = _index_rel_path(real / "knowledge" / "a.md", [(link / "knowledge", "knowledge")])

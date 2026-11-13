@@ -1,5 +1,6 @@
 import shutil
 import subprocess
+import re
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,7 @@ requires_bash = pytest.mark.skipif(shutil.which("bash") is None, reason="bash is
 
 def test_overlay_keeps_agent_mail_data_out_of_the_cow_data_mount():
     """Credentials must not also surface inside the agent's data directory."""
-    overlay = OVERLAY.read_text()
+    overlay = OVERLAY.read_text(encoding="utf-8")
 
     for mount in (
         "./agent-mail-data/config:/home/agent/.agently-cli",
@@ -28,7 +29,7 @@ def test_overlay_keeps_agent_mail_data_out_of_the_cow_data_mount():
 
 def test_wrapper_never_blocks_cowagent_startup():
     """An install failure must fall through to the original entrypoint."""
-    wrapper = WRAPPER.read_text()
+    wrapper = WRAPPER.read_text(encoding="utf-8")
     code_lines = [line for line in wrapper.splitlines() if line.strip() and not line.lstrip().startswith("#")]
 
     assert not any(line.startswith("set ") and "e" in line.split()[1] for line in code_lines)
@@ -39,7 +40,8 @@ def test_wrapper_never_blocks_cowagent_startup():
 
 @requires_bash
 def test_wrapper_is_valid_bash():
-    subprocess.run(["bash", "-n", str(WRAPPER)], check=True)
+    subprocess.run(["bash", "-n"], input=WRAPPER.read_text(encoding="utf-8").encode("utf-8"),
+                   check=True, timeout=10)
 
 
 @requires_bash
@@ -57,17 +59,21 @@ def test_wrapper_is_valid_bash():
 )
 def test_newer_versions_are_kept_and_older_ones_reinstalled(installed, pinned, expected):
     """A CLI upgraded by the user must not be downgraded on the next restart."""
-    script = (
-        f"eval \"$(sed -n '/^version_at_least()/,/^}}/p' '{WRAPPER}')\"\n"
-        f"version_at_least '{installed}' '{pinned}'"
-    )
-    result = subprocess.run(["bash", "-c", script])
+    # Send the real function over stdin: Bash may be Git Bash or WSL and
+    # cannot necessarily resolve the host Python's Windows paths.
+    function = re.search(r"^version_at_least\(\) \{.*?^\}",
+                         WRAPPER.read_text(encoding="utf-8"), re.M | re.S)
+    assert function is not None
+    script = function.group() + f"\nversion_at_least '{installed}' '{pinned}'\n"
+    result = subprocess.run(["bash"], input=script.encode("utf-8"),
+                            capture_output=True, timeout=10)
 
+    assert result.returncode in (0, 1), result.stderr
     assert (result.returncode == 0) is expected
 
 
 def test_guides_are_listed_in_the_extensions_navigation():
-    docs_config = (ROOT / "docs/docs.json").read_text()
+    docs_config = (ROOT / "docs/docs.json").read_text(encoding="utf-8")
 
     for page in ("extensions/agent-mail", "zh/extensions/agent-mail", "ja/extensions/agent-mail"):
         assert f'"{page}"' in docs_config
@@ -75,4 +81,4 @@ def test_guides_are_listed_in_the_extensions_navigation():
 
 
 def test_agent_mail_credentials_are_ignored_by_git():
-    assert "docker/agent-mail-data/" in (ROOT / ".gitignore").read_text()
+    assert "docker/agent-mail-data/" in (ROOT / ".gitignore").read_text(encoding="utf-8")

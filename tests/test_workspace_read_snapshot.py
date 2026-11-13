@@ -37,8 +37,9 @@ def replaced_read(tmp_path, monkeypatch):
 
         def read(self, *args):
             raw = self.stream.read(*args)
-            # The agent's atomic writer replaces the path after our read,
-            # leaving this open descriptor attached to the older file.
+            # The bytes and descriptor metadata have already been captured.
+            # Close before replacement, which Windows forbids on an open file.
+            self.stream.close()
             os.replace(replacement, target)
             return raw
 

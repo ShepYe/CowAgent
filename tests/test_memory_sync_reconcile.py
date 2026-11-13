@@ -15,6 +15,8 @@ is exactly the case where nothing changed and there is nothing to embed.
 import asyncio
 from pathlib import Path
 
+from fs_helpers import symlink_or_skip
+
 import pytest
 
 from agent.memory.config import MemoryConfig
@@ -162,7 +164,7 @@ def test_a_symlinked_knowledge_root_is_not_mistaken_for_an_empty_one(tmp_path, s
     (shared / "knowledge" / "shared-page.md").write_text(
         "# shared\nGLACIERQUARTZ7731\n", encoding="utf-8"
     )
-    (workspace / "knowledge").symlink_to(shared / "knowledge", target_is_directory=True)
+    symlink_or_skip(workspace / "knowledge", shared / "knowledge", target_is_directory=True)
 
     manager = _manager(workspace)
     asyncio.run(manager.sync())

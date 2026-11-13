@@ -1,16 +1,30 @@
+import json
 from pathlib import Path
 from agent.knowledge.personal_assistant import SourceService
 from agent.tools.knowledge_ingest import KnowledgeIngest
 from agent.tools.read.read import Read
 from common.personal_tasks import OWNER, TaskStore, task_scope
 from common.runtime_identity import identity_scope
+from models.config_revision import capture_config_revision
 import pytest
+
+
+@pytest.fixture
+def read_ingest_runtime():
+    from config import Config, config_scope
+
+    # 固定格式路由，避免全库前序测试遗留配置改变本组用例的阅读契约。
+    with config_scope(Config(dict(document_reading_native_pdf_enabled=True,
+                                  document_reading_native_docx_enabled=False,
+                                  document_reading_native_pptx_enabled=False))):
+        yield
 
 
 @pytest.mark.parametrize('extension', ['txt', 'pdf', 'docx', 'xlsx'])
 @pytest.mark.parametrize('retry', [False, True])
 @pytest.mark.parametrize('legacy_echo', [False, True])
-def test_read_then_ingest_uses_returned_source_identity(tmp_path, extension, retry, legacy_echo):
+def test_read_then_ingest_uses_returned_source_identity(
+        tmp_path, read_ingest_runtime, extension, retry, legacy_echo):
     original = tmp_path / ('source.' + extension)
     text = 'fixture antenna budget 42 dB'
     if extension == 'pdf':
@@ -30,12 +44,14 @@ def test_read_then_ingest_uses_returned_source_identity(tmp_path, extension, ret
     else:
         original.write_text(text, encoding='utf-8')
     store = TaskStore(tmp_path / 'tasks')
-    task = store.submit(OWNER, 'read-ingest', {'text': '分享资料'}, {'channel': 'feishu'}, 'cfg')
+    task = store.submit(OWNER, 'read-ingest', {'text': '分享资料'}, {'channel': 'feishu'},
+                        capture_config_revision())
     entry = store.attach(OWNER, task['task_id'], original, attachment_id='0')
     store.claim(OWNER, task['task_id'])
     config = {'cwd': str(tmp_path), 'task_store': store}
     with identity_scope(user_id=OWNER), task_scope(task['task_id']):
-        read = Read(config).execute({'path': entry['path']})
+        # 用途登记前先读取文字身份；原生PDF在登记长期用途后另行交付。
+        read = Read(config).execute(dict(path=entry['path'], visual=False))
         assert read.status == 'success', read.result
         source = read.result
         if retry:
@@ -55,11 +71,39 @@ def test_read_then_ingest_uses_returned_source_identity(tmp_path, extension, ret
         assert material['parse_id']
         assert material['document_id'] == source['document_id']
         assert material['revision_id'] == source['revision_id']
-        result = KnowledgeIngest(config).execute(dict(task_id=task['task_id'], purpose='long_term',
+        publication = dict(task_id=task['task_id'], purpose='long_term',
             reason='完成主题整理', pages=[dict(summary='说明本页知识的主题及适用范围。', title='天线链路预算', category='射频/预算',
                 blocks=[dict(content='天线预算 antenna 为 42 dB。', sources=[dict(
                     document_id=material['document_id'], revision_id=material['revision_id'],
-                    parse_id=material['parse_id'], ordinal=0)])], related_page_ids=[], depends_on=[])]))
+                    parse_id=material['parse_id'], ordinal=0)])], related_page_ids=[], depends_on=[])])
+        if extension == 'pdf':
+            from tests.test_reading_capabilities import ProbeModel
+            from tests.test_reading_ingest_flow import deliver
+            from agent.knowledge.reading_capabilities import capability_identity, _key, _FIXTURE_PROFILE
+
+            # 离线能力凭据绑定实际模型和配置修订，仍经过生产能力校验及媒体交付。
+            native_read = Read(config)
+            native_read.model = ProbeModel()
+            capability = capability_identity(native_read.model, task['config_revision'])
+            with SourceService(tmp_path).transaction() as db:
+                db.execute('CREATE TABLE IF NOT EXISTS reading_capabilities(id TEXT PRIMARY KEY,record TEXT)')
+                db.execute('INSERT INTO reading_capabilities VALUES(?,?)', (_key(capability), json.dumps(
+                    dict(schema_version=1, probe_version=4, fixture_profile=_FIXTURE_PROFILE,
+                         state='supported', verified_image=True, identity=capability))))
+            native = native_read.execute(dict(path=entry['path'], pages='1'))
+            assert native.status == 'success', native.result
+            assert native.result['document_id'] == source['document_id']
+            assert native.result['revision_id'] == source['revision_id']
+            deliver(native, store.get(OWNER, task['task_id']))
+            reading = native.result
+            publication.update(reading_submission_id='read-ingest-1',
+                reading_coverage=[dict(reading_id=reading['reading_id'], segment_id=reading['segment_id'])],
+                reading_evidence=[dict(reading_id=reading['reading_id'], evidence_key='budget',
+                    segment_id=reading['segment_id'], location=dict(kind='pdf', physical_page=1),
+                    observation=text, type='visual_interpretation')])
+            publication['pages'][0]['blocks'][0]['sources'] = [dict(
+                reading_id=reading['reading_id'], evidence_key='budget')]
+        result = KnowledgeIngest(config).execute(publication)
     assert result.status == 'success', result.result
     assert result.result['outcome'] == 'published'
     assert result.result['result_refs'][0]['document_id'] == source['document_id']

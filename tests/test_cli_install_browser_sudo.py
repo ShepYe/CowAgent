@@ -17,7 +17,7 @@ from cli.commands import install
 
 def test_root_does_not_prefix_sudo(monkeypatch):
     calls = []
-    monkeypatch.setattr(install.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(install.os, "geteuid", lambda: 0, raising=False)
     monkeypatch.setattr(install.subprocess, "call", lambda cmd, **kw: calls.append(cmd) or 0)
 
     assert install._apt_install("fonts-wqy-zenhei") == 0
@@ -26,7 +26,7 @@ def test_root_does_not_prefix_sudo(monkeypatch):
 
 def test_non_root_with_sudo_prefixes(monkeypatch):
     calls = []
-    monkeypatch.setattr(install.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(install.os, "geteuid", lambda: 1000, raising=False)
     monkeypatch.setattr(install.shutil, "which", lambda name: "/usr/bin/sudo")
     monkeypatch.setattr(install.subprocess, "call", lambda cmd, **kw: calls.append(cmd) or 0)
 
@@ -36,7 +36,7 @@ def test_non_root_with_sudo_prefixes(monkeypatch):
 
 def test_non_root_without_sudo_skips(monkeypatch):
     calls = []
-    monkeypatch.setattr(install.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(install.os, "geteuid", lambda: 1000, raising=False)
     monkeypatch.setattr(install.shutil, "which", lambda name: None)
     monkeypatch.setattr(install.subprocess, "call", lambda cmd, **kw: calls.append(cmd) or 0)
 

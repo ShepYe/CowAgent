@@ -12,6 +12,7 @@ it, so the breakage never showed up as a red run.
 import ast
 from collections import defaultdict
 from pathlib import Path
+import subprocess
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -83,10 +84,15 @@ def test_an_unrecognised_payload_does_not_raise_before_the_upload(channel, tmp_p
 def test_no_repo_module_imports_a_stdlib_module_removed_in_313():
     """The project advertises 3.13 support, so keep those names out of the tree."""
     offenders = {}
-    for source in REPO_ROOT.rglob("*.py"):
-        if any(part in {".git", "venv", ".venv", "__pycache__", "node_modules", "site-packages"} for part in source.parts):
-            continue
-        tree = ast.parse(source.read_text(encoding="utf-8", errors="ignore"))
+    # Check project code, including new files but excluding generated tools
+    # and vendored runtimes in ignored local directories.
+    tracked = subprocess.check_output(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", "*.py"],
+        cwd=REPO_ROOT,
+    ).decode("utf-8").split("\0")
+    for name in filter(None, tracked):
+        source = REPO_ROOT / name
+        tree = ast.parse(source.read_text(encoding="utf-8-sig"), filename=name)
         found = set()
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):

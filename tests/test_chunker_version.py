@@ -150,7 +150,7 @@ class TestSyncStampsVersion(unittest.TestCase):
                 asyncio.run(manager.sync())
                 asyncio.run(manager.sync())
 
-            expected_path = str(Path("knowledge") / "nested" / "index.md")
+            expected_path = "knowledge/nested/index.md"
             expected_hash = MemoryStorage.compute_hash(
                 knowledge_file.read_text(encoding="utf-8")
             )

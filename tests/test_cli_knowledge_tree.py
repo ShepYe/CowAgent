@@ -62,14 +62,18 @@ def invoke(tmp_path, documents, cycle=False, root_link=False, junction_boundary=
     if junction_boundary:
         (tmp_path / 'non-symbolic-link-boundary').touch()
     env = {
+        # Windows needs SystemRoot to initialise Winsock/asyncio in a child.
+        **{key: os.environ[key] for key in ('SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP')
+           if key in os.environ},
         'PATH': os.environ.get('PATH', ''),
         'HOME': str(home), 'USERPROFILE': str(home), 'COW_DATA_DIR': str(data),
         'PYTHONPATH': os.pathsep.join([str(REPO), *sys.path]),
         'PYTHONDONTWRITEBYTECODE': '1',
+        'PYTHONIOENCODING': 'utf-8',
     }
     assert workspace.resolve().is_relative_to(tmp_path.resolve())
     result = subprocess.run([sys.executable, '-c', PROGRAM], cwd=tmp_path, env=env,
-                            capture_output=True, text=True, timeout=15)
+                            capture_output=True, text=True, encoding='utf-8', timeout=15)
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
     assert payload['exit'] == 0, payload['output']

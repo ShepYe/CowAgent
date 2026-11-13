@@ -12,6 +12,12 @@ from common.runtime_identity import identity_scope
 from models.openai_compatible_bot import OpenAICompatibleBot
 
 
+@pytest.fixture(autouse=True)
+def _enable_cache_routing(monkeypatch):
+    # load_config() may have loaded the template, where cache routing is off.
+    monkeypatch.setitem(conf(), "responses_prompt_cache_enabled", True)
+
+
 @pytest.mark.parametrize("provider", ["chatGPT", "custom:relay"])
 @pytest.mark.parametrize("channel", ["weixin", "feishu"])
 @pytest.mark.parametrize("stream", [False, True])

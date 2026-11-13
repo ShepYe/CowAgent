@@ -486,7 +486,7 @@ def _install_url(url: str, result: InstallResult, agent_id: str = None):
         result.messages.append(f"Skill '{skill_name}' already exists. Overwriting SKILL.md ...")
     os.makedirs(skill_dir, exist_ok=True)
 
-    with open(os.path.join(skill_dir, "SKILL.md"), "w", encoding="utf-8") as f:
+    with open(os.path.join(skill_dir, "SKILL.md"), "w", encoding="utf-8", newline="") as f:
         f.write(content)
 
     _register_installed_skill(skill_name, source="url", agent_id=agent_id)

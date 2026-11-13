@@ -1,6 +1,8 @@
 # encoding:utf-8
 """workspace-write must not let a session rewrite the files that widen its own reach."""
 
+from fs_helpers import symlink_or_skip
+
 import pytest
 
 from agent.permission.policy import FULL_ACCESS, WORKSPACE_WRITE, check_tool_call
@@ -62,5 +64,5 @@ def test_agent_protects_its_mcp_config_and_session_settings(ws, monkeypatch):
 
 
 def test_symlink_to_a_protected_file_is_refused(ws):
-    (ws / "link.json").symlink_to(ws / "mcp.json")
+    symlink_or_skip(ws / "link.json", ws / "mcp.json")
     assert not _check(ws, "write", {"path": "link.json"}).allowed
